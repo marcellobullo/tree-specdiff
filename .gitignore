@@ -21,5 +21,9 @@ htmlcov/
 # Generated docs page (rebuild with docs/_build/build_docs.py)
 specdiff-docs.html
 
+# notebooks sketches
+*.ipynb_checkpoints
+*.ipynb
+
 # macOS
 .DS_Store
