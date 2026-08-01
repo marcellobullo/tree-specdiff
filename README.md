@@ -23,6 +23,25 @@ result = sampler.sample(y0, rng=rng)
 print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ```
 
+## Install
+Create the environment
+```bash
+conda create -n specdiff python=3.12
+conda activate specdiff && cd path-to-specdiff
+```
+Install
+```bash
+pip install -e 'specdiff[dev]'
+```
+Run the test
+```bash
+python -m pytest tests -q
+```
+Optional extras. For the PyTorch backend:
+```bash
+pip install -e 'specdiff[torch]'
+```
+
 ## Notation
 
 Everything in the code and docs uses these, and nothing else:
