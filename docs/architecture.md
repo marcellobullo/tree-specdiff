@@ -2,7 +2,7 @@
 
 How the sampler is put together, and why the seams are where they are.
 
-Read this if you are modifying the driver, adding a component type, or trying to work out
+Read this if you are modifying the sampler, adding a component type, or trying to work out
 where a number in `result.summary()` came from. If you only want to write a verification
 rule, [writing-a-verifier.md](writing-a-verifier.md) is the shorter path.
 
@@ -22,7 +22,7 @@ entire point, and it is what the verification rule is responsible for.
 
 The paper's framing is the design brief: its two rules (RMC and D-GRS) "differ only in the
 two components the paper varies: the *draft topology* and the *verification rule*." So those
-are the two things you supply, and the driver knows nothing about either.
+are the two things you supply, and the sampler knows nothing about either.
 
 ## The components
 
@@ -46,7 +46,7 @@ graph LR
     D -.->|"array primitives"| B["Backend<br/><i>NumPy / PyTorch</i>"]
 ```
 
-The driver owns the loop and the bookkeeping and nothing else. It never learns whether the
+The sampler owns the loop and the bookkeeping and nothing else. It never learns whether the
 target is a real denoiser or a closed-form mixture kernel, whether the tree is a chain or a
 branching tree, or how the rule decides. That is what makes the paper's two algorithms drop
 in as a local edit rather than a fork.
@@ -119,35 +119,35 @@ Near the end of the trajectory a full-depth tree would overshoot. Eq. (27)'s tru
 nodes of depth `<= m` is a **prefix** `0 .. offset[m+1]` — truncation is a slice, not a
 rebuild, and it is cached per instance since a run touches at most `L` distinct truncations.
 
-The two drivers reach the same node set by different routes: the scalar one truncates the
+The two samplers reach the same node set by different routes: the scalar one truncates the
 tree, the batched one filters levels by each row's own lookahead. They agree, and
 `tests/test_batched.py` pins that agreement at the level of bit-identical trajectories.
 
 ## Data flow through a round
 
 Trajectory state lives in flat stacks of shape `(num_nodes, *state_shape)`, indexed by node
-id. The batched driver uses the same layout with rows laid out as `row * tree.size + node`,
+id. The batched sampler uses the same layout with rows laid out as `row * tree.size + node`,
 so the backend needs no gather beyond the row indexing it already has.
 
 ```mermaid
 sequenceDiagram
-    participant D as Driver
+    participant S as Sampler
     participant P as Proposal
     participant T as Target
     participant V as Verifier
-    Note over D: round starts at step n, root = Y_n
-    D->>P: on_round_start(n, Y_n)
+    Note over S: round starts at step n, root = Y_n
+    S->>P: on_round_start(n, Y_n)
     loop level = 1 .. L_n
-        D->>P: means(states[parents], steps)
-        P-->>D: m^p per parent
-        Note over D: children = m^p + sigma * noise
+        S->>P: means(states[parents], steps)
+        P-->>S: m^p per parent
+        Note over S: children = m^p + sigma * noise
     end
-    D->>T: __call__(states[internal], steps)
-    T-->>D: m^q per internal node — ONE call
+    S->>T: __call__(states[internal], steps)
+    T-->>S: m^q per internal node — ONE call
     loop level = 1 .. L_n, until rejection
-        D->>V: verify(VerifyRequest)
-        V-->>D: VerifyResult(state, accepted, child_index)
-        D->>P: on_verified(step, Y_u, m^q(Y_u))
+        S->>V: verify(VerifyRequest)
+        V-->>S: VerifyResult(state, accepted, child_index)
+        S->>P: on_verified(step, Y_u, m^q(Y_u))
     end
 ```
 
@@ -174,7 +174,7 @@ needed, so the number is honest rather than flattering: `standard_sampler` repor
 `1.00x`, and a rule that never accepts reports slightly *below* `1.00x` if its proposal
 warmed up.
 
-## The batched driver
+## The batched sampler
 
 Batching over images is orthogonal to the parallelism inside a round, and a real generation
 job wants both. It is not a reshape, because speculation breaks the property that makes
@@ -185,7 +185,7 @@ Three consequences, and they are the whole design of `batched.py`:
 
 1. **`sigma` becomes per row.** Rows of one verification batch belong to different steps, so
    `BatchedVerifyRequest` carries `sigmas`, a tuple.
-2. **Live rows shrink as the round descends.** The driver *compacts* rather than masks: each
+2. **Live rows shrink as the round descends.** The sampler *compacts* rather than masks: each
    level's request contains only rows still walking down their tree, so a rule never sees a
    dead row and never needs a validity flag.
 3. **Cost is a max, not a mean.** One target call serves every live trajectory, so the batch
@@ -221,7 +221,7 @@ porting to JAX or MLX means one `Backend` subclass and no other edits. See
 ## Trade-offs and limits
 
 **The single-trajectory sampler is not the fast path.** It exists to be readable and to be
-the reference the batched driver is tested against. Real generation uses
+the reference the batched sampler is tested against. Real generation uses
 `BatchedSpeculativeSampler`.
 
 **Drafting cost is assumed negligible.** The paper's cost metric counts target calls only.

@@ -13,7 +13,7 @@ Three consequences, and they are the whole design:
     different steps, so :class:`~specdiff.types.BatchedVerifyRequest` carries
     ``sigmas``, not ``sigma``.
 2.  Live rows shrink as the round descends. A trajectory that rejects at level
-    1 takes no part in level 2. Rather than mask, the driver *compacts*: each
+    1 takes no part in level 2. Rather than mask, the sampler *compacts*: each
     level's request contains only rows still walking down their tree, so a rule
     never sees a dead row.
 3.  Cost is no longer the mean. One target call serves every live trajectory,

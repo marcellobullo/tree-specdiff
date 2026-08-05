@@ -1,4 +1,4 @@
-"""Tests for the batched driver. `python tests/test_batched.py`."""
+"""Tests for the batched sampler. `python tests/test_batched.py`."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class CoinFlipVerifier(Verifier):
     """Accepts a uniformly chosen child with probability ``p``, else resamples.
 
     Exact only when the proposal equals the target (delta = 0), which is the
-    regime the driver tests run in. Its point is that acceptance varies row to
+    regime the sampler tests run in. Its point is that acceptance varies row to
     row, so trajectories in a batch genuinely desynchronise.
     """
 
@@ -126,7 +126,7 @@ def _sampler(verifier, *, batch=8, N=24, K=3, L=4, proposal=None, **kw):
 
 # ------------------------------------------------------------------- accounting
 class DeterministicVerifier(Verifier):
-    """Consumes no randomness, so any scalar/batched divergence is the driver's.
+    """Consumes no randomness, so any scalar/batched divergence is the sampler's.
 
     Not exact -- a plumbing fixture. It rejects every third step, which is
     enough to exercise mid-tree rejection and the truncation path.
@@ -141,7 +141,7 @@ class DeterministicVerifier(Verifier):
         return VerifyResult(request.child(k), accepted=True, child_index=k)
 
 
-def test_batch_of_one_matches_the_scalar_driver():
+def test_batch_of_one_matches_the_scalar_sampler():
     N, K, L = 24, 3, 4
     target_b, batched = _sampler(AcceptFirstVerifier(), batch=1, N=N, K=K, L=L)
     rb = batched.sample(np.zeros((1, 4)), rng=np.random.default_rng(0))
@@ -166,7 +166,7 @@ def test_batch_of_one_matches_the_scalar_driver():
 def test_batch_of_one_reproduces_the_scalar_trajectory_exactly():
     """The counts agreeing is weak; the *samples* must agree too.
 
-    Both drivers reach the same draft nodes by different routes -- the scalar
+    Both samplers reach the same draft nodes by different routes -- the scalar
     one truncates the tree, the batched one filters levels by per-row lookahead
     -- so they must consume the RNG in the same order. Anything that reorders
     the draws in ``_draft`` shows up here and nowhere else.
@@ -188,7 +188,7 @@ def test_batch_of_one_reproduces_the_scalar_trajectory_exactly():
     assert np.array_equal(rs.trajectory, rb.trajectories[0])
 
 
-def test_batch_of_one_matches_the_scalar_driver_with_a_stateful_proposal():
+def test_batch_of_one_matches_the_scalar_sampler_with_a_stateful_proposal():
     """Same, with a delayed drift: PerSlotProposal must reproduce it per slot."""
     N, K, L = 21, 3, 4
     t_s, t_b = LinearGaussianTarget(A), LinearGaussianTarget(A)
@@ -367,8 +367,8 @@ def test_irregular_tree_is_rejected_with_a_useful_message():
         raise AssertionError("expected a level-uniformity error")
 
 
-# ------------------------------------------------------- driver-parity guarantees
-def test_batched_driver_rejects_a_non_floating_init():
+# ------------------------------------------------------ sampler-parity guarantees
+def test_batched_sampler_rejects_a_non_floating_init():
     """An integer init would truncate every noise draw to zero, silently."""
     _, sampler = _sampler(AcceptFirstVerifier(), batch=3, N=6, K=2, L=2)
     try:
@@ -380,7 +380,7 @@ def test_batched_driver_rejects_a_non_floating_init():
 
 
 def test_contract_checking_is_as_strict_batched_as_scalar():
-    """check_contract=True must not weaken when you move to the batched driver.
+    """check_contract=True must not weaken when you move to the batched sampler.
 
     CheckedVerifier.verify_batch delegates to inner.verify_batch, so
     CheckedVerifier.verify never runs on this path; the per-row checks have to
@@ -419,7 +419,7 @@ def test_lying_accept_is_caught_batched_too():
         raise AssertionError("CheckedVerifier failed to catch a mismatched accept")
 
 
-def test_info_node_is_available_on_both_drivers():
+def test_info_node_is_available_on_both_samplers():
     """A rule keyed on info['node'] must not KeyError under batching."""
     seen = {"scalar": [], "batched": []}
 
@@ -456,7 +456,7 @@ def test_batched_acceptance_rate_matches_the_rule():
     _, sampler = _sampler(CoinFlipVerifier(p=p, seed=1), batch=batch, N=N, K=2, L=3)
     r = sampler.sample(np.zeros((batch, 3)), rng=np.random.default_rng(0))
     assert abs(r.acceptance_rate - p) < 0.05
-    # and it agrees with what the scalar driver reports for the same rule
+    # and it agrees with what the scalar sampler reports for the same rule
     scalar = SpeculativeSampler(
         target=LinearGaussianTarget(A),
         proposal=ExactProposal(A),

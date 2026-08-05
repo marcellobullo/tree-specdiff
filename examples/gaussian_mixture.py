@@ -147,7 +147,7 @@ def plan_batch(alpha: float, lookahead: int, num_steps: int, batch_size: int, tr
     return float(np.mean(batched)), float(np.mean(isolated))
 
 
-# ---------------------------------------------------------------------- driver
+# ------------------------------------------------------------------------ main
 def main() -> None:
     rng = np.random.default_rng(0)
     dim, num_components, N, churn = 8, 5, 50, 1.0

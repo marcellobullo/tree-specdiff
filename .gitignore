@@ -23,7 +23,7 @@ specdiff-docs.html
 
 # notebooks sketches
 *.ipynb_checkpoints
-*.ipynb
+#*.ipynb
 
 # macOS
 .DS_Store

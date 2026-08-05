@@ -89,9 +89,9 @@ class ResampleVerifier(Verifier):
 
     Trivially exact and trivially useless: it commits one state per target
     call, so a run with it reproduces the standard sampler at ``1.00x``. That
-    makes it the reference point for the driver -- if Algorithm 3 with this
+    makes it the reference point for the sampler -- if Algorithm 3 with this
     rule does not match a plain Euler-Maruyama loop in distribution, the bug is
-    in the driver, not in the coupling.
+    in the sampler, not in the coupling.
     """
 
     name = "resample"

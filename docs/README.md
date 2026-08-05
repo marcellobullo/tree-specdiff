@@ -7,7 +7,7 @@ five-line quick start. These four documents go deeper.
 | --- | --- |
 | [writing-a-verifier.md](writing-a-verifier.md) | **implement a verification rule** — the contract, rank-1 coordinates, how to test for exactness, and the traps. This is the library's primary extension point and the guide most readers want |
 | [models.md](models.md) | sample from your own diffusion model: the target, the schedule, proposals, choosing a draft tree, dtype rules, adding an array backend |
-| [architecture.md](architecture.md) | understand or modify the driver: the three phases of a round, step indexing, horizon truncation, cost accounting, and why the seams are where they are |
+| [architecture.md](architecture.md) | understand or modify the sampler: the three phases of a round, step indexing, horizon truncation, cost accounting, and why the seams are where they are |
 | [api-reference.md](api-reference.md) | look up a signature or an attribute |
 
 ## Common starting points
@@ -32,4 +32,4 @@ statistical test.
 
 **"Why is the batched speedup lower than the per-trajectory speedup?"**
 It is supposed to be — one target call serves every live trajectory, so the batch advances at
-the pace of its slowest member. [The batched driver](architecture.md#the-batched-driver).
+the pace of its slowest member. [The batched sampler](architecture.md#the-batched-sampler).

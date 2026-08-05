@@ -203,7 +203,7 @@ class BatchedVerifyRequest:
     reason about validity. ``slots`` says which trajectory each row belongs to,
     for rules that keep per-trajectory state.
 
-    ``info`` mirrors the scalar driver's, with one difference forced by the
+    ``info`` mirrors the scalar sampler's, with one difference forced by the
     batch: the scalar request carries the tree node as ``info["node"]``, but
     rows sit at different nodes, so the batched request carries the whole tuple
     as ``info["nodes"]``. :meth:`row` translates it back, so a rule written
@@ -235,7 +235,7 @@ class BatchedVerifyRequest:
     def row(self, j: int) -> VerifyRequest:
         """Extract row ``j`` as a single-node request.
 
-        The resulting ``info`` matches the scalar driver's exactly: the
+        The resulting ``info`` matches the scalar sampler's exactly: the
         batch-wide ``"nodes"`` tuple becomes this row's ``"node"``.
         """
         info = self.info
@@ -290,7 +290,7 @@ class BatchedVerifyResult:
 
 @dataclass(frozen=True)
 class BatchedRoundRecord:
-    """One outer iteration of the batched driver: a single target call."""
+    """One outer iteration of the batched sampler: a single target call."""
 
     iteration: int
     active: Tuple[int, ...]

@@ -1,4 +1,4 @@
-"""Driver tests. Run with `python -m pytest tests` or `python tests/test_sampler.py`."""
+"""Sampler tests. Run with `python -m pytest tests` or `python tests/test_sampler.py`."""
 
 from __future__ import annotations
 

@@ -269,14 +269,14 @@ See [writing-a-verifier.md](writing-a-verifier.md) for the contract and the obli
 
 Always rejects and draws a fresh `Y ~ N(mu_q, sigma^2 I)`. Trivially exact and trivially
 useless — it commits one state per target call, reproducing the standard sampler at `1.00x`.
-That makes it the driver's reference point: if Algorithm 3 with this rule does not match a
-plain Euler–Maruyama loop in distribution, the bug is in the driver, not in the coupling.
+That makes it the sampler's reference point: if Algorithm 3 with this rule does not match a
+plain Euler–Maruyama loop in distribution, the bug is in the sampler, not in the coupling.
 
 ### `CheckedVerifier(inner)`
 
 Enforces the checkable half of the contract: output type, state shape, finiteness,
 `child_index` bounds, and `accepted=True` implying the state *is* the drafted child. Identical
-checks on both drivers. Use `check_contract=True` rather than instantiating it directly.
+checks on both samplers. Use `check_contract=True` rather than instantiating it directly.
 
 ### Registry
 
@@ -319,7 +319,7 @@ Everything a rule is allowed to see at one node.
 
 `VerifyRequest` with a leading batch dimension and one substantive difference: **`sigmas` is
 per row**, because rows belong to different steps. Also carries `slots`; `children` is
-`(batch, K, *shape)`. All rows are live — the driver compacts rather than masks.
+`(batch, K, *shape)`. All rows are live — the sampler compacts rather than masks.
 
 `.row(j)` extracts row `j` as a `VerifyRequest`, translating the batch-wide `info["nodes"]`
 tuple back into the scalar contract's `info["node"]`.

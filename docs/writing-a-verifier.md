@@ -253,7 +253,7 @@ the checkable half of the contract: wrong output type, wrong state shape, non-fi
 an out-of-range `child_index`, and — the important one — `accepted=True` with a state that is
 not the drafted child.
 
-The checks are identical on both drivers, so a rule the scalar sampler rejects is rejected
+The checks are identical on both samplers, so a rule the scalar sampler rejects is rejected
 under batching too, with the same message plus a row number.
 
 ## Restricting the topology

@@ -1,7 +1,7 @@
 """Speculative diffusion sampling over arbitrary draft trees.
 
 Algorithm 3 of *Accelerating Diffusion Sampling via Speculative Draft Trees*.
-The driver knows nothing about the two things the paper varies -- the draft
+The sampler knows nothing about the two things the paper varies -- the draft
 topology and the verification rule -- so you supply those and nothing else.
 
     from specdiff import DraftTree, DelayedDriftProposal, SpeculativeSampler
@@ -62,7 +62,7 @@ from .verify import (
 __version__ = "0.1.0"
 
 __all__ = [
-    # driver
+    # samplers
     "SpeculativeSampler",
     "BatchedSpeculativeSampler",
     "standard_sampler",

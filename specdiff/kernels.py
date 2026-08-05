@@ -148,7 +148,7 @@ class MirrorProposal(ProposalTransition):
     """``m^p = m^q``: a perfect proposal (``delta = 0``, everything accepts).
 
     Useless in production, invaluable in tests: it isolates bugs in a
-    verification rule from bugs in the coupling, and it makes the driver's
+    verification rule from bugs in the coupling, and it makes the sampler's
     accounting easy to reason about.
     """
 

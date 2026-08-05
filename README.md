@@ -5,7 +5,7 @@ diffusion sampling over an arbitrary draft tree, with a pluggable verification r
 
 The paper's own framing is the design brief — RMC and D-GRS "differ only in the two
 components the paper varies: the *draft topology* and the *verification rule*". So those are
-the two things you supply, and the driver knows nothing about either.
+the two things you supply, and the sampler knows nothing about either.
 
 ```python
 from specdiff import DraftTree, DelayedDriftProposal, SpeculativeSampler
@@ -102,6 +102,7 @@ rather than letting it through; `float32` and `float64` both work.
 | [docs/models.md](docs/models.md) | plugging in your own diffusion model, proposals, trees, backends |
 | [docs/architecture.md](docs/architecture.md) | how a round works, data flow, cost accounting, design decisions |
 | [docs/api-reference.md](docs/api-reference.md) | every exported symbol |
+| [notebooks/](notebooks/README.md) | one runnable tutorial per component — trees, kernels, verifiers, the two samplers, backends, and an end-to-end walkthrough |
 
 `examples/gaussian_mixture.py` runs the whole thing end to end on a Gaussian mixture, with no
 network involved.
@@ -194,7 +195,7 @@ Three things the batch dimension actually changes:
 verification batch belong to different steps. Use `ops.scale_rows` to broadcast it portably.
 
 **Live rows shrink as the round descends.** A trajectory that rejects at level 1 takes no
-part in level 2. The driver compacts rather than masks, so a rule never sees a dead row and
+part in level 2. The sampler compacts rather than masks, so a rule never sees a dead row and
 never needs a validity flag. `request.slots[j]` says which trajectory row `j` is, for rules
 holding per-trajectory state; `request.row(j)` carries it through as `slot`.
 
@@ -225,10 +226,10 @@ row `j` may depend only on `request.row(j)`.
 `info` carries the same keys either way, with one translation: rows sit at different tree
 nodes, so the batched request holds `info["nodes"]` (a tuple) while `request.row(j)` turns it
 back into the scalar contract's `info["node"]`. A rule keyed on `info["node"]` therefore runs
-unchanged under both drivers.
+unchanged under both samplers.
 
 `check_contract=True` applies identical per-row checks on both paths — shape, finiteness,
-index bounds, and accepted-state identity — so a rule the scalar driver rejects is rejected
+index bounds, and accepted-state identity — so a rule the scalar sampler rejects is rejected
 under batching too, with the same message plus a row number.
 
 Trajectories share an RNG stream, so a given trajectory is not bit-reproducible across
@@ -253,7 +254,7 @@ scale, since at zero churn both kernels are point masses and speculation is vacu
 reverse drift needs to know when a round starts and which target drifts have become
 available; root-drift prefetching then reuses a drift the previous round already paid for
 during verification, instead of spending an extra NFE per round. The hooks let that live in
-the proposal rather than as a special case in the driver. Note the increment is recoverable
+the proposal rather than as a special case in the sampler. Note the increment is recoverable
 from means alone: `gamma * b^q = m^q(y) - y`, so the proposal never needs drift access.
 
 **Where the NFEs are counted.** `TargetTransition.__call__` counts; that is why you call the
@@ -264,7 +265,7 @@ uniform tree, which is where a tree buys back some of its verification cost.
 
 ## Limitations, and what I would revisit
 
-- **Two drivers, one algorithm.** `sampler.py` and `batched.py` implement the same three
+- **Two samplers, one algorithm.** `sampler.py` and `batched.py` implement the same three
   phases and can drift apart. The scalar one is kept because it is the readable reference and
   the natural thing for a single image; a test asserts the two agree on accounting for a batch of 1.
   If the pair grows a third variant, collapse them and have `SpeculativeSampler` be a
@@ -275,7 +276,7 @@ uniform tree, which is where a tree buys back some of its verification cost.
   already first-class.
 - **Static topology.** The tree is fixed at construction. The paper's closing paragraph wants
   it adapted online to proposal quality and budget; that fits as a `TopologyPolicy` returning
-  a tree per round, given the previous round's `RoundRecord`. The driver already truncates a
+  a tree per round, given the previous round's `RoundRecord`. The sampler already truncates a
   tree per round, so the hook is one line.
 - **`check_exactness` is a smoke test.** A KS test on 4k samples catches gross errors, not
   subtle bias in the tail. For a rule you intend to publish, also verify the analytic
