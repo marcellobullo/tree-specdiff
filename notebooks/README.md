@@ -6,7 +6,7 @@ and imports only from `specdiff` — but the order below is the one that builds 
 | # | notebook | component | what it covers |
 | --- | --- | --- | --- |
 | 1 | [`tree_tutorial.ipynb`](tree_tutorial.ipynb) | `trees.py` | building a `DraftTree` from a parent list, the uniform/chain families, `B` and `|I|` |
-| 2 | [`kernels_tutorial.ipynb`](kernels_tutorial.ipynb) | `kernels.py` | `TargetTransition` and where NFEs are counted, `NoiseSchedule`, `ProposalTransition` and its hooks, `DelayedDriftProposal` and root-drift prefetching |
+| 2 | [`kernels_tutorial.ipynb`](kernels_tutorial.ipynb) | `kernels.py` | the model interface derived from the paper: reverse SDE → eq. (5) → `TargetTransition` + `NoiseSchedule`, the eq. (24) assumption, the delayed drift (7) and root-drift prefetching, a worked flow-matching conversion (28)–(38), the role of churn (Remark 3), and an index of every equation |
 | 3 | [`verifier_tutorial.ipynb`](verifier_tutorial.ipynb) | `verify.py`, `verifiers/rank1.py`, `testing.py` | the one contract, `VerifyRequest`/`VerifyResult`, rank-1 coordinates and degeneracy, `check_exactness` (including what a wrong rule looks like), `CheckedVerifier`, the registry |
 | 4 | [`sampler_tutorial.ipynb`](sampler_tutorial.ipynb) | `sampler.py`, `types.py` | Algorithm 3 round by round, `standard_sampler`, `RoundRecord`/`SamplingResult`, truncation near the horizon, cost accounting, projecting speedup from `delta` |
 | 5 | [`batched_tutorial.ipynb`](batched_tutorial.ipynb) | `batched.py` | many trajectories per target call, batched proposals, per-row `sigma`, compaction, occupancy and straggler cost |
