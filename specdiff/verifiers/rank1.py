@@ -121,7 +121,8 @@ class Rank1Frame:
         """``Y -> (S, Z_perp)`` of eq. (10)."""
         z = (state - self.mu_p) / self.sigma
         s = self.ops.dot(self.direction, z)
-        return s, z - s * self.direction
+        z_perp = z - s * self.direction
+        return s, z_perp
 
     def reconstruct(self, s: float, z_perp: Array) -> Array:
         """``(S, Z_perp) -> Y`` of eq. (11)."""
