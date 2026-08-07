@@ -27,3 +27,6 @@ specdiff-docs.html
 
 # macOS
 .DS_Store
+
+# paper
+diffusion_speculative_sampling-paper.pdf

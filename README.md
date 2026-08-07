@@ -69,7 +69,7 @@ specdiff/
   sampler.py  batched.py  trees.py  kernels.py  verify.py  types.py  testing.py  ops.py
   verifiers/
     rank1.py  stubs.py
-tests/       test_sampler.py  test_batched.py  test_rank1.py
+tests/       test_sampler.py  test_batched.py  test_rank1.py  test_rmc.py
 examples/    gaussian_mixture.py
 ```
 
@@ -82,7 +82,7 @@ examples/    gaussian_mixture.py
 | `specdiff/verify.py` | the `Verifier` contract, contract checker, name registry |
 | `specdiff/types.py` | `VerifyRequest`/`VerifyResult` and the run records |
 | `specdiff/verifiers/rank1.py` | the rank-1 reduction (eqs. 8–11), shared by any isotropic rule |
-| `specdiff/verifiers/stubs.py` | where Algorithms 1 and 2 go — **not implemented** |
+| `specdiff/verifiers/stubs.py` | Algorithm 1 (RMC); Algorithm 2 (D-GRS) is **not implemented** |
 | `specdiff/testing.py` | statistical exactness test for a rule |
 | `specdiff/ops.py` | the only module that touches NumPy/PyTorch |
 

@@ -12,9 +12,11 @@ five-line quick start. These four documents go deeper.
 
 ## Common starting points
 
-**"I want to implement Algorithm 1 or 2."**
+**"I want to implement Algorithm 2, or a coupling of my own."**
 [writing-a-verifier.md](writing-a-verifier.md), then
-[the section on the two stubs](writing-a-verifier.md#implementing-the-papers-two-algorithms).
+[the section on the paper's two rules](writing-a-verifier.md#the-papers-two-algorithms).
+Algorithm 1 (`rmc`) is already implemented and is the worked reference; Algorithm 2 (`d-grs`)
+is left to the reader.
 
 **"I want to know if speculation is worth it on my model."**
 [Measuring your headroom first](writing-a-verifier.md#measuring-your-headroom-first) — a probe

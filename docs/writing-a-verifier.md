@@ -309,20 +309,42 @@ class MyRule(Verifier):
 rule = create_verifier("my-rule")          # addressable from a config file
 ```
 
-## Implementing the paper's two algorithms
+## The paper's two algorithms
 
 `specdiff/verifiers/stubs.py` holds `ReflectionMaximalCoupling` (Algorithm 1) and
-`GreedyRejectionSampling` (Algorithm 2). They are deliberately unimplemented — their purpose
-is to fix the names, topology constraints and telemetry so that filling them in is a local
-edit, and the bodies are left as the reader's work. What follows is what you need, not the
+`GreedyRejectionSampling` (Algorithm 2).
+
+**Algorithm 1 is implemented**, and is the worked reference for everything above: about
+fifteen lines, no framework import, and it runs under both samplers. Read it before writing
+your own rule. Address it as `create_verifier("rmc")`, and pair it with `DraftTree.chain(L)` —
+`max_children = 1` means `check_topology` refuses anything wider at construction time.
+
+Its shape, in the coordinates of the section above: project the single child to `s_hat`;
+accept with probability `1 ^ phi(s_hat - delta) / phi(s_hat)`; on rejection reflect about the
+crossing point of the two densities, `s = delta - s_hat`, carrying the child's `z_perp`
+through untouched; reconstruct. Per-step acceptance is `2 * Phi_bar(delta / 2)`, eq. (16) —
+which is the overlap `1 - TV(P, Q)`, so it is also the ceiling for *any* single-proposal
+coupling. Report `proposals_examined = 1`.
+
+Two numerical points in that body worth stealing:
+
+- **Never form `phi` itself.** The ratio simplifies to `exp(delta * (s_hat - delta/2))` — the
+  quadratics cancel, the normalising constant cancels, and you avoid differencing two large
+  nearly equal squared norms. This is why `specdiff.ops` ships `Phi` and `Phi_bar` but no
+  Gaussian density: neither of the paper's rules needs one.
+- **Compare in log space with `math.log1p(-u)`, not `math.log(u)`.** `ops.uniform` returns
+  `[0, 1)`, so `u` can be exactly `0` and `math.log` raises `ValueError` — about once in
+  `2^53` nodes, i.e. never in your test sweep and eventually in someone's long run. `1 - u` is
+  uniform too, and `log1p` is defined on precisely the range `uniform()` guarantees. No cap on
+  the ratio is then needed: the left side is `<= 0`, so a positive log-ratio accepts
+  unconditionally, which *is* the `1 ^ ·`. (In PyTorch `torch.log(0)` returns `-inf` rather
+  than raising, so a rule ported from a tensor implementation can hide this bug.)
+
+**Algorithm 2 is left as the reader's work** — the class fixes its name, topology constraint
+and telemetry so that filling it in is a local edit. What follows is what you need, not the
 answer.
 
-**Algorithm 1 — reflection maximal coupling, `K = 1`.** Project the single child to `s_hat`;
-accept with probability `1 ^ phi(s_hat - delta) / phi(s_hat)`; on rejection reflect,
-`s = delta - s_hat`; reconstruct. Per-step acceptance is `2 * Phi_bar(-delta / 2)`, eq. (16).
-Report `proposals_examined = 1`.
-
-**Algorithm 2 — greedy rejection sampling, any `K`.** Sweep the children *in drafting order* —
+**Greedy rejection sampling, any `K`.** Sweep the children *in drafting order* —
 this is the sequence coupling, not the list coupling. Maintain the level `lambda_k` and the
 residual mass `G_{k+1}`, and accept child `k` with probability
 `1 ^ (rho(s_k) - lambda_{k-1})_+ / G_k`. On a full sweep of rejections, sample the normalised
@@ -336,6 +358,10 @@ and `Rank1Frame.tau` computes `tau_k` with the degeneracy guard already applied.
 
 ### Three traps
 
+The first two are what makes Algorithm 2 harder than Algorithm 1 rather than merely longer:
+at `K = 1` there is no order to get wrong and only one residual to carry, so both come for
+free. The third bites either rule.
+
 1. **Order.** The children arrive in sampling order and a sequence coupling must keep it.
    Sorting them or examining them by likelihood ratio breaks exactness.
 2. **Which orthogonal residual you carry through.** Algorithm 2 returns `Z_perp,k` on
@@ -343,6 +369,11 @@ and `Rank1Frame.tau` computes `tau_k` with the degeneracy guard already applied.
    wrong one produces samples that pass a casual eyeball check and fail `check_exactness`.
 3. **Degeneracy.** Check `frame.degenerate` before computing any `tau`. See
    [above](#degeneracy).
+
+`tests/test_rmc.py` is the shape the Algorithm 2 tests should take: an exactness sweep, the
+analytic acceptance probability checked against the measured one, the structural claim of the
+rejection branch, and the topology guard. Only the second and third change — eq. (15) instead
+of eq. (16), and a residual branch instead of a reflection.
 
 ## Checklist
 

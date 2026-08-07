@@ -1,20 +1,15 @@
-"""Where Algorithms 1 and 2 go.
+"""The paper's two verification rules.
 
-Deliberately unimplemented. The point of these two classes is to show that the
-template already carries everything the paper's rules need, and to fix their
-names, topology constraints and telemetry so that filling them in is a local
-edit.
+``ReflectionMaximalCoupling`` (Algorithm 1, ``K = 1``) is implemented below.
+``GreedyRejectionSampling`` (Algorithm 2, any ``K``) is not: it is left as the
+reader's work, and the class exists to fix its name, topology constraint and
+telemetry so that filling it in is a local edit. Both are proof that the
+template already carries everything the paper's rules need -- neither touches
+the sampler, and both work under batching unchanged.
 
-Sketch of the work each one needs, in the coordinates of
+What Algorithm 2 needs, in the coordinates of
 :class:`~specdiff.verifiers.rank1.Rank1Frame`:
 
-``ReflectionMaximalCoupling`` (Algorithm 1, ``K = 1``)
-    Project the single child to ``s_hat``; accept with probability
-    ``1 ^ phi(s_hat - delta) / phi(s_hat)``; on rejection reflect,
-    ``s = delta - s_hat``; reconstruct. Acceptance probability
-    ``2 * Phi_bar(-delta / 2)`` (eq. 16).
-
-``GreedyRejectionSampling`` (Algorithm 2, any ``K``)
     Sweep the children *in the order they were drafted* -- the sequence, not
     list, coupling. Maintain the level ``lambda_k`` and residual mass
     ``G_{k+1}``; accept child ``k`` with probability
@@ -25,7 +20,7 @@ Sketch of the work each one needs, in the coordinates of
     delta/2)`` with ``tau_k = ln(lambda_k) / delta`` (Appendix B.2), so no
     numerical integration is needed.
 
-Two traps worth writing down before either is implemented:
+Three traps, the first two specific to Algorithm 2 and the third shared:
 
 *   The children arrive in ``request.children`` in sampling order and a
     sequence coupling must keep it. Sorting them, or examining them by
@@ -33,15 +28,18 @@ Two traps worth writing down before either is implemented:
 *   Which orthogonal residual is carried through matters. Algorithm 2 returns
     ``Z_perp,k`` on acceptance of child ``k`` but ``Z_perp,1`` on the residual
     branch (lines 9 and 18).
+*   Check ``frame.degenerate`` before dividing by ``delta``. The regime that
+    breaks a rule is small-and-nonzero ``delta``, which is exactly what a good
+    proposal produces.
 """
 
 from __future__ import annotations
 
+import math
+
 from ..types import VerifyRequest, VerifyResult
 from ..verify import Verifier, register_verifier
 from .rank1 import Rank1Frame
-
-import math
 
 
 @register_verifier("rmc")

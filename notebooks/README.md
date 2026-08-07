@@ -27,16 +27,16 @@ a GPU and no notebook takes more than a few seconds.
 
 ## A note on the verification rules
 
-`specdiff/verifiers/stubs.py` leaves Algorithms 1 (RMC) and 2 (D-GRS) unimplemented on purpose,
-so no notebook implements them either. The rules used here are all exact and all *deliberately*
-weak:
+Algorithm 1 (RMC) is implemented in `specdiff/verifiers/stubs.py`; Algorithm 2 (D-GRS) is left
+unimplemented on purpose. Alongside `rmc`, the notebooks use rules that are exact and
+*deliberately* weak, because they isolate one thing at a time:
 
 * `ResampleVerifier` / `DeltaProbe` — never accept; they isolate the sampler and measure the
   headroom a coupling would have (`delta`, and the acceptance probability it implies);
 * `AcceptIfIdentical` — accepts only where `delta` is zero to working precision (Remark 2), which
   is enough to exercise the acceptance path and show the sampler's ceiling.
 
-Every speedup number attributed to a real coupling in these notebooks comes from the analytic
-cost model, not from a rule. Filling in the stubs is what turns that projection into a
-measurement; [`verifier_tutorial.ipynb`](verifier_tutorial.ipynb) §10 has the recipe and the
-checklist.
+Speedups attributed to `rmc` are measured. Those attributed to D-GRS or to a branching tree
+still come from the analytic cost model, not from a rule, and implementing Algorithm 2 is what
+turns that projection into a measurement; [`verifier_tutorial.ipynb`](verifier_tutorial.ipynb)
+§10 has the recipe and the checklist.

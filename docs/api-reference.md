@@ -288,8 +288,9 @@ create_verifier("my-rule", **kwargs) -> Verifier
 available_verifiers() -> tuple[str, ...]
 ```
 
-Registered by the library: `resample`, `rmc`, `d-grs`. The last two are
-[deliberately unimplemented](writing-a-verifier.md#implementing-the-papers-two-algorithms).
+Registered by the library: `resample`, `rmc`, `d-grs`. All three are registered on
+`import specdiff`. `rmc` is Algorithm 1 and is implemented; `d-grs` is Algorithm 2 and is
+[left as the reader's work](writing-a-verifier.md#the-papers-two-algorithms).
 
 ---
 

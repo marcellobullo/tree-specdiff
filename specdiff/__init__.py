@@ -59,6 +59,18 @@ from .verify import (
     register_verifier,
 )
 
+# Imported for its side effect as much as its names: the rules in
+# `verifiers.stubs` register themselves under "rmc" and "d-grs" at import time,
+# and without this `create_verifier("rmc")` raises KeyError after a bare
+# `import specdiff` -- the registry would advertise only "resample" until some
+# other module happened to pull the subpackage in.
+from .verifiers import (  # noqa: E402
+    DEGENERATE_TOL,
+    GreedyRejectionSampling,
+    Rank1Frame,
+    ReflectionMaximalCoupling,
+)
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -90,6 +102,11 @@ __all__ = [
     "register_verifier",
     "create_verifier",
     "available_verifiers",
+    # the paper's rules, and the coordinates they share
+    "Rank1Frame",
+    "DEGENERATE_TOL",
+    "ReflectionMaximalCoupling",
+    "GreedyRejectionSampling",
     # contract types
     "VerifyRequest",
     "VerifyResult",
