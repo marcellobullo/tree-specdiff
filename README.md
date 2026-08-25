@@ -26,21 +26,28 @@ print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ## Install
 Create the environment
 ```bash
-conda create -n specdiff python=3.12
-conda activate specdiff && cd path-to-specdiff
+conda create -n specdiff python=3.12 && conda activate specdiff
 ```
-Install
+Install from the repository root (the `.` is the project, not the `specdiff/`
+package directory):
 ```bash
-pip install -e 'specdiff[dev]'
+pip install -e '.[dev]'
 ```
-Run the test
+Run the tests
 ```bash
 python -m pytest tests -q
 ```
 Optional extras. For the PyTorch backend:
 ```bash
-pip install -e 'specdiff[torch]'
+pip install -e '.[torch]'
 ```
+For the image experiments — pretrained EDM checkpoints and multi-GPU sharding
+(see [experiments/images/](experiments/images/README.md)):
+```bash
+pip install -e '.[dev,edm]'
+```
+On a CUDA box, install `torch` first from the PyTorch index if you need a
+specific CUDA build; the plain PyPI wheel is what `pip` picks otherwise.
 
 ## Notation
 
