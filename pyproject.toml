@@ -17,6 +17,12 @@ edm = ["torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30"]
 # experiments/images/fid.py. torch-fidelity is what torchmetrics' FID needs;
 # `datasets` only for --dataset cifar10, which fetches the real images.
 fid = ["torchmetrics>=1.0", "torch-fidelity>=0.3", "datasets>=2.14", "pillow"]
+# experiments/images/clip.py. transformers supplies the CLIP checkpoint that
+# torchmetrics' CLIPScore loads.
+# clip.py uses transformers directly (CLIPModel + processor + tokenizer),
+# matching the reference implementation's preprocessing so the scores are
+# comparable with numbers computed there.
+clip = ["transformers>=4.40", "pillow"]
 # Tests, plus the plotting stack -- so `[dev]` is enough to run the GM
 # experiment end to end, figures included, without a second install.
 dev = ["numpy>=1.24", "pytest>=7", "matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13"]
@@ -26,6 +32,7 @@ all = [
     "matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13",
     "torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30",
     "torchmetrics>=1.0", "torch-fidelity>=0.3", "datasets>=2.14",
+    "transformers>=4.40",
 ]
 
 [build-system]

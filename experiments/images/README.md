@@ -6,6 +6,8 @@ Multi-GPU sharding, the `(K, L)` sweep, and SD3 are step 3 onwards.
 
 | file | what it is |
 | --- | --- |
+**Pixel space** (EDM):
+
 | `models.py` | the adapter: denoiser → velocity → churn transition, plus the schedule |
 | `toy.py` | a closed-form stand-in denoiser, so the wiring is testable with no checkpoint and no GPU |
 | `run_edm.py` | generation driver — writes `samples.pt`, `meta.json`, `grid.png` |
@@ -16,6 +18,31 @@ Multi-GPU sharding, the `(K, L)` sweep, and SD3 are step 3 onwards.
 | [`server-checklist.md`](server-checklist.md) | smoke tests to pass before either protocol |
 | `crosscheck_reference.py` | port fidelity against the sibling implementation |
 | `../../tests/test_edm_images.py` | the test suite for all of the above (CPU, ~5 s) |
+
+**Latent space** (SD3.5) — separate files by design; the two will become
+separate directories:
+
+| file | what it is |
+| --- | --- |
+| `sd3_models.py` | the latent adapter: guided velocity, prompt table, churn transition |
+| `toy_sd3.py` | a closed-form stand-in pipeline, so this is testable with no 16 GiB download |
+| `run_sd3.py` | generation driver — prompt sets, CFG, chunked VAE decode, sharding |
+| `sweep_sd3.sh` | the `(K, L)` sweep for SD3 |
+| `clip.py` | CLIP score from saved samples — per-image, so cells can be compared *paired* |
+| `coco_prompts.py` | build a deterministic, prefix-stable COCO caption set |
+| [`sd3.md`](sd3.md) | full protocol: generate + score |
+| `../../tests/test_sd3.py` | 19 tests (CPU, ~1 s) |
+
+`sigma_grid`/`churn_std_grid` and the shard/matching helpers are *duplicated*
+between the two rather than shared. `tests/test_sd3.py` asserts each copy
+agrees with its pixel-space counterpart exactly, so the duplication cannot
+drift silently.
+
+SD3 conditions on **text**, one caption per image. `--prompts FILE` gives image
+`i` line `i` at noise seed `--seed + i`, so every rule sees identical
+(caption, starting noise) pairs and the comparison is paired rather than two
+marginals. There is no FID: these are samples of a text conditional, not of a
+dataset distribution.
 
 ## Run it
 
