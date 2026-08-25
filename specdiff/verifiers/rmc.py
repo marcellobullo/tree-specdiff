@@ -1,36 +1,23 @@
-"""The paper's two verification rules.
+"""Algorithm 1: the reflection maximal coupling (De Bortoli et al. 2025).
 
-``ReflectionMaximalCoupling`` (Algorithm 1, ``K = 1``) is implemented below.
-``GreedyRejectionSampling`` (Algorithm 2, any ``K``) is not: it is left as the
-reader's work, and the class exists to fix its name, topology constraint and
-telemetry so that filling it in is a local edit. Both are proof that the
-template already carries everything the paper's rules need -- neither touches
-the sampler, and both work under batching unchanged.
+The single-proposal rule. It works entirely in the coordinates of
+:class:`~specdiff.verifiers.rank1.Rank1Frame`, where the ``d``-dimensional
+coupling collapses to a scalar one and the orthogonal residual of the proposal
+rides through untouched.
 
-What Algorithm 2 needs, in the coordinates of
-:class:`~specdiff.verifiers.rank1.Rank1Frame`:
+Two numerical points that generalise to any rule written against this contract:
 
-    Sweep the children *in the order they were drafted* -- the sequence, not
-    list, coupling. Maintain the level ``lambda_k`` and residual mass
-    ``G_{k+1}``; accept child ``k`` with probability
-    ``1 ^ (rho(s_k) - lambda_{k-1})_+ / G_k``. On a full sweep of rejections,
-    sample the normalised residual (eq. 13). The masses of the super-level
-    sets are half-space masses in the projected coordinate,
-    ``Q(H_k) = Phi_bar(tau_k - delta/2)`` and ``P(H_k) = Phi_bar(tau_k +
-    delta/2)`` with ``tau_k = ln(lambda_k) / delta`` (Appendix B.2), so no
-    numerical integration is needed.
+*   Never form the Gaussian density. The acceptance ratio simplifies to a single
+    exponential -- the quadratics cancel, the normalising constant cancels, and
+    you avoid differencing two large nearly equal squared norms. This is why
+    :mod:`specdiff.ops` ships ``Phi`` and ``Phi_bar`` and no PDF.
+*   Compare in log space with ``math.log1p(-u)``, not ``math.log(u)``.
+    ``ops.uniform`` returns ``[0, 1)``, so ``u`` can be exactly ``0`` where
+    ``math.log`` raises. ``1 - u`` is uniform too and ``log1p`` is defined on
+    precisely the range ``uniform()`` guarantees. On the torch backend this is
+    not academic: ``torch.rand`` is float32, so ``P(u == 0)`` is ``2^-24``.
 
-Three traps, the first two specific to Algorithm 2 and the third shared:
-
-*   The children arrive in ``request.children`` in sampling order and a
-    sequence coupling must keep it. Sorting them, or examining them by
-    likelihood ratio, breaks exactness.
-*   Which orthogonal residual is carried through matters. Algorithm 2 returns
-    ``Z_perp,k`` on acceptance of child ``k`` but ``Z_perp,1`` on the residual
-    branch (lines 9 and 18).
-*   Check ``frame.degenerate`` before dividing by ``delta``. The regime that
-    breaks a rule is small-and-nonzero ``delta``, which is exactly what a good
-    proposal produces.
+See :mod:`specdiff.verifiers.dgrs` for Algorithm 2, which relaxes ``K = 1``.
 """
 
 from __future__ import annotations
@@ -99,17 +86,4 @@ class ReflectionMaximalCoupling(Verifier):
             accepted=accepted,
             child_index=child_index,
             proposals_examined=1,       
-        )
-
-
-@register_verifier("d-grs")
-class GreedyRejectionSampling(Verifier):
-    """Algorithm 2. Sequence coupling over the ``K`` children of a node."""
-
-    max_children = None
-
-    def verify(self, request: VerifyRequest) -> VerifyResult:
-        raise NotImplementedError(
-            "Algorithm 2. Examine request.children in the given order; "
-            "return proposals_examined=k on acceptance and K + 1 on the residual branch."
         )
