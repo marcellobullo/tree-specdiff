@@ -31,9 +31,37 @@ Array = Any
 DEGENERATE_TOL: Optional[float] = None
 """Default tolerance below which ``delta`` counts as zero.
 
-``None`` means "derive it from the state dtype" -- ``sqrt(eps)``, which is
-~1.5e-8 in float64 and ~3.4e-4 in float32. Set a float here to override
+``None`` means :data:`DEFAULT_DEGENERATE_TOL`. Set a float here to override
 globally, or pass ``tol=`` to :meth:`Rank1Frame.from_request`.
+"""
+
+DEFAULT_DEGENERATE_TOL: float = 1e-10
+"""The threshold itself: a constant, and deliberately *not* dtype-derived.
+
+Every quantity that can break down here -- ``delta``, ``tau = ln(lambda)/delta``
+and the D-GRS masses ``G_k`` -- is a Python float, computed in float64 no matter
+what dtype the states carry (``ops.norm`` and ``ops.dot`` return floats). So the
+floor is a property of float64 arithmetic, not of the state array.
+
+That floor is ``delta ~ 1e-15``: ``G_2 = Phi_bar(-delta/2) - Phi_bar(delta/2)``
+is mathematically ``delta / sqrt(2 pi)``, and float64 resolves it down to about
+``4e-16`` before the two survival terms cancel to exactly zero. ``1e-10`` clears
+that by five orders of magnitude while admitting only ``~4e-11`` of total
+variation (the shortcut's cost is ``TV = delta / sqrt(2 pi)``).
+
+Previously this was ``sqrt(eps)`` of the state dtype. That was ~1.5e-8 in
+float64 -- harmless -- but ~3.1e-2 in float16 and ~8.8e-2 in bfloat16, where
+accepting unconditionally admits 1.2% and 3.5% total variation *per node*. Both
+are large enough for :func:`specdiff.testing.check_exactness` to detect as
+non-exact, so on half-precision states the shortcut stopped being "the correct
+limit" and became a silent approximation, in exactly the small-``delta`` regime
+a good proposal produces.
+
+The dtype dependence had no mechanism behind it. The frame is self-consistent by
+construction -- ``delta * direction == diff`` identically -- so the coupling is
+exact with respect to the mean gap *as computed*, whatever precision the means
+carry. A coarse dtype makes that gap less accurate, but the shortcut cannot
+repair that and only adds bias on top.
 """
 
 
@@ -68,7 +96,7 @@ class Rank1Frame:
         if tol is None:
             tol = DEGENERATE_TOL
         if tol is None:
-            tol = math.sqrt(ops.finfo_eps(request.children))
+            tol = DEFAULT_DEGENERATE_TOL
         return cls(
             delta=delta,
             direction=direction,
@@ -86,16 +114,24 @@ class Rank1Frame:
         ``tau = ln(lambda) / delta`` is undefined, so rules must special-case
         this rather than divide by zero.
 
-        The test is ``delta <= tol``, **not** ``delta == 0``. Exact equality is
-        the wrong predicate here: the regime that breaks a rule is small-and-
-        nonzero, and that is exactly what a *good* proposal produces. At
-        ``delta = 1e-16`` an exact test says "not degenerate" while
-        ``tau = ln(lambda) / delta`` is ~1e15, which saturates ``Phi_bar`` to
-        exactly 0 and makes the D-GRS residual mass ``G_k`` vanish -- a
-        division by zero one step later. Below ``tol`` the two kernels are
-        indistinguishable at the state's own precision anyway (the TV distance
-        is ``~delta / sqrt(2 pi)``), so accepting unconditionally is not an
-        approximation, it is the correct limit.
+        The test is ``delta <= tol``, **not** ``delta == 0``: ``tol`` is a
+        small constant (:data:`DEFAULT_DEGENERATE_TOL`) sitting above the
+        float64 floor where ``G_2`` cancels to zero, so the branch fires only
+        where the two kernels really are the same to working precision.
+
+        Note that neither of the paper's rules actually *needs* this branch
+        above that floor -- both were measured exact with it disabled at every
+        ``delta`` down to and including exactly ``0``. ``lambda_1 = 1``, so
+        ``tau_1 = ln(1)/delta = 0`` for any ``delta > 0``, and ``lambda`` then
+        grows only by ``G ~ delta``, which keeps ``ln(lambda)/delta`` at O(1)
+        rather than blowing up. The branch is a guard on the residual path at
+        ``delta ~ 1e-16``, and a short-circuit; it is not what makes small
+        ``delta`` safe.
+
+        Keep it cheap, therefore. The shortcut is not free: it accepts
+        unconditionally, which costs ``TV = delta / sqrt(2 pi)`` of exactness
+        every time it fires. A tolerance chosen loosely spends that silently,
+        and only in the small-``delta`` regime a good proposal produces.
         """
         return self.delta <= self.tol
 
