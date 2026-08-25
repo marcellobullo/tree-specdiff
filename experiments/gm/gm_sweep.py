@@ -4,7 +4,7 @@ Runs every ``(K, L)`` cell for both of the paper's rules and writes one row per
 trajectory to a resumable CSV. Plotting lives in ``plot_gm.py``; a sweep
 that takes hours should not be coupled to a plotting library.
 
-    python experiments/gm_sweep.py --out results/gm/$(date +%Y%m%d-%H%M%S)
+    python experiments/gm/gm_sweep.py --out results/gm/$(date +%Y%m%d-%H%M%S)
 
 Matched budgets
 ---------------
@@ -66,7 +66,9 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# parents[2] is the repo root: `import experiments.gm.models` needs it on
+# the path, since neither `experiments` nor `experiments/gm` is a package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lazy  # noqa: E402

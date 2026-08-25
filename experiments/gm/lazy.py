@@ -43,7 +43,9 @@ from typing import Optional
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# parents[2] is the repo root: `import experiments.gm.models` needs it on
+# the path, since neither `experiments` nor `experiments/gm` is a package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from specdiff import VerifyRequest, create_verifier  # noqa: E402
 from specdiff.ops import resolve_backend  # noqa: E402

@@ -7,7 +7,7 @@ the difference you would care about (~0.1 calls), and check every combination
 of `prefetch` and `evaluate_leaves` -- the prefetch policy is duplicated
 between the two implementations, which is exactly the kind of thing that drifts.
 
-    python experiments/validate_lazy.py
+    python experiments/gm/validate_lazy.py
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# parents[2] is the repo root: `import experiments.gm.models` needs it on
+# the path, since neither `experiments` nor `experiments/gm` is a package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lazy  # noqa: E402
