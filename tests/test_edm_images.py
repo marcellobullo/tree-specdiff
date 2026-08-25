@@ -470,6 +470,28 @@ class TestSharding:
             ])
             assert torch.equal(rejoined, labels)
 
+    def test_a_slow_rank_is_reported(self, tmp_path, capsys):
+        """The whole batch waits on the slowest rank, so say so."""
+        from images import run_edm
+
+        args = self._args(tmp_path, num_samples=4)
+        denoiser = run_edm.build_denoiser(args)
+        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        tree = run_edm.build_tree(args, setting.num_steps)
+
+        base = dict(target_calls=1, target_states_evaluated=1, speedup=1.0,
+                    end_to_end_speedup=1.0, mean_isolated_speedup=1.0,
+                    occupancy=1.0, acceptance_rate=0.5)
+        for rank, secs in ((0, 10.0), (1, 40.0)):        # rank 1 four times slower
+            torch.save({"samples": torch.zeros((2, *setting.state_shape), dtype=torch.uint8),
+                        "rank": rank, "seconds": secs, **base},
+                       tmp_path / f"shard_{rank:03d}.pt")
+
+        meta = run_edm.merge_shards(args, setting, tree, denoiser, "none", tmp_path)
+        assert meta["seconds"] == 40.0
+        assert meta["seconds_per_rank"] == [10.0, 40.0]
+        assert "4.00x the fastest" in capsys.readouterr().out
+
     def test_two_shards_merge_into_one_run(self, tmp_path):
         from images import run_edm
 
@@ -501,6 +523,11 @@ class TestSharding:
         meta = run_edm.merge_shards(args, setting, tree, denoiser, mode, tmp_path)
         assert meta["num_samples"] == 9
         assert meta["num_processes"] == 2
+        # Per-rank timings survive the merge: wall clock is the slowest rank, so
+        # a straggler has to stay diagnosable after the run.
+        assert len(meta["seconds_per_rank"]) == 2
+        assert meta["seconds"] == max(meta["seconds_per_rank"])
+        assert not list(tmp_path.glob("progress_rank*.json"))
         samples = torch.load(tmp_path / "samples.pt", weights_only=True)
         assert samples.shape == (9, *setting.state_shape)
         assert samples.dtype == torch.uint8
