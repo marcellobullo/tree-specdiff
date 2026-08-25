@@ -332,16 +332,22 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
         done += n
 
         # tqdm is useless under `accelerate launch` with stderr redirected to a
-        # log, so emit a periodic line and a pollable progress.json instead.
+        # log, so emit a pollable progress file instead. *Every* rank writes its
+        # own -- the batch finishes when the slowest one does, so a rank stuck on
+        # a contended GPU is exactly what you need to be able to see. Only rank 0
+        # prints, because four interleaved progress streams in one log are worse
+        # than none:  `cat <out>/progress_rank*.json` shows them all.
         now = time.time()
-        if rank == 0 and (now - last_report > REPORT_EVERY_S or done == count):
+        if now - last_report > REPORT_EVERY_S or done == count:
             rate = done / max(now - t0, 1e-9)
-            print(f"  rank 0: {done}/{count}  {rate:.2f} img/s  "
-                  f"speedup {result.speedup:.2f}x  acc {result.acceptance_rate:.3f}",
-                  flush=True)
-            with open(out / "progress.json", "w") as f:
-                json.dump({"rule": args.rule, "done_rank0": done, "of_rank0": count,
-                           "img_per_s": rate, "elapsed_s": round(now - t0, 1)}, f)
+            with open(out / f"progress_rank{rank:03d}.json", "w") as f:
+                json.dump({"rule": args.rule, "rank": rank, "done": done,
+                           "of": count, "img_per_s": round(rate, 4),
+                           "elapsed_s": round(now - t0, 1)}, f)
+            if rank == 0:
+                print(f"  rank 0: {done}/{count}  {rate:.2f} img/s  "
+                      f"speedup {result.speedup:.2f}x  acc {result.acceptance_rate:.3f}",
+                      flush=True)
             last_report = now
 
     mean = lambda xs: sum(xs) / len(xs)  # noqa: E731
@@ -356,6 +362,7 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
             "occupancy": mean(occupancies),
             "acceptance_rate": mean(accepts),
             "seconds": round(time.time() - t0, 1),
+            "rank": rank,
         },
         str(shard) + ".tmp",
     )
@@ -411,6 +418,9 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out):
         "target_states_evaluated": sum(p["target_states_evaluated"] for p in parts),
         # Wall clock is the slowest rank, not the sum: they run concurrently.
         "seconds": max(p["seconds"] for p in parts),
+        # Per rank, so a straggler is diagnosable after the fact. A spread here
+        # means one GPU was contended or slower, and the whole run waited on it.
+        "seconds_per_rank": [p["seconds"] for p in sorted(parts, key=lambda q: q["rank"])],
     }
 
     torch.save(samples, out / "samples.pt.tmp")
@@ -420,6 +430,17 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out):
     with open(out / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
     save_grid(samples, out / "grid.png")
+    for f in out.glob("progress_rank*.json"):
+        f.unlink()
+
+    secs = meta["seconds_per_rank"]
+    if len(secs) > 1:
+        slowest, fastest = max(secs), min(secs)
+        print(f"per-rank seconds: {secs}")
+        if slowest > 1.15 * fastest:
+            print(f"  note: slowest rank took {slowest / fastest:.2f}x the fastest "
+                  f"({slowest:.0f}s vs {fastest:.0f}s). Wall clock is the slowest "
+                  f"rank, so a contended or slower GPU costs the whole run.")
     return meta
 
 
@@ -478,10 +499,18 @@ def main(argv=None) -> None:
     generate_shard(args, setting, sampler, denoiser, labels, start, count, out, rank)
 
     barrier(accelerator)
-    if rank != 0:
-        return
-    meta = merge_shards(args, setting, tree, denoiser, label_mode, out)
-    print(json.dumps(meta, indent=2))
+    if rank == 0:
+        meta = merge_shards(args, setting, tree, denoiser, label_mode, out)
+        print(json.dumps(meta, indent=2))
+
+    # Tear the process group down explicitly. Without this NCCL warns at exit
+    # about leaked resources -- harmless, but it is the last thing printed after
+    # a long run, which makes a clean run look like a failed one.
+    if accelerator is not None:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":
