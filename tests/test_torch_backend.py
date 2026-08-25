@@ -274,3 +274,53 @@ if __name__ == "__main__":
         fn(*args)
         print(f"ok  {fn.__name__}{args if args else ''}")
     print("\nall passed")
+
+
+# --------------------------------------------------------------- device placement
+def _non_cpu_device():
+    """A real accelerator to test against, or None.
+
+    cuda on a server, mps on a Mac. The bug this guards against is invisible on
+    cpu, which is why the rest of this file never caught it: `torch.rand`
+    allocates on the *default* device and refuses a generator from anywhere
+    else, so a run on cuda died at its first acceptance test.
+    """
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return None
+
+
+@pytest.mark.skipif(_non_cpu_device() is None, reason="no accelerator available")
+def test_uniform_accepts_a_generator_from_the_states_device():
+    dev = _non_cpu_device()
+    ref = torch.zeros(3, device=dev)
+    ops = resolve_backend(ref)
+    rng = ops.make_rng(0, ref=ref)
+    assert str(rng.device).startswith(dev)
+
+    u = ops.uniform(rng)                      # must not raise
+    assert 0.0 <= u < 1.0
+    # Still a float32 draw, which is what the guards in RMC and D-GRS assume.
+    assert isinstance(u, float)
+
+
+@pytest.mark.skipif(_non_cpu_device() is None, reason="no accelerator available")
+def test_a_whole_sample_runs_on_the_accelerator():
+    """End to end off cpu: the failure above only surfaced under a real run."""
+    dev = _non_cpu_device()
+    target = _ShiftKernel()
+    sampler = SpeculativeSampler(
+        target=target,
+        proposal=DelayedDriftProposal(target),
+        schedule=ConstantSchedule(0.3),
+        tree=DraftTree.uniform(branching=2, lookahead=2),
+        verifier=create_verifier("d-grs"),
+        num_steps=8,
+    )
+    init = torch.zeros(4, device=dev)
+    ops = resolve_backend(init)
+    result = sampler.sample(init, rng=ops.make_rng(0, ref=init))
+    assert str(result.sample.device).startswith(dev)
+    assert torch.isfinite(result.sample).all()

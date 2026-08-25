@@ -243,7 +243,12 @@ class TorchBackend(Backend):
         )
 
     def uniform(self, rng=None):
-        return float(self._torch.rand((), generator=rng).item())
+        # The draw has to happen on the generator's own device: `torch.rand`
+        # otherwise allocates on the default device (cpu) and refuses a
+        # generator from anywhere else. A run on cuda hands this a cuda
+        # generator, so omitting `device` fails at the first acceptance test.
+        device = None if rng is None else rng.device
+        return float(self._torch.rand((), generator=rng, device=device).item())
 
     def make_rng(self, seed=None, ref=None):
         gen = self._torch.Generator(device="cpu" if ref is None else ref.device)
