@@ -24,7 +24,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from specdiff import (  # noqa: E402
-    BatchedDelayedDriftProposal,
     BatchedSpeculativeSampler,
     DelayedDriftProposal,
     DraftTree,
@@ -34,6 +33,7 @@ from specdiff import (  # noqa: E402
     VerifyRequest,
     VerifyResult,
     Verifier,
+    create_verifier,
     standard_sampler,
 )
 from specdiff.ops import standard_normal_sf  # noqa: E402
@@ -72,7 +72,7 @@ class MixtureReverseKernel(TargetTransition):
         per = coef[None, :, None] * diff - self.mu[None, :, :]
         return (w[:, :, None] * per).sum(axis=1)
 
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         out = np.empty_like(states)
         for step in sorted(set(steps)):
             idx = [i for i, s in enumerate(steps) if s == step]
@@ -169,7 +169,7 @@ def main() -> None:
     probe = DeltaProbe()
     sampler = SpeculativeSampler(
         target=target,
-        proposal=DelayedDriftProposal(target, prefetch=True),
+        proposal=DelayedDriftProposal(target),
         schedule=schedule,
         tree=tree,
         verifier=probe,
@@ -199,7 +199,7 @@ def main() -> None:
     batch = 16
     batched = BatchedSpeculativeSampler(
         target=target,
-        proposal=BatchedDelayedDriftProposal(target, prefetch=True),
+        proposal=DelayedDriftProposal(target),
         schedule=schedule,
         tree=tree,
         verifier=DeltaProbe(),
@@ -219,8 +219,37 @@ def main() -> None:
     print("delayed drift is never more than one step stale and this delta is a")
     print("lower bound. Under a real coupling the drift ages across the accepted")
     print("prefix and the mismatch grows -- as it does with dimension, ~sqrt(d).")
-    print("\nPlug in a coupling to convert that headroom into speedup:")
-    print("  specdiff/verifiers/stubs.py")
+
+    # ---- the projection above, measured -----------------------------------
+    # Both of the paper's rules, on the topology each is for: RMC needs a chain
+    # (max_children = 1), D-GRS is what the extra width is for.
+    print(f"\nMeasured, {lookahead}-level lookahead, mean of 20 trajectories:")
+    print(f"{'rule':>7}{'topology':>18}{'B':>5}{'speedup':>10}{'acceptance':>12}")
+    for name, rule_tree in (
+        ("rmc", DraftTree.chain(lookahead)),
+        ("d-grs", DraftTree.chain(lookahead)),
+        ("d-grs", tree),
+    ):
+        sampler = SpeculativeSampler(
+            target=target,
+            proposal=DelayedDriftProposal(target),
+            schedule=schedule,
+            tree=rule_tree,
+            verifier=create_verifier(name),
+            num_steps=N,
+        )
+        runs = [sampler.sample(rng.standard_normal(dim), rng=rng) for _ in range(20)]
+        shape = f"K={rule_tree.branching}, L={rule_tree.depth}"
+        print(
+            f"{name:>7}{shape:>18}{rule_tree.budget:>5}"
+            f"{np.mean([r.speedup for r in runs]):>10.2f}x"
+            f"{np.mean([r.acceptance_rate for r in runs]):>12.3f}"
+        )
+
+    print("\nThe two rules agree at K = 1 -- eq. (16) is the ceiling for any")
+    print("single-proposal coupling, and RMC attains it. Only D-GRS can spend a")
+    print("larger budget on width, which is the point of Algorithm 2. Measured")
+    print("acceptance sits below the probe's projection for the reason above.")
 
 
 if __name__ == "__main__":

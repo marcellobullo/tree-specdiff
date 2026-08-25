@@ -67,7 +67,7 @@ class VerifyRequest:
     sigma: float
     children: Array
     parent_state: Optional[Array] = None
-    slot: int = 0
+    index_in_batch: int = 0
     """Which trajectory this node belongs to. Always ``0`` under the
     single-trajectory sampler; under :mod:`specdiff.batched` it identifies the
     trajectory, which a rule holding per-trajectory state needs in order to
@@ -200,8 +200,8 @@ class BatchedVerifyRequest:
 
     All rows are live: finished or already-rejected trajectories are dropped
     from the batch by the sampler rather than masked, so a rule never has to
-    reason about validity. ``slots`` says which trajectory each row belongs to,
-    for rules that keep per-trajectory state.
+    reason about validity. ``indices_in_batch`` says which image each row
+    belongs to, for rules that keep per-image memory.
 
     ``info`` mirrors the scalar sampler's, with one difference forced by the
     batch: the scalar request carries the tree node as ``info["node"]``, but
@@ -211,7 +211,7 @@ class BatchedVerifyRequest:
     """
 
     steps: Tuple[int, ...]
-    slots: Tuple[int, ...]
+    indices_in_batch: Tuple[int, ...]
     proposal_mean: Array  # (batch, *shape)
     target_mean: Array  # (batch, *shape)
     sigmas: Tuple[float, ...]
@@ -250,7 +250,7 @@ class BatchedVerifyRequest:
             sigma=self.sigmas[j],
             children=self.children[j],
             parent_state=None if self.parent_state is None else self.parent_state[j],
-            slot=self.slots[j],
+            index_in_batch=self.indices_in_batch[j],
             rng=self.rng,
             info=info,
         )
@@ -294,7 +294,7 @@ class BatchedRoundRecord:
 
     iteration: int
     active: Tuple[int, ...]
-    """Trajectory slots that took part."""
+    """Images that took part, by index in the batch."""
     start_steps: Tuple[int, ...]
     committed: Tuple[int, ...]
     """States committed per active trajectory, all >= 1. Equivalently, levels

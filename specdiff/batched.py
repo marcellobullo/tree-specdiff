@@ -29,8 +29,7 @@ the backend needs no gather beyond the row indexing it already had.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Tuple
 
 from .kernels import NoiseSchedule, ProposalTransition, TargetTransition
 from .ops import Backend, resolve_backend
@@ -46,138 +45,6 @@ from .verify import CheckedVerifier, Verifier
 Array = Any
 
 
-# --------------------------------------------------------------------- proposals
-class BatchedProposal(ABC):
-    """A proposal that knows which trajectory each row belongs to.
-
-    ``slots`` accompanies every call: ``slots[i]`` is the trajectory index of
-    row ``i``. Stateless proposals ignore it; a delayed drift uses it to look
-    up that trajectory's own frozen drift.
-    """
-
-    @abstractmethod
-    def means(self, slots: Sequence[int], states: Array, steps: Sequence[int]) -> Array: ...
-
-    def on_round_start(self, slots: Sequence[int], steps: Sequence[int], roots: Array) -> None: ...
-
-    def on_verified(
-        self, slots: Sequence[int], steps: Sequence[int], states: Array, target_means: Array
-    ) -> None: ...
-
-    def reset(self, num_slots: int) -> None: ...
-
-
-class StatelessBatchedProposal(BatchedProposal):
-    """Adapter lifting any stateless :class:`ProposalTransition` into a batch.
-
-    A draft network, ``IdentityProposal``, ``MirrorProposal``: none of them
-    carry per-trajectory state, so all rows go through in one call and slots
-    are ignored. Refuses a stateful proposal rather than corrupting it.
-    """
-
-    def __init__(self, inner: ProposalTransition) -> None:
-        if getattr(inner, "stateful", False):
-            raise TypeError(
-                f"{type(inner).__name__} is stateful and cannot be shared across a batch: "
-                "its cached state belongs to one trajectory. Use a BatchedProposal "
-                "(e.g. BatchedDelayedDriftProposal) or wrap per slot with PerSlotProposal."
-            )
-        self.inner = inner
-
-    def means(self, slots, states, steps):
-        return self.inner.means(states, steps)
-
-    def reset(self, num_slots):
-        self.inner.reset()
-
-
-class BatchedDelayedDriftProposal(BatchedProposal):
-    """Eq. (7) with root-drift prefetching, one frozen drift per trajectory.
-
-    The increments live in a ``(num_slots, *state_shape)`` buffer, so drafting
-    is a single gather-and-add over the whole batch. The warm-up evaluations
-    that trajectories need before they hold any drift are collected into one
-    batched target call rather than one per trajectory.
-    """
-
-    def __init__(self, target: TargetTransition, *, prefetch: bool = True) -> None:
-        self._target = target
-        self._prefetch = prefetch
-        self._increments: Optional[Array] = None
-        self._have: List[bool] = []
-        self._num_slots = 0
-
-    def reset(self, num_slots: int) -> None:
-        self._increments = None
-        self._have = [False] * num_slots
-        self._num_slots = num_slots
-
-    def on_round_start(self, slots, steps, roots) -> None:
-        ops = resolve_backend(roots)
-        if self._increments is None:
-            self._increments = ops.zeros_stack(self._num_slots, roots[0])
-        missing = [i for i, s in enumerate(slots) if self._prefetch is False or not self._have[s]]
-        if not missing:
-            return
-        rows = ops.take(roots, missing)
-        means = self._target(rows, tuple(steps[i] for i in missing))
-        ops.put(self._increments, [slots[i] for i in missing], means - rows)
-        for i in missing:
-            self._have[slots[i]] = True
-
-    def on_verified(self, slots, steps, states, target_means) -> None:
-        if not self._prefetch:
-            return
-        ops = resolve_backend(states)
-        ops.put(self._increments, list(slots), target_means - states)
-        for s in slots:
-            self._have[s] = True
-
-    def means(self, slots, states, steps):
-        ops = resolve_backend(states)
-        return states + ops.take(self._increments, list(slots))
-
-
-class PerSlotProposal(BatchedProposal):
-    """General fallback: one independent proposal instance per trajectory.
-
-    Correct for any stateful proposal, at the cost of a Python loop over the
-    slots present in each call. Prefer a native batched implementation when the
-    proposal is hot.
-    """
-
-    def __init__(self, factory, num_slots: Optional[int] = None) -> None:
-        self._factory = factory
-        self._instances: List[ProposalTransition] = []
-        if num_slots is not None:
-            self.reset(num_slots)
-
-    def reset(self, num_slots: int) -> None:
-        self._instances = [self._factory() for _ in range(num_slots)]
-
-    def _grouped(self, slots):
-        groups: dict[int, List[int]] = {}
-        for row, s in enumerate(slots):
-            groups.setdefault(s, []).append(row)
-        return groups
-
-    def means(self, slots, states, steps):
-        ops = resolve_backend(states)
-        out = ops.zeros_stack(len(slots), states[0])
-        for slot, rows in self._grouped(slots).items():
-            sub = ops.take(states, rows)
-            ops.put(out, rows, self._instances[slot].means(sub, tuple(steps[r] for r in rows)))
-        return out
-
-    def on_round_start(self, slots, steps, roots) -> None:
-        for row, slot in enumerate(slots):
-            self._instances[slot].on_round_start(steps[row], roots[row])
-
-    def on_verified(self, slots, steps, states, target_means) -> None:
-        for row, slot in enumerate(slots):
-            self._instances[slot].on_verified(steps[row], states[row], target_means[row])
-
-
 # ----------------------------------------------------------------------- sampler
 class BatchedSpeculativeSampler:
     """Algorithm 3 run on ``batch_size`` independent trajectories at once.
@@ -188,9 +55,9 @@ class BatchedSpeculativeSampler:
     * the draft tree must be **level-uniform** (every node at a given depth has
       the same number of children), so that one level's candidates form a
       rectangular ``(batch, K, *shape)`` array;
-    * the proposal must be a :class:`BatchedProposal`. Wrap a stateless one in
-      :class:`StatelessBatchedProposal`; a stateful one belongs in
-      :class:`PerSlotProposal` or gets a native implementation.
+    * the proposal must be level-uniform-safe in the same sense; any
+      :class:`~specdiff.kernels.ProposalTransition` works unchanged, since the
+      interface is the same one the single-image sampler uses.
 
     The verifier needs no change: :meth:`Verifier.verify_batch` falls back to a
     row-wise loop over the rule you already have.
@@ -203,7 +70,7 @@ class BatchedSpeculativeSampler:
     def __init__(
         self,
         target: TargetTransition,
-        proposal: BatchedProposal,
+        proposal: ProposalTransition,
         schedule: NoiseSchedule,
         tree: DraftTree,
         verifier: Verifier,
@@ -215,11 +82,6 @@ class BatchedSpeculativeSampler:
     ) -> None:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
-        if not isinstance(proposal, BatchedProposal):
-            raise TypeError(
-                "the batched sampler needs a BatchedProposal; wrap a stateless "
-                "ProposalTransition in StatelessBatchedProposal"
-            )
         if not tree.is_level_uniform():
             raise ValueError(
                 f"{tree} is not level-uniform, so its candidates cannot form a rectangular "
@@ -335,10 +197,10 @@ class BatchedSpeculativeSampler:
                 break
 
             parent_ids = [r * size + u for r in rows for u in parents]
-            parent_slots = [active[r] for r in rows for _ in parents]
+            parent_indices = [active[r] for r in rows for _ in parents]
             parent_steps = [steps_done[active[r]] + level - 1 for r in rows for _ in parents]
 
-            means = self.proposal.means(parent_slots, ops.take(states, parent_ids), parent_steps)
+            means = self.proposal.means(parent_indices, ops.take(states, parent_ids), parent_steps)
             ops.put(proposal_means, parent_ids, means)
 
             counts = [len(self.tree.children(u)) for _ in rows for u in parents]
@@ -358,13 +220,16 @@ class BatchedSpeculativeSampler:
         """The single batched target call of the iteration, over every live
         trajectory's internal nodes."""
         size = self.tree.size
-        ids, steps = [], []
+        ids, steps, indices_in_batch = [], [], []
         for r, la in enumerate(lookaheads):
             for u in self.tree.internal_nodes:
                 if self.tree.depth_of(u) < la:  # u is internal in T|_{L_n}
                     ids.append(r * size + u)
                     steps.append(steps_done[active[r]] + self.tree.depth_of(u))
-        means = self.target(ops.take(states, ids), tuple(steps))
+                    # active[r], not r: r is the position in the live list, which
+                    # shifts as images finish and leave the batch.
+                    indices_in_batch.append(active[r])
+        means = self.target(tuple(indices_in_batch), ops.take(states, ids), tuple(steps))
         buffer = ops.zeros_stack(len(active) * size, states[0])
         ops.put(buffer, ids, means)
         return buffer, len(ids)
@@ -404,7 +269,7 @@ class BatchedSpeculativeSampler:
 
             request = BatchedVerifyRequest(
                 steps=tuple(steps),
-                slots=tuple(active[r] for r in rows),
+                indices_in_batch=tuple(active[r] for r in rows),
                 proposal_mean=ops.take(proposal_means, parent_ids),
                 target_mean=ops.take(target_means, parent_ids),
                 sigmas=tuple(self.schedule(s) for s in steps),
@@ -426,7 +291,7 @@ class BatchedSpeculativeSampler:
                     result.states,
                 )
             self.proposal.on_verified(
-                request.slots, steps, request.parent_state, request.target_mean
+                request.indices_in_batch, steps, request.parent_state, request.target_mean
             )
 
             for j, r in enumerate(rows):

@@ -19,13 +19,7 @@ topology and the verification rule -- so you supply those and nothing else.
 
 from __future__ import annotations
 
-from .batched import (
-    BatchedDelayedDriftProposal,
-    BatchedProposal,
-    BatchedSpeculativeSampler,
-    PerSlotProposal,
-    StatelessBatchedProposal,
-)
+from .batched import BatchedSpeculativeSampler
 from .kernels import (
     ConstantSchedule,
     DelayedDriftProposal,
@@ -60,10 +54,10 @@ from .verify import (
 )
 
 # Imported for its side effect as much as its names: the rules in
-# `verifiers.stubs` register themselves under "rmc" and "d-grs" at import time,
-# and without this `create_verifier("rmc")` raises KeyError after a bare
-# `import specdiff` -- the registry would advertise only "resample" until some
-# other module happened to pull the subpackage in.
+# `verifiers.rmc` and `verifiers.dgrs` register themselves under "rmc" and
+# "d-grs" at import time, and without this `create_verifier("rmc")` raises
+# KeyError after a bare `import specdiff` -- the registry would advertise only
+# "resample" until some other module happened to pull the subpackage in.
 from .verifiers import (  # noqa: E402
     DEGENERATE_TOL,
     GreedyRejectionSampling,
@@ -90,11 +84,6 @@ __all__ = [
     "NoiseSchedule",
     "ConstantSchedule",
     "TabulatedSchedule",
-    # batched proposals
-    "BatchedProposal",
-    "StatelessBatchedProposal",
-    "BatchedDelayedDriftProposal",
-    "PerSlotProposal",
     # the pluggable rule
     "Verifier",
     "CheckedVerifier",

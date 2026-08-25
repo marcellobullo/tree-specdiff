@@ -20,6 +20,28 @@ Array = Any
 RoundCallback = Callable[[RoundRecord], None]
 
 
+PREFETCH_MODES = ("none", "parent", "nearest")
+"""Which already-computed drift the next round reuses (Appendix C).
+
+``"none"``
+    Reuse nothing: re-evaluate the target at every round's root. Costs one
+    extra NFE per round, and gives the best proposal there is -- the drift is
+    exact at the root by construction.
+``"parent"``
+    The last verified parent's drift. Free, but one step behind the state the
+    next round starts from: it was computed at step ``n + level - 1`` from the
+    parent, while the round begins at ``n + level`` from the child.
+``"nearest"``
+    The freshest drift available *at the committed step*, still free: the
+    committed leaf's own when ``evaluate_leaves`` is on (exact), else the
+    nearest drafted sibling at that depth, else the parent.
+
+Every mode is exact. The proposal only decides which states get drafted; the
+verifier guarantees the committed state is a target draw however stale the
+drift is. These trade acceptance rate, never correctness.
+"""
+
+
 class SpeculativeSampler:
     """Draft-tree speculative sampler.
 
@@ -62,10 +84,18 @@ class SpeculativeSampler:
         *,
         num_steps: int,
         check_contract: bool = False,
+        prefetch: str = "parent",
+        evaluate_leaves: bool = False,
         backend: Optional[Backend] = None,
     ) -> None:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
+        if prefetch not in PREFETCH_MODES:
+            raise ValueError(
+                f"prefetch must be one of {sorted(PREFETCH_MODES)}; got {prefetch!r}. "
+                "It used to be a bool on DelayedDriftProposal: True is now "
+                '"parent", False is now "none".'
+            )
         verifier.check_topology(tree)
         self.target = target
         self.proposal = proposal
@@ -73,6 +103,10 @@ class SpeculativeSampler:
         self.tree = tree
         self.verifier = CheckedVerifier(verifier) if check_contract else verifier
         self.num_steps = int(num_steps)
+        self.prefetch = prefetch
+        self.evaluate_leaves = bool(evaluate_leaves)
+        self._check_root_mean = bool(check_contract)
+        self._exact_root_mean = None
         self._backend = backend
 
     # ------------------------------------------------------------------ public
@@ -93,7 +127,9 @@ class SpeculativeSampler:
         ops = self._backend or resolve_backend(init)
         ops.check_state_dtype(init, "init")
         self.target.reset_stats()
-        self.proposal.reset()
+        self.proposal.reset(1)
+        self.proposal.configure_prefetch(self.prefetch)
+        self._exact_root_mean = None
         self.verifier.reset()
 
         N = self.num_steps
@@ -134,7 +170,8 @@ class SpeculativeSampler:
         ops.put(states, [ROOT], root_state[None])
         proposal_means = ops.zeros_stack(tree.size, root_state)
 
-        self.proposal.on_round_start(n, root_state)
+        # One image is batch_size = 1: every entry belongs to image 0.
+        self.proposal.on_round_start((0,), (n,), ops.stack_rows([root_state]))
 
         # ---------------------------------------------------- Phase 1: drafting
         # lines 5-9. Sequential in depth (a child cannot precede its parent),
@@ -146,7 +183,9 @@ class SpeculativeSampler:
                 break
             step = n + level - 1
             sigma = self.schedule(step)
-            means = self.proposal.means(ops.take(states, parents), (step,) * len(parents))
+            means = self.proposal.means(
+                (0,) * len(parents), ops.take(states, parents), (step,) * len(parents)
+            )
             ops.put(proposal_means, parents, means)
 
             counts = [len(tree.children(u)) for u in parents]
@@ -158,11 +197,37 @@ class SpeculativeSampler:
         # lines 11-13. The single target evaluation of the round, batched over
         # the internal nodes only: leaves are never parents, so their target
         # means are never needed (eq. 26: |I| = B / K).
+        # A round that follows a fully-accepted one under `prefetch="nearest"`
+        # with `evaluate_leaves` already knows its own root's target mean: the
+        # committed leaf's, computed last round at this very state and step.
+        # Re-evaluating it would return the same number, so drop it from the
+        # batch -- one row per round, and the only case where skipping is
+        # provably exact rather than an approximation.
+        known_root_mean, self._exact_root_mean = self._exact_root_mean, None
+
         internal = tree.internal_nodes
-        steps = tuple(n + tree.depth_of(u) for u in internal)
-        target_means_batch = self.target(ops.take(states, internal), steps)
+        if self.evaluate_leaves:
+            # Leaves are never parents, so nothing needs their target mean to
+            # be *verified*. They are evaluated only so `prefetch="nearest"`
+            # has an exact drift to carry when the round accepts every level.
+            # Costs K^L extra rows; see DraftTree.verification_budget.
+            evaluated = internal + tuple(u for u in range(tree.size)
+                                         if u not in set(internal))
+        else:
+            evaluated = internal
+        has_mean = set(evaluated)
+        if known_root_mean is not None:
+            evaluated = tuple(u for u in evaluated if u != ROOT)
+
+        steps = tuple(n + tree.depth_of(u) for u in evaluated)
         target_means = ops.zeros_stack(tree.size, root_state)
-        ops.put(target_means, internal, target_means_batch)
+        if evaluated:
+            ops.put(target_means, evaluated,
+                    self.target((0,) * len(steps), ops.take(states, evaluated), steps))
+        if known_root_mean is not None:
+            ops.put(target_means, [ROOT], known_root_mean[None])
+            if self._check_root_mean:
+                self._verify_exact_root(ops, states, target_means, n)
 
         # -------------------------------------------------- Phase 3: acceptance
         # lines 15-23. Walk down from the root, stopping at the first rejection.
@@ -194,12 +259,27 @@ class SpeculativeSampler:
             # happens whether or not the child was accepted -- the evaluation
             # was made either way, and on a rejection at level 1 it is the only
             # drift the next round will have.
-            self.proposal.on_verified(step, states[u], target_means[u])
+            #
+            # This is the *parent's* drift, one step behind the state the next
+            # round will actually start from. `carry="nearest"` defers the hand-
+            # off to the end of the round so it can pick a drift evaluated at
+            # the committed step instead; see `_carry_nearest`.
+            if self.prefetch == "parent":
+                self._hand_over(ops, step, states[u], target_means[u])
+            elif self.prefetch == "nearest":
+                last_parent, last_children = u, children
+                last_committed = result.state
 
             if not result.accepted:  # line 18: residual sample, round ends
                 rejected = True
                 break
             u = children[result.child_index]  # line 22
+
+        if self.prefetch == "nearest" and committed:
+            self._prefetch_nearest(
+                ops, tree, n, states, target_means, has_mean,
+                last_parent, last_children, last_committed, u, rejected,
+            )
 
         return RoundRecord(
             start_step=n,
@@ -210,6 +290,93 @@ class SpeculativeSampler:
             drafted=tree.budget,
             verified=len(internal),
             proposals_examined=tuple(examined),
+        )
+
+    def _verify_exact_root(self, ops, states, target_means, n: int) -> None:
+        """Assert the reused root mean is what a fresh evaluation would give.
+
+        The optimisation rests on an invariant -- that the committed leaf of the
+        previous round is this round's root, at the same step -- which nothing
+        else enforces. Truncation, a topology change or an off-by-one in the
+        step bookkeeping would break it silently and bias every trajectory, so
+        under ``check_contract`` it is checked. Uses ``target.means`` directly
+        rather than ``target(...)``, so the check itself costs no NFE.
+        """
+        fresh = self.target.means((0,), states[ROOT][None], (n,))[0]
+        if not ops.allclose(fresh, target_means[ROOT]):
+            raise ValueError(
+                "the reused root target mean does not match a fresh evaluation "
+                f"at step {n}. The exact-root optimisation assumed the previous "
+                "round's committed leaf is this round's root; it is not."
+            )
+
+    def _prefetch_nearest(
+        self, ops, tree, n, states, target_means, has_mean,
+        parent, children, committed_state, terminal, rejected,
+    ) -> None:
+        """Hand the proposal the freshest drift available at the committed step.
+
+        The delayed-drift proposal reuses one target drift for the whole of the
+        next round, so what matters is how close that drift is to the state the
+        next round starts from. ``prefetch="parent"`` hands over the last
+        verified parent's, which is wrong on two axes at once: it was computed
+        from the parent, and at the previous step's noise level. This picks a
+        drift at the right step instead.
+
+        Three cases, in order of what is available:
+
+        1.  **Full acceptance.** The round exhausted its lookahead, so the
+            committed state is a leaf. With ``evaluate_leaves`` its own drift
+            was computed in Phase 2 and is *exact* at the next root -- nothing
+            stale at all. Without it, leaves have no target mean and we fall
+            through to the parent.
+        2.  **Rejection above the last level.** The committed state is a
+            residual draw, not a drafted node, so no exact drift exists. Its
+            siblings at that depth do sit at the same step and were verified in
+            Phase 2, so carry the nearest one's. The residual is drawn close to
+            the drafts by construction, which is what makes "nearest" a good
+            proxy rather than an arbitrary pick.
+        3.  **Rejection at the last level** (siblings are leaves, no
+            ``evaluate_leaves``), or anything else unavailable: the parent's.
+
+        Never costs an additional target evaluation -- every drift it can reach
+        was already paid for by Phase 2.
+        """
+        depth = tree.depth_of(parent) + 1
+
+        if not rejected and terminal in has_mean:
+            # Case 1: the committed leaf's own drift, exact at the next root.
+            # It is also the next root's target mean -- same state, same step --
+            # so record it and let Phase 2 drop the root from its batch.
+            self._hand_over(
+                ops, n + tree.depth_of(terminal), states[terminal], target_means[terminal]
+            )
+            self._exact_root_mean = target_means[terminal]
+            return
+
+        usable = [v for v in children if v in has_mean]
+        if rejected and usable:
+            # Case 2: nearest sibling at the committed depth.
+            best, best_d = usable[0], None
+            for v in usable:
+                d = ops.norm(states[v] - committed_state)
+                if best_d is None or d < best_d:
+                    best, best_d = v, d
+            self._hand_over(ops, n + depth, states[best], target_means[best])
+            return
+
+        # Case 3: fall back to the parent, one step stale.
+        self._hand_over(ops, n + depth - 1, states[parent], target_means[parent])
+
+
+    def _hand_over(self, ops, step, state, target_mean) -> None:
+        """Hand one verified node's drift to the proposal.
+
+        The proposal interface is the same at any batch size, so a single-image
+        run passes image 0 and stacks of one row.
+        """
+        self.proposal.on_verified(
+            (0,), (step,), ops.stack_rows([state]), ops.stack_rows([target_mean])
         )
 
 

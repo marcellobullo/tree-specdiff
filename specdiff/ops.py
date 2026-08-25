@@ -58,9 +58,10 @@ class Backend(ABC):
     def finfo_eps(self, ref: Array) -> float:
         """Machine epsilon of ``ref``'s dtype.
 
-        Used for dtype-aware tolerances: ``sqrt(eps)`` is ~1.5e-8 in float64
-        but ~3.4e-4 in float32, and a fixed constant would be wrong for one of
-        them. See :attr:`specdiff.verifiers.rank1.Rank1Frame.degenerate`.
+        Exposed for rules that want a dtype-aware tolerance of their own.
+        Note that the *degeneracy* tolerance is deliberately **not** one of
+        them -- see :data:`specdiff.verifiers.rank1.DEFAULT_DEGENERATE_TOL`
+        for why a dtype-derived threshold was the wrong choice there.
         """
 
     @abstractmethod
@@ -112,11 +113,24 @@ class Backend(ABC):
 
     @abstractmethod
     def norm(self, x: Array) -> float:
-        """Euclidean norm of a single state, as a Python float."""
+        """Euclidean norm of a single state, as a Python float.
+
+        Must reduce in **at least float32**, whatever dtype the state carries.
+        A float16 reduction squares its inputs in float16, whose exponent range
+        cannot hold the result: it underflows to exactly ``0`` below ``~2.4e-4``
+        and overflows to ``inf`` above ``~256``, both well inside the ordinary
+        range of a state. Since ``norm`` feeds ``Rank1Frame.delta``, a zero
+        there is not a small error -- it makes every frame look degenerate and
+        every coupling accept unconditionally.
+        """
 
     @abstractmethod
     def dot(self, x: Array, y: Array) -> float:
-        """Flat inner product of two single states, as a Python float."""
+        """Flat inner product of two single states, as a Python float.
+
+        Same widening requirement as :meth:`norm`; this one feeds the projected
+        coordinate ``S`` in :meth:`Rank1Frame.project`.
+        """
 
     @abstractmethod
     def copy(self, x: Array) -> Array: ...
@@ -185,11 +199,21 @@ class NumpyBackend(Backend):
     def group_rows(self, stack, group_size):
         return stack.reshape((-1, group_size) + stack.shape[1:])
 
+    def _wide(self, x):
+        """Flatten, and promote to at least float32 before reducing.
+
+        See :meth:`Backend.norm`: a float16 reduction squares its inputs in
+        float16, whose 5-bit exponent cannot hold the result. Promotion is a
+        no-op for float32 and float64.
+        """
+        flat = x.reshape(-1)
+        return flat.astype(self._np.promote_types(flat.dtype, self._np.float32), copy=False)
+
     def norm(self, x):
-        return float(self._np.linalg.norm(x.reshape(-1)))
+        return float(self._np.linalg.norm(self._wide(x)))
 
     def dot(self, x, y):
-        return float(self._np.dot(x.reshape(-1), y.reshape(-1)))
+        return float(self._np.dot(self._wide(x), self._wide(y)))
 
     def copy(self, x):
         return x.copy()
@@ -258,11 +282,22 @@ class TorchBackend(Backend):
     def group_rows(self, stack, group_size):
         return stack.reshape((-1, group_size) + tuple(stack.shape[1:]))
 
+    def _wide(self, x):
+        """Flatten, and promote to at least float32 before reducing.
+
+        `torch.linalg.vector_norm` already widens internally, but `torch.dot`
+        does not: a float16 dot underflows to zero below ~1e-4 per term.
+        Promoting to float32 rather than float64 keeps this valid on devices
+        without double support (MPS); float32 and float64 are unchanged.
+        """
+        flat = x.reshape(-1)
+        return flat.to(self._torch.promote_types(flat.dtype, self._torch.float32))
+
     def norm(self, x):
-        return float(self._torch.linalg.vector_norm(x.reshape(-1)).item())
+        return float(self._torch.linalg.vector_norm(self._wide(x)).item())
 
     def dot(self, x, y):
-        return float(self._torch.dot(x.reshape(-1), y.reshape(-1)).item())
+        return float(self._torch.dot(self._wide(x), self._wide(y)).item())
 
     def copy(self, x):
         return x.clone()
