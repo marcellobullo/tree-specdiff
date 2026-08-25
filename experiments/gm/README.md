@@ -17,7 +17,7 @@ The sweep itself needs only NumPy. **Plotting needs matplotlib, pandas and seabo
 none of which are core dependencies:
 
 ```bash
-pip install -e '.[plots]'
+pip install -e '.[dev]'      # or '.[plots]' for plotting alone
 ```
 
 ## 1. Check the simulator first

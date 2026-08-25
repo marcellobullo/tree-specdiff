@@ -6,13 +6,23 @@ requires-python = ">=3.9"
 dependencies = []
 
 [project.optional-dependencies]
+# The library core imports nothing outside the standard library: you choose a
+# backend. These extras are the things built *on* it.
 numpy = ["numpy>=1.24"]
 torch = ["torch>=2.0"]
-dev = ["numpy>=1.24", "pytest>=7"]
-# experiments/gm: plot_gm.py / heatmap.py. The sweep itself needs neither.
+# experiments/gm: plot_gm.py / heatmap.py. The sweep itself needs none of them.
 plots = ["matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13"]
 # experiments/images: pretrained EDM checkpoints, multi-GPU sharding.
 edm = ["torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30"]
+# Tests, plus the plotting stack -- so `[dev]` is enough to run the GM
+# experiment end to end, figures included, without a second install.
+dev = ["numpy>=1.24", "pytest>=7", "matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13"]
+# Everything, for a working machine in one command.
+all = [
+    "numpy>=1.24", "pytest>=7",
+    "matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13",
+    "torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

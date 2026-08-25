@@ -41,11 +41,21 @@ Optional extras. For the PyTorch backend:
 ```bash
 pip install -e '.[torch]'
 ```
-For the image experiments — pretrained EDM checkpoints and multi-GPU sharding
-(see [experiments/images/](experiments/images/README.md)):
+Or everything in one go — tests, plotting, and the image experiments:
 ```bash
-pip install -e '.[dev,edm]'
+pip install -e '.[all]'
 ```
+
+| extra | |
+| --- | --- |
+| `dev` | tests, plus the plotting stack — enough for the whole GM experiment |
+| `plots` | `matplotlib`, `pandas`, `seaborn` — plotting only |
+| `edm` | pretrained EDM checkpoints and multi-GPU sharding, see [experiments/images/](experiments/images/README.md) |
+| `all` | everything above |
+
+The library core itself imports nothing outside the standard library — you pick
+a backend with `[numpy]` or `[torch]`. That is deliberate, and why none of the
+above is a hard dependency.
 On a CUDA box, install `torch` first from the PyTorch index if you need a
 specific CUDA build; the plain PyPI wheel is what `pip` picks otherwise.
 
