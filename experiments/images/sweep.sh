@@ -31,6 +31,7 @@ SEED="${SEED:-0}"
 LABELS="${LABELS:-auto}"               # auto | uniform | none | <class index>
 FORWARD_BATCH="${FORWARD_BATCH:-0}"
 MIN_FREE_MIB="${MIN_FREE_MIB:-6000}"
+NUM_REAL="${NUM_REAL:-50000}"   # real images the FID is measured against
 
 # "K,L" pairs, in the order they run. `-` not `:-`, so CONFIGS="" means NO
 # configs (INCLUDE_TARGET=1 CONFIGS="" generates the baseline alone); with `:-`
@@ -169,23 +170,15 @@ log "generation complete. NFE / acceptance are in:"
 echo
 for d in $dirs; do echo "  $d/meta.json"; done
 echo
-# Scoring is not ported into specdiff yet -- the reference implementation's
-# scorer needs its Inception statistics and dataset loaders, which are a
-# separate piece of work. samples.pt is written in exactly the layout that
-# scorer expects (uint8 (N, C, H, W)), so it can be used unchanged -- and using
-# it keeps these FIDs directly comparable with the ones already computed there.
-if [[ -n "${FID_REPO:-}" ]]; then
-  log "score with the reference implementation:"
-  echo
-  echo "  cd $FID_REPO && python scripts/fid_from_samples.py --samples$dirs \\"
-  echo "      --cache-dir $OUT_ROOT/_fid_cache --device cuda:${GPUS%%,*} \\"
-  echo "      --dataset $DATASET${DATA:+ --data $DATA} \\"
-  echo "      --num-real 50000 --inception-score --output $OUT_ROOT/fid_report.json"
-  echo
-  if [[ "$DATASET" != "cifar10" && -z "$DATA" ]]; then
-    log "note: --dataset $DATASET needs --data (the real images); set DATA= to fill it in above"
-  fi
-else
-  log "set FID_REPO=<accelerating-diffusion-sampling checkout> to have the"
-  log "scoring command printed here; specdiff has no scorer of its own yet."
+log "score with:"
+echo
+echo "  python experiments/images/fid.py --samples$dirs \\"
+echo "      --dataset $DATASET${DATA:+ --data $DATA} --num-real $NUM_REAL \\"
+echo "      --cache-dir $OUT_ROOT --device cuda:${GPUS%%,*} --inception-score \\"
+echo "      --output $OUT_ROOT/fid_report.json"
+echo
+log "the real-set statistics are cached in $OUT_ROOT, so every cell after the"
+log "first is scored without re-featurising the real images."
+if [[ "$DATASET" != "cifar10" && -z "$DATA" ]]; then
+  log "note: --dataset $DATASET needs --data (the real images); set DATA= to fill it in above"
 fi

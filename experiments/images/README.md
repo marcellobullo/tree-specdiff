@@ -10,6 +10,10 @@ Multi-GPU sharding, the `(K, L)` sweep, and SD3 are step 3 onwards.
 | `toy.py` | a closed-form stand-in denoiser, so the wiring is testable with no checkpoint and no GPU |
 | `run_edm.py` | generation driver — writes `samples.pt`, `meta.json`, `grid.png` |
 | `sweep.sh` | the `(K, L)` sweep — d-grs vs rmc across the grid, resumable |
+| `fid.py` | FID and Inception Score from saved samples, with a cached real set |
+| [`cifar10-conditional.md`](cifar10-conditional.md) | full protocol: generate + score, class-conditional CIFAR-10 |
+| [`ffhq.md`](ffhq.md) | the same for FFHQ 64x64 — what differs, and why |
+| [`server-checklist.md`](server-checklist.md) | smoke tests to pass before either protocol |
 | `crosscheck_reference.py` | port fidelity against the sibling implementation |
 | `../../tests/test_edm_images.py` | the test suite for all of the above (CPU, ~5 s) |
 
@@ -128,9 +132,25 @@ Omitting it makes `EDMPrecond` fall back to a zero embedding, which is not a
 trained null token and yields plausible images from the wrong distribution.
 `--labels none` on a conditional checkpoint is refused, and so is the reverse.
 
-**No FID here.** `run_edm.py` writes `samples.pt` as uint8 `(N, 3, H, W)` —
-the layout the existing scorer consumes — and stops. Scoring a generation run
-separately is what lets one expensive run be measured many ways.
+**Scoring is a separate step**, so one expensive generation run can be measured
+many ways. `fid.py` reads the `samples.pt` that `run_edm.py` writes:
+
+```bash
+python experiments/images/fid.py --samples results/edm/*/ --dataset cifar10 --num-real 50000 --device cuda:0 --inception-score --output results/edm/fid_report.json
+```
+
+Needs `pip install -e '.[fid]'`. It uses torchmetrics'
+`FrechetInceptionDistance(feature=2048, normalize=False)` — the same
+implementation the reference uses, so the numbers are comparable with the ones
+computed there. FID is *not* comparable across Inception implementations, so
+that is a fixed choice rather than a detail.
+
+The real-side statistics are cached (`fid_real_<dataset>_<N>_<size>px.pt`).
+FID depends on the real images only through `sum(f)`, `sum(f f^T)` and the
+count, so this is exact, not an approximation — verified to the last decimal —
+and it is what makes scoring a twelve-cell sweep cheap. The filename carries the
+count and resolution, because FID against a different real N or size is a
+different number and must not silently reuse a cache.
 
 ## Verification
 

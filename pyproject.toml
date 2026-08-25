@@ -14,6 +14,9 @@ torch = ["torch>=2.0"]
 plots = ["matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13"]
 # experiments/images: pretrained EDM checkpoints, multi-GPU sharding.
 edm = ["torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30"]
+# experiments/images/fid.py. torch-fidelity is what torchmetrics' FID needs;
+# `datasets` only for --dataset cifar10, which fetches the real images.
+fid = ["torchmetrics>=1.0", "torch-fidelity>=0.3", "datasets>=2.14", "pillow"]
 # Tests, plus the plotting stack -- so `[dev]` is enough to run the GM
 # experiment end to end, figures included, without a second install.
 dev = ["numpy>=1.24", "pytest>=7", "matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13"]
@@ -22,6 +25,7 @@ all = [
     "numpy>=1.24", "pytest>=7",
     "matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13",
     "torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30",
+    "torchmetrics>=1.0", "torch-fidelity>=0.3", "datasets>=2.14",
 ]
 
 [build-system]
