@@ -13,6 +13,13 @@ is the setting to check the sampler in before pointing it at a real model.
 | `plot_gm.py` | `raw.csv` → `summary.csv` + both paper figures |
 | `heatmap.py` | the annotated `(K, L)` grid panels |
 
+The sweep itself needs only NumPy. **Plotting needs matplotlib, pandas and seaborn**,
+none of which are core dependencies:
+
+```bash
+pip install -e '.[plots]'
+```
+
 ## 1. Check the simulator first
 
 ```bash
@@ -50,7 +57,9 @@ evaluation order, so results are identical at any worker count. The sweep skips
 cells already in `raw.csv`, so an interrupted run resumes.
 
 **`summary.csv` is written by `plot_gm.py`, not by the sweep.** Both steps are
-needed.
+needed. If `plot_gm.py` prints `cannot plot: <module> is not installed`, the
+`summary.csv` is still valid — install the named package and re-run the plot
+step alone; the sweep does not need repeating.
 
 ## Outputs
 

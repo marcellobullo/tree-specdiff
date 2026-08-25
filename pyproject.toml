@@ -9,6 +9,8 @@ dependencies = []
 numpy = ["numpy>=1.24"]
 torch = ["torch>=2.0"]
 dev = ["numpy>=1.24", "pytest>=7"]
+# experiments/gm: plot_gm.py / heatmap.py. The sweep itself needs neither.
+plots = ["matplotlib>=3.7", "pandas>=2.0", "seaborn>=0.13"]
 # experiments/images: pretrained EDM checkpoints, multi-GPU sharding.
 edm = ["torch>=2.0", "accelerate>=0.26", "pillow", "diffusers>=0.30"]
 

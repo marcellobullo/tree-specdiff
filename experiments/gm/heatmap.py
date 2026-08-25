@@ -25,9 +25,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib as mpl
-import matplotlib.pyplot as plt
-import numpy as np
-import seaborn as sns
+
+# Agg before pyplot: this module only ever writes files, and every plotting
+# function in plot_gm.py does the same. Without it a headless box has to rely on
+# matplotlib guessing right about the backend.
+mpl.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import seaborn as sns  # noqa: E402
 
 RULE_LABELS = {"rmc": "RMC", "d-grs": "D-GRS (ours)"}
 

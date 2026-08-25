@@ -475,8 +475,15 @@ def main() -> None:
         plot_speedup_vs_budget(summary, out / "speedup_vs_budget")
         plot_calls_by_depth(summary, out / "calls_vs_budget_by_depth")
         plot_speedup_vs_k(summary, out / "speedup_vs_k")
-    except ImportError:
-        print("matplotlib not available; summary.csv written, figures skipped")
+    except ImportError as exc:
+        # Name the module that is actually missing. This used to say
+        # "matplotlib not available" for any ImportError raised anywhere in the
+        # six calls above -- including `import pandas` inside plot_heatmaps --
+        # which sent at least one person installing the wrong package.
+        missing = getattr(exc, "name", None) or str(exc)
+        print(f"cannot plot: {missing} is not installed "
+              f"({exc}). summary.csv was written; figures skipped.")
+        print("  pip install -e '.[plots]'    # matplotlib, pandas, seaborn")
 
 
 if __name__ == "__main__":
