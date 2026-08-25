@@ -11,17 +11,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from specdiff import (  # noqa: E402
-    BatchedDelayedDriftProposal,
     BatchedSpeculativeSampler,
     BatchedVerifyRequest,
     BatchedVerifyResult,
     ConstantSchedule,
     DelayedDriftProposal,
     DraftTree,
-    PerSlotProposal,
     ResampleVerifier,
     SpeculativeSampler,
-    StatelessBatchedProposal,
     Verifier,
     VerifyResult,
 )
@@ -62,7 +59,7 @@ class ParityVerifier(Verifier):
     """A deterministic rule, so the two code paths can be compared exactly.
 
     Not exact -- it is a plumbing fixture, not a coupling. It accepts a child
-    chosen by the step index unless ``(step + slot) % 3 == 0``, which is enough
+    chosen by the step index unless ``(step + image) % 3 == 0``, which is enough
     to desynchronise the batch in a reproducible way. Overrides
     :meth:`verify_batch` to exercise the vectorised path.
     """
@@ -70,11 +67,11 @@ class ParityVerifier(Verifier):
     name = "parity"
 
     @staticmethod
-    def _decide(step, slot, k):
-        return None if (step + slot) % 3 == 0 else step % k
+    def _decide(step, image, k):
+        return None if (step + image) % 3 == 0 else step % k
 
     def verify(self, request):
-        pick = self._decide(request.step, request.slot, request.num_children)
+        pick = self._decide(request.step, request.index_in_batch, request.num_children)
         if pick is None:
             return VerifyResult(request.target_mean, accepted=False)
         return VerifyResult(request.child(pick), accepted=True, child_index=pick)
@@ -82,8 +79,8 @@ class ParityVerifier(Verifier):
     def verify_batch(self, request: BatchedVerifyRequest) -> BatchedVerifyResult:
         ops = resolve_backend(request.children)
         picks = [
-            self._decide(s, slot, request.num_children)
-            for s, slot in zip(request.steps, request.slots)
+            self._decide(s, b, request.num_children)
+            for s, b in zip(request.steps, request.indices_in_batch)
         ]
         states = ops.stack_rows(
             [
@@ -105,7 +102,7 @@ class LoopOnlyParityVerifier(ParityVerifier):
     verify_batch = Verifier.verify_batch
 
     def verify(self, request):
-        pick = self._decide(request.step, request.slot, request.num_children)
+        pick = self._decide(request.step, request.index_in_batch, request.num_children)
         if pick is None:
             return VerifyResult(request.target_mean, accepted=False)
         return VerifyResult(request.child(pick), accepted=True, child_index=pick)
@@ -115,7 +112,7 @@ def _sampler(verifier, *, batch=8, N=24, K=3, L=4, proposal=None, **kw):
     target = LinearGaussianTarget(A)
     return target, BatchedSpeculativeSampler(
         target=target,
-        proposal=proposal or StatelessBatchedProposal(ExactProposal(A)),
+        proposal=proposal or ExactProposal(A),
         schedule=ConstantSchedule(SIGMA),
         tree=DraftTree.uniform(K, L),
         verifier=verifier,
@@ -188,8 +185,8 @@ def test_batch_of_one_reproduces_the_scalar_trajectory_exactly():
     assert np.array_equal(rs.trajectory, rb.trajectories[0])
 
 
-def test_batch_of_one_matches_the_scalar_sampler_with_a_stateful_proposal():
-    """Same, with a delayed drift: PerSlotProposal must reproduce it per slot."""
+def test_batch_of_one_matches_the_scalar_sampler_with_a_remembering_proposal():
+    """Same, with a delayed drift: the per-image memory must survive batching."""
     N, K, L = 21, 3, 4
     t_s, t_b = LinearGaussianTarget(A), LinearGaussianTarget(A)
     scalar = SpeculativeSampler(
@@ -203,7 +200,7 @@ def test_batch_of_one_matches_the_scalar_sampler_with_a_stateful_proposal():
     rs = scalar.sample(np.zeros(4), rng=np.random.default_rng(0))
     batched = BatchedSpeculativeSampler(
         target=t_b,
-        proposal=PerSlotProposal(lambda: DelayedDriftProposal(t_b)),
+        proposal=DelayedDriftProposal(t_b),
         schedule=ConstantSchedule(SIGMA),
         tree=DraftTree.uniform(K, L),
         verifier=DeterministicVerifier(),
@@ -240,8 +237,8 @@ def test_stragglers_make_the_batch_slower_than_its_members():
 def _steps_reached(result):
     reached = [0] * result.batch_size
     for rec in result.rounds:
-        for slot, c in zip(rec.active, rec.committed):
-            reached[slot] += c
+        for image, c in zip(rec.active, rec.committed):
+            reached[image] += c
     return reached
 
 
@@ -273,7 +270,7 @@ def test_batched_trajectory_law_is_unchanged():
     target = LinearGaussianTarget(A)
     sampler = BatchedSpeculativeSampler(
         target=target,
-        proposal=StatelessBatchedProposal(ExactProposal(A)),
+        proposal=ExactProposal(A),
         schedule=ConstantSchedule(SIGMA),
         tree=DraftTree.uniform(3, 3),
         verifier=CoinFlipVerifier(p=0.5, seed=8),
@@ -304,14 +301,26 @@ def test_vectorised_verify_batch_agrees_with_the_row_loop():
 
 
 # --------------------------------------------------------------------- proposals
-def test_stateful_proposal_cannot_be_shared_across_a_batch():
+def test_delayed_drift_keeps_one_drift_per_image():
+    """Each image's frozen drift is its own.
+
+    There is no longer a wrapper that could share one drift across the batch,
+    so the property is tested where it now lives: the proposal itself indexes
+    its buffer by ``indices_in_batch``. Three images given three different
+    roots must draft three different means from an identical state -- if the
+    buffer were shared, all three rows would come back equal.
+    """
     target = LinearGaussianTarget(A)
-    try:
-        StatelessBatchedProposal(DelayedDriftProposal(target))
-    except TypeError as exc:
-        assert "stateful" in str(exc)
-    else:
-        raise AssertionError("a stateful proposal was silently shared across the batch")
+    proposal = DelayedDriftProposal(target)
+    proposal.reset(3)
+
+    roots = np.array([[1.0, 0, 0, 0], [0, 2.0, 0, 0], [0, 0, 3.0, 0]])
+    proposal.on_round_start((0, 1, 2), (0, 0, 0), roots)
+
+    shared = np.zeros((3, 4))
+    out = proposal.means((0, 1, 2), shared, (0, 0, 0))
+    assert not np.allclose(out[0], out[1])
+    assert np.allclose(out, shared + (target((0, 1, 2), roots, (0, 0, 0)) - roots))
 
 
 def test_batched_delayed_drift_warms_up_once_for_the_whole_batch():
@@ -319,7 +328,7 @@ def test_batched_delayed_drift_warms_up_once_for_the_whole_batch():
     target = LinearGaussianTarget(A)
     sampler = BatchedSpeculativeSampler(
         target=target,
-        proposal=BatchedDelayedDriftProposal(target, prefetch=True),
+        proposal=DelayedDriftProposal(target),
         schedule=ConstantSchedule(0.05),
         tree=DraftTree.uniform(2, 3),
         verifier=ResampleVerifier(),
@@ -332,30 +341,13 @@ def test_batched_delayed_drift_warms_up_once_for_the_whole_batch():
     assert _steps_reached(r) == [N] * batch
 
 
-def test_per_slot_proposal_keeps_state_separate():
-    N, batch = 12, 4
-    target = LinearGaussianTarget(A)
-    sampler = BatchedSpeculativeSampler(
-        target=target,
-        proposal=PerSlotProposal(lambda: DelayedDriftProposal(target, prefetch=True)),
-        schedule=ConstantSchedule(0.05),
-        tree=DraftTree.uniform(2, 2),
-        verifier=ResampleVerifier(),
-        num_steps=N,
-    )
-    r = sampler.sample(np.zeros((batch, 3)), rng=np.random.default_rng(14))
-    # one warm-up per slot here, since the instances are independent
-    assert r.target_calls == N + batch
-    assert _steps_reached(r) == [N] * batch
-
-
 def test_irregular_tree_is_rejected_with_a_useful_message():
     target = LinearGaussianTarget(A)
     pruned = DraftTree([-1, 0, 0, 1, 1, 2])  # node 1 has 2 children, node 2 has 1
     try:
         BatchedSpeculativeSampler(
             target=target,
-            proposal=StatelessBatchedProposal(ExactProposal(A)),
+            proposal=ExactProposal(A),
             schedule=ConstantSchedule(SIGMA),
             tree=pruned,
             verifier=AcceptFirstVerifier(),

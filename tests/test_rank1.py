@@ -11,7 +11,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from specdiff import VerifyRequest  # noqa: E402
-from specdiff.verifiers.rank1 import Rank1Frame  # noqa: E402
+from specdiff.ops import standard_normal_cdf, standard_normal_sf  # noqa: E402
+from specdiff.verifiers.rank1 import (  # noqa: E402
+    DEFAULT_DEGENERATE_TOL,
+    Rank1Frame,
+)
 
 
 def _frame(delta, dim=8, dtype=np.float64, sigma=1.0, tol=None):
@@ -68,13 +72,50 @@ def test_degenerate_uses_a_tolerance_not_exact_equality():
     assert not _frame(1e-3).degenerate
 
 
-def test_degenerate_tolerance_follows_the_dtype():
-    """sqrt(eps) is ~1.5e-8 in float64 but ~3.4e-4 in float32; a single
-    hardcoded constant would be wrong for one of them."""
-    f64, f32 = _frame(1e-5, dtype=np.float64), _frame(1e-5, dtype=np.float32)
-    assert f64.tol < 1e-6 < f32.tol
-    assert not f64.degenerate
-    assert f32.degenerate
+def test_degenerate_tolerance_does_not_follow_the_dtype():
+    """The threshold is a constant, deliberately.
+
+    Everything that can break down here -- `delta`, `tau`, the D-GRS masses --
+    is a Python float computed in float64 whatever the states carry, so the
+    floor is a property of float64, not of the array. It used to be `sqrt(eps)`
+    of the state dtype, which is ~3.1e-2 in float16: large enough that
+    accepting unconditionally admits 1.2% total variation per node, in exactly
+    the small-delta regime a good proposal produces.
+    """
+    for dtype in (np.float64, np.float32, np.float16):
+        assert _frame(1.0, dtype=dtype).tol == DEFAULT_DEGENERATE_TOL
+    # A displacement float16 *can* represent is not degenerate any more. Under
+    # the old sqrt(eps) rule this was, and the coupling silently skipped its
+    # acceptance test here.
+    assert not _frame(1e-5, dtype=np.float16).degenerate
+    # Below the dtype's own smallest subnormal (~6e-8) the two means are
+    # bit-identical, so delta really is zero. That is the dtype's limit, not
+    # the tolerance's, and firing the shortcut there is correct.
+    assert _frame(1e-9, dtype=np.float16).degenerate
+
+
+def test_degenerate_tolerance_clears_the_float64_floor():
+    """Pins the mechanism the constant is sized against, so it cannot be
+    retuned blind.
+
+    `G_2 = Phi_bar(-delta/2) - Phi_bar(delta/2)` is mathematically
+    `delta / sqrt(2 pi)`. float64 resolves it until the two survival terms
+    cancel outright, at `delta ~ 1e-15`. Below that the D-GRS residual mass is
+    zero and the rule takes its fallback path, so the tolerance must sit above
+    it -- with margin, since the only cost of a *smaller* tolerance is that the
+    shortcut fires less often.
+    """
+    floor = None
+    for exponent in range(10, 20):
+        delta = 10.0**-exponent
+        if standard_normal_sf(-delta / 2) - standard_normal_sf(delta / 2) <= 0.0:
+            floor = delta
+            break
+    assert floor is not None, "G_2 never underflowed; the floor moved"
+    assert floor <= 1e-15, f"floor at {floor:.0e}, tighter than assumed"
+    assert DEFAULT_DEGENERATE_TOL > floor * 1e4, "tolerance has too little margin"
+    # ... and the shortcut it buys costs almost nothing.
+    assert 2.0 * standard_normal_cdf(DEFAULT_DEGENERATE_TOL / 2) - 1.0 < 1e-10
 
 
 def test_tau_is_guarded_on_a_degenerate_frame():

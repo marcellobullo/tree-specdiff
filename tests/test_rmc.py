@@ -35,7 +35,7 @@ from specdiff import (  # noqa: E402
 from specdiff.kernels import ConstantSchedule, TargetTransition  # noqa: E402
 from specdiff.ops import standard_normal_sf  # noqa: E402
 from specdiff.verifiers.rank1 import Rank1Frame  # noqa: E402
-from specdiff.verifiers.stubs import ReflectionMaximalCoupling  # noqa: E402
+from specdiff.verifiers.rmc import ReflectionMaximalCoupling  # noqa: E402
 
 DIM = 8
 SIGMA = 0.7
@@ -182,7 +182,8 @@ def test_accepted_state_is_the_drafted_child():
 
 def test_both_endpoints_of_the_uniform_are_handled():
     """`ops.uniform` returns [0, 1), so `u` can be exactly 0 -- where `math.log`
-    raises `ValueError` and `math.log1p(-u)` does not. About one node in 2^53,
+    raises `ValueError` and `math.log1p(-u)` does not. One node in 2^53 on NumPy, and
+    one in 2^24 (~6e-8) on the torch backend, where torch.rand is float32,
     i.e. never in this suite and eventually in a long run.
 
     Note which endpoint is which. Comparing `log1p(-u)` means the effective
@@ -242,7 +243,7 @@ def test_registered_under_rmc_on_a_bare_import():
 class _ShiftKernel(TargetTransition):
     """A trivial target: one fixed step per call. Enough to drive the sampler."""
 
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         return states + 0.1
 
 
