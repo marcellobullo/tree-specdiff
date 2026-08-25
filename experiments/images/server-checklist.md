@@ -29,8 +29,8 @@ The single largest unknown. Unpickling needs EDM's `torch_utils` and `dnnlib`
 importable, and **executes code from the pickle**.
 
 ```bash
-git clone https://github.com/NVlabs/edm.git ~/edm
-curl -L -o ~/edm-cifar10-32x32-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl
+git clone https://github.com/NVlabs/edm.git ~/specdiff/edm
+curl -L -o ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
 ```
 
 ```bash
