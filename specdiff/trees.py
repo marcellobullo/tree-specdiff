@@ -115,8 +115,41 @@ class DraftTree:
 
     @property
     def budget(self) -> int:
-        """``B = |V| - 1``, the number of drafted (hence proposal-evaluated) states."""
+        """``B = |V| - 1``: the states this round **drafts**.
+
+        The paper's proposal budget (eq. 12, ``B = K + ... + K^L`` when
+        uniform), and the x-axis every speedup is plotted against. It is a
+        *proposal* cost: under the self-speculative delayed drift, drafting a
+        state is a vector add, not a network call.
+
+        The expensive budget is :meth:`verification_budget`, which counts the
+        states the **target** sees. The two differ by a factor of ``K``, so do
+        not read ``budget`` as the hardware requirement.
+        """
         return self.size - 1
+
+    def verification_budget(self, *, evaluate_leaves: bool = False) -> int:
+        """States the **target** must evaluate per round.
+
+        This is the expensive budget, and the one that sets the batch a round
+        has to fit in memory. Contrast :attr:`budget`, which counts drafted
+        states.
+
+        ``evaluate_leaves=False`` (default)
+            ``|I|``, the internal nodes -- what the sampler actually evaluates.
+            Leaves are never parents, so their target means are never needed to
+            verify anything (eq. 26: ``|I| = B / K`` when uniform).
+        ``evaluate_leaves=True``
+            ``|I|`` plus the leaf level. A delayed-drift proposal can use the
+            leaf drifts to carry an *exact* drift into the next round on full
+            acceptance, worth a few percent of NFE speedup; it costs ``K^L``
+            extra rows, taking the batch from ``B / K`` to ``B + 1``.
+
+        The ``+1`` is the root. specdiff evaluates it, because its target mean
+        is what verifies the depth-1 children. An implementation whose carry is
+        exact *at* the root can skip it and land on exactly ``B``.
+        """
+        return self.size if evaluate_leaves else len(self._internal)
 
     @property
     def depth(self) -> int:
@@ -126,7 +159,10 @@ class DraftTree:
     @property
     def internal_nodes(self) -> Tuple[int, ...]:
         """``I(T)``: nodes with children. These, and only these, are the states
-        the target model is evaluated at (eq. 26: ``|I| = B / K`` when uniform)."""
+        the target model is evaluated at (eq. 26: ``|I| = B / K`` when uniform).
+
+        See :meth:`verification_budget` for the count, and for what changes if
+        the leaf level is evaluated too."""
         return self._internal
 
     def parent(self, u: int) -> int:
