@@ -19,10 +19,32 @@ Four things can be wrong in the port, and there is one test class for each:
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
 import pytest
+
+def two_sample_ks(a, b) -> float:
+    """Two-sample Kolmogorov-Smirnov statistic, without scipy.
+
+    `specdiff.testing._ks_statistic` rolls its own one-sample KS for the same
+    reason: the library declares no scientific-stack dependency, and a test
+    guarded by `importorskip` on one would skip silently rather than fail --
+    which is exactly how this test came to pass locally and skip on a server.
+    """
+    a, b = sorted(float(x) for x in a), sorted(float(x) for x in b)
+    n, m = len(a), len(b)
+    i = j = 0
+    stat = 0.0
+    while i < n and j < m:
+        if a[i] <= b[j]:
+            i += 1
+        else:
+            j += 1
+        stat = max(stat, abs(i / n - j / m))
+    return stat
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -263,7 +285,6 @@ class TestSampling:
         the cheap version of ``specdiff.testing.check_exactness`` applied to the
         assembled model rather than to a rule in isolation.
         """
-        stats = pytest.importorskip("scipy.stats")
         s = models.build(make_denoiser(img_resolution=4), num_steps=STEPS, eps=EPS)
         tree = DraftTree.uniform(branching=2, lookahead=3)
 
@@ -286,8 +307,13 @@ class TestSampling:
 
         # Disjoint seed blocks: shared seeds would couple the two samples and
         # make the KS test meaningless.
-        p = stats.ks_2samp(draw(spec, 1_000, 300), draw(base, 500_000, 300)).pvalue
-        assert p > 0.01, f"speculative and standard laws differ (KS p = {p:.4f})"
+        n = 300
+        stat = two_sample_ks(draw(spec, 1_000, n), draw(base, 500_000, n))
+        # Two-sample critical value at alpha = 0.01: c(alpha) sqrt((n + m) / nm).
+        crit = 1.63 * math.sqrt((n + n) / (n * n))
+        assert stat <= crit, (
+            f"speculative and standard laws differ (KS {stat:.4f} > {crit:.4f})"
+        )
 
 
 class TestBatched:
