@@ -99,7 +99,7 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
 
         # --- the proposal's frozen drift (DelayedDriftProposal.on_round_start)
         if increment is None or prefetch == "none":
-            increment = target.means(state[None], (n,))[0] - state
+            increment = target.means((0,), state[None], (n,))[0] - state
             calls += 1
             rows += 1
             known_root_mean = None
@@ -126,7 +126,7 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
             sigma = schedule(step)
             proposal_mean = parent + increment
             if parent_mean is None:
-                parent_mean = target.means(parent[None], (step,))[0]
+                parent_mean = target.means((0,), parent[None], (step,))[0]
 
             children = proposal_mean + sigma * ops.randn_stack(K, init, rng)
             result = verifier(VerifyRequest(
@@ -167,14 +167,14 @@ def _prefetch_nearest(ops, target, committed_state, parent, parent_mean, childre
     if not rejected and evaluate_leaves:
         # Case 1: the committed leaf's own drift -- exact at the next root, and
         # therefore also the next root's target mean.
-        mean = target.means(committed_state[None], (n + depth,))[0]
+        mean = target.means((0,), committed_state[None], (n + depth,))[0]
         return mean - committed_state, mean
 
     if rejected and (depth <= lookahead - 1 or evaluate_leaves):
         # Case 2: nearest drafted sibling at the committed depth. Its siblings
         # are internal (so already paid for) unless the rejection was at the
         # last level, which only `evaluate_leaves` covers.
-        means = target.means(children, (n + depth,) * len(children))
+        means = target.means((0,) * len(children), children, (n + depth,) * len(children))
         d = [ops.norm(children[j] - committed_state) for j in range(len(children))]
         j = int(np.argmin(d))
         return means[j] - children[j], None
