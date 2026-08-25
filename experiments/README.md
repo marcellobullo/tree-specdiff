@@ -6,7 +6,7 @@ they live here rather than in `examples/` (seconds, pedagogical) or `tests/`
 
 | directory | setting |
 | --- | --- |
-| `gm/` | the Gaussian mixture of Section 5.1 — no network, runs on a laptop |
+| `gm/` | the Gaussian mixture of Section 5.1 — no network, runs on a laptop; see [gm/README.md](gm/README.md) |
 | `images/` | pretrained EDM checkpoints (CIFAR-10, FFHQ) — see [images/README.md](images/README.md) |
 
 ## Gaussian mixture — the (K, L) sweep (Figures 1 and 3)
@@ -29,8 +29,11 @@ One plotting script rather than two, because both figures come from the same
 `raw.csv -> summary.csv` reduction; splitting them would duplicate that step or
 make one import the other.
 
-Defaults reproduce the reference run: `d=512`, 5 components, `T=30`,
+Defaults match the reference run's protocol: `d=512`, 5 components, `T=30`,
 `eps=0.06`, mixture seed `20260714`, `K, L in 1..7`, 100 trajectories per cell.
+The one exception is the sampling seed — `results/gm/20260820-193412` used
+`--seed 14`, where the default is `20260714`, so add it to reproduce that
+directory cell for cell rather than only in distribution.
 
 `gm_sweep.py` writes each cell as it completes and skips cells already present,
 so an interrupted run resumes.
