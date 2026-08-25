@@ -34,17 +34,20 @@ class LinearGaussianTarget(TargetTransition):
         super().__init__()
         self.a = a
 
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         return self.a * states
 
 
 class ExactProposal(ProposalTransition):
-    """Same mean map as the target, but does not spend an NFE (test double)."""
+    """Same mean map as the target, but does not spend an NFE (test double).
+
+    Keeps no per-image memory, so ``indices_in_batch`` is ignored.
+    """
 
     def __init__(self, a: float) -> None:
         self.a = a
 
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         return self.a * states
 
 
@@ -79,6 +82,35 @@ def test_tree_budget_and_internals():
     assert DraftTree.largest_uniform(budget=155, branching=2).depth == 6  # 2+..+2^6 = 126
     widths = DraftTree.from_widths([3, 1, 2])
     assert widths.budget == 3 + 3 + 6 and not widths.is_uniform()
+
+
+def test_budget_and_verification_budget_are_different_costs():
+    """`budget` counts drafted states, `verification_budget` target states.
+
+    They are separated because they are paid in different currencies: drafting
+    is a vector add under the delayed drift, while verification is the network.
+    Reading `B` as the hardware requirement overstates what the target sees by
+    a factor of K -- which is the whole reason a wide tree is affordable.
+    """
+    for K in (1, 2, 3, 5):
+        for L in (1, 2, 3, 4):
+            tree = DraftTree.uniform(K, L)
+            assert tree.verification_budget() == len(tree.internal_nodes)
+            assert tree.verification_budget() == tree.budget // K  # eq. (26)
+            # Evaluating the leaves as well means evaluating every node: the
+            # drafted states plus the root, i.e. B + 1.
+            assert tree.verification_budget(evaluate_leaves=True) == tree.budget + 1
+            assert (
+                tree.verification_budget(evaluate_leaves=True)
+                - tree.verification_budget()
+                == K**L
+            ), "the leaf level is exactly K^L extra rows"
+
+    # A chain is the case where the distinction collapses: every node but the
+    # last is a parent, so |I| == B and the leaf level is a single row.
+    chain = DraftTree.chain(9)
+    assert chain.budget == chain.verification_budget() == 9
+    assert chain.verification_budget(evaluate_leaves=True) == 10
 
 
 def test_tree_truncation():
@@ -146,7 +178,7 @@ def test_delayed_drift_prefetching_costs_one_warmup_call():
     target = LinearGaussianTarget()
     sampler = SpeculativeSampler(
         target=target,
-        proposal=DelayedDriftProposal(target, prefetch=True),
+        proposal=DelayedDriftProposal(target),
         schedule=ConstantSchedule(0.05),
         tree=DraftTree.uniform(2, L),
         verifier=ResampleVerifier(),
