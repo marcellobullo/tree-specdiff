@@ -425,6 +425,11 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out):
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    # Long tree runs allocate and free many differently-sized activation blocks;
+    # without this the allocator can fragment itself out of memory even when the
+    # total is fine. Harmless when memory is plentiful. Set before any CUDA
+    # context exists, and only if the caller has not chosen their own policy.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     accelerator = None
     rank, world = 0, 1
@@ -458,6 +463,14 @@ def main(argv=None) -> None:
               f"{len(setting.deterministic_steps)} Euler), eps={args.eps}")
         print(f"tree {tree}: proposal budget B={tree.budget}, "
               f"verification budget |I|={tree.verification_budget()} rows per round")
+        # The number that actually sets peak memory, and the one to lower when a
+        # run OOMs: one target call carries sample_batch x |I| states.
+        eff = args.sample_batch or args.num_samples
+        rows = eff * tree.verification_budget()
+        print(f"memory  : {eff} trajectories x |I|={tree.verification_budget()} "
+              f"= {rows} states per target call"
+              + (f", split into forwards of {args.forward_batch}"
+                 if args.forward_batch > 0 else " (one forward)"))
         print(f"labels: {label_mode}"
               + (f" over {denoiser.num_classes} classes" if label_mode != "none" else ""))
     print(f"rank {rank}: images {start}..{start + count - 1}", flush=True)
