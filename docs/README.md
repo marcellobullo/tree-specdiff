@@ -12,11 +12,11 @@ five-line quick start. These four documents go deeper.
 
 ## Common starting points
 
-**"I want to implement Algorithm 2, or a coupling of my own."**
+**"I want to write a coupling of my own."**
 [writing-a-verifier.md](writing-a-verifier.md), then
 [the section on the paper's two rules](writing-a-verifier.md#the-papers-two-algorithms).
-Algorithm 1 (`rmc`) is already implemented and is the worked reference; Algorithm 2 (`d-grs`)
-is left to the reader.
+Both are implemented — `rmc` is the short one to read first, `d-grs` is the one that shows what
+a sequence coupling over `K` proposals costs.
 
 **"I want to know if speculation is worth it on my model."**
 [Measuring your headroom first](writing-a-verifier.md#measuring-your-headroom-first) — a probe

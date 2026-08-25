@@ -29,7 +29,7 @@ You are given one parent node and its drafted children, and you return one state
 | `request.sigma` | the scale both kernels share at this step |
 | `request.children` | `(K, *state_shape)`, **in drafting order** |
 | `request.rng` | the run's generator — use this one |
-| `request.step`, `.slot`, `.parent_state`, `.info` | context, if you need it |
+| `request.step`, `.index_in_batch`, `.parent_state`, `.info` | context, if you need it |
 
 | you return | |
 | --- | --- |
@@ -100,8 +100,18 @@ if frame.degenerate:              # the two kernels coincide, so accept anything
 tau = frame.tau(lam)              # ln(lam) / delta, guarded
 ```
 
-`degenerate` is `delta <= tol`, **not** `delta == 0`, with `tol = sqrt(eps)` of the state
-dtype — about `1.5e-8` in float64 and `3.4e-4` in float32.
+`degenerate` is `delta <= tol`, **not** `delta == 0`, with `tol = 1e-10`
+(`DEFAULT_DEGENERATE_TOL`) — a constant, and deliberately *not* derived from the state dtype.
+Everything that can break down here — `delta`, `tau = ln(lambda)/delta`, the D-GRS masses
+`G_k` — is a Python float computed in float64 whatever the states carry, so the floor is a
+property of float64, not of the array. That floor is `delta ~ 1e-15`, where
+`G_2 = Phi_bar(-delta/2) - Phi_bar(delta/2)` cancels to zero; `1e-10` clears it by five orders
+of magnitude while admitting only `~4e-11` of total variation.
+
+The shortcut is not free — it accepts unconditionally, which costs `TV = delta / sqrt(2 pi)`
+every time it fires — so a loose tolerance spends exactness silently, in exactly the
+small-`delta` regime a good proposal produces. This was previously `sqrt(eps)` of the state
+dtype, which is `3.1e-2` in float16: `check_exactness` detects that as non-exact.
 
 Exact equality is the wrong predicate, and the reason is worth internalising: the regime that
 breaks a rule is small-and-nonzero `delta`, which is precisely what a *good* proposal produces.
@@ -311,8 +321,8 @@ rule = create_verifier("my-rule")          # addressable from a config file
 
 ## The paper's two algorithms
 
-`specdiff/verifiers/stubs.py` holds `ReflectionMaximalCoupling` (Algorithm 1) and
-`GreedyRejectionSampling` (Algorithm 2).
+`specdiff/verifiers/rmc.py` holds `ReflectionMaximalCoupling` (Algorithm 1) and
+`specdiff/verifiers/dgrs.py` holds `GreedyRejectionSampling` (Algorithm 2).
 
 **Algorithm 1 is implemented**, and is the worked reference for everything above: about
 fifteen lines, no framework import, and it runs under both samplers. Read it before writing
@@ -334,24 +344,47 @@ Two numerical points in that body worth stealing:
   Gaussian density: neither of the paper's rules needs one.
 - **Compare in log space with `math.log1p(-u)`, not `math.log(u)`.** `ops.uniform` returns
   `[0, 1)`, so `u` can be exactly `0` and `math.log` raises `ValueError` — about once in
-  `2^53` nodes, i.e. never in your test sweep and eventually in someone's long run. `1 - u` is
+  `2^53` nodes on NumPy — but `torch.rand` is float32, so on the torch backend it is `2^-24`,
+  about `6e-8`, which a long run will reach. `1 - u` is
   uniform too, and `log1p` is defined on precisely the range `uniform()` guarantees. No cap on
   the ratio is then needed: the left side is `<= 0`, so a positive log-ratio accepts
   unconditionally, which *is* the `1 ^ ·`. (In PyTorch `torch.log(0)` returns `-inf` rather
   than raising, so a rule ported from a tensor implementation can hide this bug.)
 
-**Algorithm 2 is left as the reader's work** — the class fixes its name, topology constraint
-and telemetry so that filling it in is a local edit. What follows is what you need, not the
-answer.
-
-**Greedy rejection sampling, any `K`.** Sweep the children *in drafting order* —
-this is the sequence coupling, not the list coupling. Maintain the level `lambda_k` and the
-residual mass `G_{k+1}`, and accept child `k` with probability
-`1 ^ (rho(s_k) - lambda_{k-1})_+ / G_k`. On a full sweep of rejections, sample the normalised
-residual (eq. 13). The masses of the super-level sets are half-space masses in the projected
-coordinate — `Q(H_k) = Phi_bar(tau_k - delta/2)` and `P(H_k) = Phi_bar(tau_k + delta/2)` with
-`tau_k = ln(lambda_k) / delta` (Appendix B.2) — so no numerical integration is needed. Report
+**Algorithm 2 — greedy rejection sampling, any `K`** — is `create_verifier("d-grs")`, and is
+the rule a branching tree exists for. It sweeps the children *in drafting order* — this is the
+sequence coupling, not the list coupling. It maintains the level `lambda_k` and the residual
+mass `G_{k+1}`, accepting child `k` with probability
+`1 ^ (rho(s_k) - lambda_{k-1})_+ / G_k` where `rho(s) = phi(s - delta) / phi(s)`. On rejection
+the level rises to `lambda_k = lambda_{k-1} + G_k`, inducing the super-level set
+`H_k = {s : rho(s) >= lambda_k}` and leaving `G_{k+1} = Q(H_k) - lambda_k P(H_k)`. After a full
+sweep of rejections it samples the normalised residual (eq. 13). It reports
 `proposals_examined = k` on acceptance and `K + 1` on the residual branch.
+
+The masses are half-space masses in the projected coordinate —
+`Q(H_k) = Phi_bar(tau_k - delta/2)` and `P(H_k) = Phi_bar(tau_k + delta/2)` with
+`tau_k = ln(lambda_k) / delta` (Appendix B.2) — so no numerical integration is needed
+*anywhere*, including in the residual: eq. (13)'s positive part is a half-line, so its CDF is
+a difference of `Phi_bar`s and inverting it is a bisection.
+
+Three things in that body that generalise to any sequence coupling:
+
+- **Project every child before the sweep starts.** The residual branch needs `Z_perp` of the
+  *first* child (line 18), not the last one examined, so the projections cannot be consumed
+  and discarded as you go.
+- **Accept on `u < beta`, not `u <= beta`.** `ops.uniform` returns `[0, 1)`, so `u` can be
+  exactly `0`, and `<=` would accept even at `beta = 0` — which is the state *every child below
+  the current level* is in, not a rare one. On the torch backend `torch.rand` is float32, so
+  that misfires with probability `2^-24` (~`6e-8`) per such child; at a million of them it is a
+  6% chance of one silently wrong acceptance.
+- **Clamp `G_k` at zero.** It is a difference of two survival functions and can go a few ulps
+  negative once the remaining mass is near zero; a negative mass turns the next `beta` into
+  garbage rather than into a rejection.
+
+Acceptance is `1 - G_{K+1}` (Theorem 2, eqs. 14–15) and rises with `K` — which is the whole
+argument for a tree. At `K = 1` the recursion gives `lambda_1 = 1` and `G_2 = 2 Phi(delta/2) - 1`,
+so it collapses to eq. (16): the same acceptance as RMC. The two rules differ at `K = 1` only
+in what they return on rejection — RMC reflects, D-GRS draws from the residual.
 
 `specdiff.ops` provides `standard_normal_cdf` and `standard_normal_sf` so neither needs SciPy,
 and `Rank1Frame.tau` computes `tau_k` with the degeneracy guard already applied.
@@ -370,10 +403,12 @@ free. The third bites either rule.
 3. **Degeneracy.** Check `frame.degenerate` before computing any `tau`. See
    [above](#degeneracy).
 
-`tests/test_rmc.py` is the shape the Algorithm 2 tests should take: an exactness sweep, the
-analytic acceptance probability checked against the measured one, the structural claim of the
-rejection branch, and the topology guard. Only the second and third change — eq. (15) instead
-of eq. (16), and a residual branch instead of a reflection.
+`tests/test_rmc.py` and `tests/test_dgrs.py` are the shape your own rule's tests should take:
+an exactness sweep over `delta` (including `0`) and `K`, the analytic acceptance probability
+checked against the measured one, the structural claim of the rejection branch, and the
+topology guard. Note that exactness alone is a weak test — `ResampleVerifier` passes every KS
+check and accepts nothing — so the acceptance-probability assertion is what actually pins a
+rule to the algorithm it claims to implement.
 
 ## Checklist
 

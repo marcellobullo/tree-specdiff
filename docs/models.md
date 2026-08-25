@@ -34,7 +34,7 @@ class MyDenoiser(TargetTransition):
         super().__init__()                    # sets up the counters
         self.net, self.times, self.gamma = net, times, gamma
 
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         """(rows, *state_shape) states at `rows` step indices -> means, same shape."""
         t = self.times[list(steps)]           # steps is a tuple of ints, one per row
         drift = self.net(states, t)
@@ -50,7 +50,7 @@ whole point; a loop over rows throws the speedup away.
 network takes a scalar timestep, group by step:
 
 ```python
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         out = np.empty_like(states)
         for step in sorted(set(steps)):
             idx = [i for i, s in enumerate(steps) if s == step]
@@ -142,35 +142,34 @@ class DraftNetProposal(ProposalTransition):
     def __init__(self, small_net):
         self.net = small_net
 
-    def means(self, states, steps):
+    def means(self, indices_in_batch, states, steps):
         return states + self.net(states, steps)
 ```
 
-Three optional hooks exist because the interesting proposals are stateful:
-`on_round_start(step, root_state)`, `on_verified(step, state, target_mean)`, and `reset()`.
+`indices_in_batch[i]` says which of the `batch_size` images entry `i` belongs to. A proposal
+that keeps no per-image memory — a draft network, `Identity`, `Mirror` — ignores it, as above.
+
+Three optional hooks exist because the interesting proposals *do* keep per-image memory:
+`on_round_start(indices_in_batch, steps, roots)`,
+`on_verified(indices_in_batch, steps, states, target_means)`, and `reset(batch_size)`.
 A distilled draft network needs none of them and inherits the no-ops.
 
-**If your proposal caches anything across calls, set `stateful = True`.** That is what stops a
-single-trajectory proposal from being silently shared across a batch, where one cached drift
-would be reused by trajectories sitting at different steps.
+**If your proposal caches anything across calls, key it on `indices_in_batch`.** Store it in a
+`(batch_size, *state_shape)` buffer sized by `reset`, the way `DelayedDriftProposal` does, so
+one image's cached drift can never be handed to another sitting at a different step.
 
 ## Batching over images
 
-The batched sampler needs a `BatchedProposal`, because a proposal now has to know which
-trajectory each row belongs to:
-
-| your proposal | wrap it in |
-| --- | --- |
-| stateless (draft net, `Identity`, `Mirror`) | `StatelessBatchedProposal(inner)` |
-| the delayed drift | `BatchedDelayedDriftProposal(target)` — native, one `(batch, *shape)` buffer |
-| any other stateful one | `PerSlotProposal(factory)` — one instance per trajectory |
+Nothing to wrap. A proposal already takes `indices_in_batch` on every call, so the object you
+pass to the single-image sampler is the same object you pass to the batched one — batch size 1
+is just `batch_size = 1`, not a different interface.
 
 ```python
-from specdiff import BatchedSpeculativeSampler, BatchedDelayedDriftProposal
+from specdiff import BatchedSpeculativeSampler, DelayedDriftProposal
 
 sampler = BatchedSpeculativeSampler(
     target=my_target,
-    proposal=BatchedDelayedDriftProposal(my_target),
+    proposal=DelayedDriftProposal(my_target),
     schedule=my_schedule,
     tree=DraftTree.uniform(branching=4, lookahead=3),
     verifier=my_rule,                 # unchanged — rules need no batching work
@@ -180,12 +179,9 @@ sampler = BatchedSpeculativeSampler(
 result = sampler.sample(y0_batch)     # (batch, *state_shape)
 ```
 
-`BatchedDelayedDriftProposal` collects the warm-up evaluations that trajectories need before
-they hold any drift into **one** batched target call, not one per trajectory. `PerSlotProposal`
-cannot — its instances are independent, so it costs one warm-up call per slot. Prefer a native
-batched implementation when the proposal is hot.
-
-Passing a `stateful` proposal to `StatelessBatchedProposal` raises rather than corrupting it.
+`DelayedDriftProposal` collects the warm-up evaluations that images need before they hold any
+drift into **one** batched target call, not one per image, and indexes its drift buffer by
+`indices_in_batch` so no image can pick up another's.
 
 Two further requirements: the tree must be level-uniform, and — see below — states must be
 floating point.

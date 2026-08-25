@@ -51,8 +51,8 @@ Everything in the code and docs uses these, and nothing else:
 | `N` | `num_steps` | denoising steps in the full trajectory — the standard sampler's NFE count |
 | `L` | `lookahead`, `tree.depth` | levels of the draft tree below the root; how far ahead one round speculates |
 | `K` | `branching`, `tree.branching` | candidate children per node. `K = 1` is RMC's chain |
-| `B` | `tree.budget` | drafted states per round, `K + ... + K^L` (eq. 12) — the proposal budget the paper plots against |
-| `\|I\|` | `len(tree.internal_nodes)` | states the target model actually sees per round, `B / K` when uniform |
+| `B` | `tree.budget` | states **drafted** per round, `K + ... + K^L` (eq. 12) — the *proposal* budget the paper plots against |
+| `\|I\|` | `tree.verification_budget()` | states the **target** evaluates per round, `B / K` when uniform — the *verification* budget, and the batch that must fit in memory |
 | `n` | `step`, `start_step` | index of the current step along the trajectory, `0 <= n < N` |
 | `sigma_n` | `schedule(step)` | noise scale, shared by proposal and target at step `n` |
 | `delta` | `Rank1Frame.delta` | normalised mean mismatch `\|\|mu_q - mu_p\|\| / sigma`; sets every acceptance probability |
@@ -68,8 +68,9 @@ pyproject.toml
 specdiff/
   sampler.py  batched.py  trees.py  kernels.py  verify.py  types.py  testing.py  ops.py
   verifiers/
-    rank1.py  stubs.py
-tests/       test_sampler.py  test_batched.py  test_rank1.py  test_rmc.py
+    rank1.py  rmc.py  dgrs.py
+tests/       test_sampler.py  test_batched.py  test_rank1.py  test_rmc.py  test_dgrs.py
+             test_torch_backend.py
 examples/    gaussian_mixture.py
 ```
 
@@ -82,7 +83,8 @@ examples/    gaussian_mixture.py
 | `specdiff/verify.py` | the `Verifier` contract, contract checker, name registry |
 | `specdiff/types.py` | `VerifyRequest`/`VerifyResult` and the run records |
 | `specdiff/verifiers/rank1.py` | the rank-1 reduction (eqs. 8–11), shared by any isotropic rule |
-| `specdiff/verifiers/stubs.py` | Algorithm 1 (RMC); Algorithm 2 (D-GRS) is **not implemented** |
+| `specdiff/verifiers/rmc.py` | Algorithm 1: reflection maximal coupling (`rmc`), `K = 1` |
+| `specdiff/verifiers/dgrs.py` | Algorithm 2: greedy rejection sampling (`d-grs`), any `K` |
 | `specdiff/testing.py` | statistical exactness test for a rule |
 | `specdiff/ops.py` | the only module that touches NumPy/PyTorch |
 
@@ -159,8 +161,9 @@ if frame.degenerate:                    # delta is zero to working precision
 tau = frame.tau(lam)                    # ln(lam) / delta, guarded
 ```
 
-`degenerate` is `delta <= tol`, not `delta == 0`, with `tol = sqrt(eps)` of the state dtype
-(~1.5e-8 in float64, ~3.4e-4 in float32). Exact equality is the wrong test: the regime that
+`degenerate` is `delta <= tol`, not `delta == 0`, with `tol = 1e-10` — a constant, and
+deliberately *not* dtype-derived: `delta`, `tau` and the D-GRS masses are Python floats
+computed in float64 whatever the states carry. Exact equality is the wrong test: the regime that
 breaks a rule is small-and-nonzero `delta`, which is what a *good* proposal produces, and
 there `ln(lambda) / delta` saturates `Phi_bar` to exactly 0 and makes the D-GRS residual mass
 vanish. Below `tol` the kernels are indistinguishable at the state's own precision, so
@@ -174,11 +177,11 @@ handles that; the round structure is identical, but each trajectory carries its 
 and one target call serves every live trajectory.
 
 ```python
-from specdiff import BatchedSpeculativeSampler, BatchedDelayedDriftProposal
+from specdiff import BatchedSpeculativeSampler, DelayedDriftProposal
 
 sampler = BatchedSpeculativeSampler(
     target=my_target,
-    proposal=BatchedDelayedDriftProposal(my_target),   # one frozen drift per trajectory
+    proposal=DelayedDriftProposal(my_target),   # one frozen drift per trajectory
     schedule=my_schedule,
     tree=DraftTree.uniform(branching=4, lookahead=3),
     verifier=my_rule,                                  # unchanged
@@ -196,8 +199,8 @@ verification batch belong to different steps. Use `ops.scale_rows` to broadcast 
 
 **Live rows shrink as the round descends.** A trajectory that rejects at level 1 takes no
 part in level 2. The sampler compacts rather than masks, so a rule never sees a dead row and
-never needs a validity flag. `request.slots[j]` says which trajectory row `j` is, for rules
-holding per-trajectory state; `request.row(j)` carries it through as `slot`.
+never needs a validity flag. `request.indices_in_batch[j]` says which image row `j` is, for
+rules holding per-image state; `request.row(j)` carries it through as `index_in_batch`.
 
 **Cost is a max, not a mean.** One call serves every live trajectory, so the batch advances
 at the pace of its slowest member. `result.speedup` (`N / iterations`) is the wall-clock
@@ -210,12 +213,11 @@ comparable with the single-trajectory result for the same configuration.
 Two requirements the batched path adds. The tree must be **level-uniform** (every node at a
 given depth has the same width) so that a level's candidates form a rectangular
 `(batch, K, *shape)` array — `uniform` and `from_widths` qualify, arbitrary pruned trees do not.
-And the proposal must be a `BatchedProposal`: stateless ones wrap in
-`StatelessBatchedProposal`, stateful ones either get a native implementation
-(`BatchedDelayedDriftProposal`, which keeps a `(batch, *shape)` buffer of increments and warms up
-in a single batched call) or go in `PerSlotProposal`, which allocates one instance per
-trajectory. A stateful proposal passed to `StatelessBatchedProposal` raises rather than
-silently sharing one trajectory's cached drift across the batch.
+The proposal needs no change at all: `ProposalTransition` takes `indices_in_batch` at every
+batch size, so the object you hand the single-trajectory sampler is the object you hand this
+one. `DelayedDriftProposal` keeps a `(batch, *shape)` buffer of increments indexed by
+`indices_in_batch`, so no trajectory can pick up another's drift, and its warm-ups go in a
+single batched call.
 
 Rules get `verify_batch`, whose default implementation loops over rows calling `verify`, so
 nothing needs rewriting. Override it when the per-node work is worth vectorising — for the
@@ -250,8 +252,8 @@ which is what makes the rank-1 reduction legal. `NoiseSchedule.__call__` refuses
 scale, since at zero churn both kernels are point masses and speculation is vacuous
 (Remark 3).
 
-**Why the proposal has lifecycle hooks.** The interesting proposals are stateful. The delayed
-reverse drift needs to know when a round starts and which target drifts have become
+**Why the proposal has lifecycle hooks.** The interesting proposals keep per-image memory. The
+delayed reverse drift needs to know when a round starts and which target drifts have become
 available; root-drift prefetching then reuses a drift the previous round already paid for
 during verification, instead of spending an extra NFE per round. The hooks let that live in
 the proposal rather than as a special case in the sampler. Note the increment is recoverable
@@ -272,8 +274,8 @@ uniform tree, which is where a tree buys back some of its verification cost.
   `batch = 1` façade.
 - **Batch occupancy decays.** Trajectories that finish early leave the batch, so late
   iterations run under-full. Refilling with fresh trajectories (continuous batching, as
-  serving stacks do for LLMs) would recover it and is a natural next step, since slots are
-  already first-class.
+  serving stacks do for LLMs) would recover it and is a natural next step, since
+  `indices_in_batch` is already first-class.
 - **Static topology.** The tree is fixed at construction. The paper's closing paragraph wants
   it adapted online to proposal quality and budget; that fits as a `TopologyPolicy` returning
   a tree per round, given the previous round's `RoundRecord`. The sampler already truncates a

@@ -48,14 +48,14 @@ retaining them.
 
 ```python
 BatchedSpeculativeSampler(
-    target, proposal: BatchedProposal, schedule, tree, verifier,
+    target, proposal: ProposalTransition, schedule, tree, verifier,
     *, num_steps: int, check_contract: bool = False,
     keep_trajectories: bool = False, backend: Backend | None = None,
 )
 ```
 
 The same, over `batch_size` independent trajectories at once. Two added requirements: the tree
-must be **level-uniform**, and the proposal must be a `BatchedProposal`.
+must be **level-uniform**. Any `ProposalTransition` works unchanged.
 
 - `keep_trajectories` — retain the full `(batch, N+1, *shape)` history rather than terminal
   states only. Costs memory.
@@ -123,7 +123,7 @@ batch size against.
 (`committed - 1` if rejected, else `committed`), `rejected`, `drafted` (`B_n`), `verified`
 (`|I(T_n)|`), `proposals_examined`.
 
-`BatchedRoundRecord`: `iteration`, `active` (trajectory slots), `start_steps`, `committed`,
+`BatchedRoundRecord`: `iteration`, `active` (indices in the batch), `start_steps`, `committed`,
 `accepted_depth`, `rejected`, `drafted`, `verified` — the per-trajectory fields are tuples
 aligned with `active`.
 
@@ -150,10 +150,11 @@ which both rules out cycles and forces the breadth-first ordering the class reli
 | | |
 | --- | --- |
 | `.size` | `\|V\|`, including the root |
-| `.budget` | `B = \|V\| - 1`, the drafted (proposal-evaluated) states |
+| `.budget` | `B = \|V\| - 1`, the states **drafted** — the proposal budget of eq. (12) |
+| `.verification_budget(evaluate_leaves=False)` | states the **target** evaluates: `\|I\| = B / K` when uniform, or `B + 1` with `leaves=True` |
 | `.depth` | `L`, the lookahead |
 | `.branching` | `K` for a uniform tree; the maximum width otherwise |
-| `.internal_nodes` | `I(T)` — nodes with children, and **only** these are target-evaluated |
+| `.internal_nodes` | `I(T)` — nodes with children, and **only** these are target-evaluated; see `.verification_budget()` |
 | `.parent(u)`, `.children(u)`, `.depth_of(u)` | `children` is in drafting order |
 | `.layer(level)` | `V_l`, the nodes of depth `level` |
 | `.width_at(level)` | children per node at that depth; raises if the level is not uniform |
@@ -172,11 +173,16 @@ Abstract. `m^q` — the expensive map. Override `means`; **call the instance**, 
 keeps the NFE accounting.
 
 ```python
-means(states, steps) -> Array      # (rows, *shape) at `rows` step indices -> means
-__call__(states, steps) -> Array   # counts the call, validates the row count
-num_calls, num_states              # counters
-reset_stats()                      # called at the start of each sample()
+means(indices_in_batch, states, steps) -> Array      # -> (rows, *shape)
+__call__(indices_in_batch, states, steps) -> Array   # counts the call, validates lengths
+num_calls, num_states                                # counters
+reset_stats()                                        # called at the start of each sample()
 ```
+
+`indices_in_batch[i]` is which of the `batch_size` images entry `i` belongs to — the same
+convention as `ProposalTransition`. One call carries entries from several images, so a target
+that conditions per image (a class label, a text prompt) needs it; one that conditions on
+nothing ignores it.
 
 Must be a single batched evaluation. `steps` is a tuple of ints and rows may sit at different
 steps.
@@ -196,15 +202,17 @@ needs exactly `N` entries.
 Abstract. `m^p` — cheap by assumption, called once per tree level while drafting.
 
 ```python
-means(states, steps) -> Array                    # required
-on_round_start(step, root_state)                 # optional hooks
-on_verified(step, state, target_mean)
-reset()
-stateful: bool = False                           # set True if you cache across calls
+means(indices_in_batch, states, steps) -> Array           # required
+on_round_start(indices_in_batch, steps, roots)            # optional hooks
+on_verified(indices_in_batch, steps, states, target_means)
+configure_prefetch(mode)
+reset(batch_size)
 ```
 
-`stateful` is what stops a single-trajectory proposal from being silently shared across a
-batch.
+`indices_in_batch[i]` is which of the `batch_size` images entry `i` belongs to. This is the
+same interface at every batch size — the single-image sampler passes all zeros — so one
+proposal object works with either sampler and no adapter classes exist. A proposal with no
+per-image memory ignores the argument; one that caches should key its buffer on it.
 
 | class | `m^p(y)` |
 | --- | --- |
@@ -218,25 +226,16 @@ better proposal.
 
 ---
 
-## Batched proposals
+## Proposals and batching
 
-### `BatchedProposal`
+There is one proposal interface at every batch size. `ProposalTransition` takes
+`indices_in_batch` on every call — `indices_in_batch[i]` is which of the `batch_size` images
+entry `i` belongs to — and the single-image sampler passes all zeros. So the same proposal
+object works with either sampler, and no adapter classes exist.
 
-Abstract. Like `ProposalTransition`, but `slots` accompanies every call: `slots[i]` is the
-trajectory index of row `i`.
-
-```python
-means(slots, states, steps) -> Array
-on_round_start(slots, steps, roots)
-on_verified(slots, steps, states, target_means)
-reset(num_slots)
-```
-
-| class | |
-| --- | --- |
-| `StatelessBatchedProposal(inner)` | lifts any stateless `ProposalTransition`. Raises `TypeError` on a stateful one |
-| `BatchedDelayedDriftProposal(target, *, prefetch=True)` | native eq. (7); warm-ups collected into **one** batched call |
-| `PerSlotProposal(factory, num_slots=None)` | one independent instance per trajectory — correct for anything, at the cost of a Python loop and one warm-up call per slot |
+`DelayedDriftProposal` holds a `(batch_size, *state_shape)` buffer of frozen drifts, so
+drafting is one gather-and-add regardless of batch size, and the warm-up evaluations are
+collected into **one** target call rather than one per image.
 
 ---
 
@@ -288,9 +287,9 @@ create_verifier("my-rule", **kwargs) -> Verifier
 available_verifiers() -> tuple[str, ...]
 ```
 
-Registered by the library: `resample`, `rmc`, `d-grs`. All three are registered on
-`import specdiff`. `rmc` is Algorithm 1 and is implemented; `d-grs` is Algorithm 2 and is
-[left as the reader's work](writing-a-verifier.md#the-papers-two-algorithms).
+Registered by the library: `resample`, `rmc`, `d-grs`, all registered on `import specdiff`.
+`rmc` is Algorithm 1 (`max_children = 1`, so pair it with `DraftTree.chain(L)`) and `d-grs` is
+Algorithm 2 (any `K`); see [the paper's two algorithms](writing-a-verifier.md#the-papers-two-algorithms).
 
 ---
 
@@ -306,7 +305,7 @@ Everything a rule is allowed to see at one node.
 | `proposal_mean`, `target_mean`, `sigma` | `m^p(Y_u)`, `m^q(Y_u)`, `sigma_step` |
 | `children` | `(K, *state_shape)`, **in drafting order** |
 | `parent_state` | `Y_u`; optional |
-| `slot` | trajectory index — always `0` under the scalar sampler |
+| `index_in_batch` | which image this row is — always `0` under the scalar sampler |
 | `rng` | the run's generator. Rules must use this one |
 | `info` | free-form; carries `"level"` and `"node"` |
 | `.num_children`, `.state_shape`, `.child(i)` | properties/helpers |
@@ -319,7 +318,7 @@ Everything a rule is allowed to see at one node.
 ### `BatchedVerifyRequest`
 
 `VerifyRequest` with a leading batch dimension and one substantive difference: **`sigmas` is
-per row**, because rows belong to different steps. Also carries `slots`; `children` is
+per row**, because rows belong to different steps. Also carries `indices_in_batch`; `children` is
 `(batch, K, *shape)`. All rows are live — the sampler compacts rather than masks.
 
 `.row(j)` extracts row `j` as a `VerifyRequest`, translating the batch-wide `info["nodes"]`
@@ -345,7 +344,7 @@ Rank1Frame.from_request(request, *, tol=None) -> Rank1Frame
 | --- | --- |
 | `.delta` | `\|\|mu_q - mu_p\|\| / sigma` — controls every acceptance probability in the paper |
 | `.direction` | the unit vector `e` |
-| `.tol` | degeneracy tolerance; defaults to `sqrt(eps)` of the state dtype |
+| `.tol` | degeneracy tolerance; defaults to `DEFAULT_DEGENERATE_TOL` (`1e-10`), not dtype-derived |
 | `.degenerate` | `delta <= tol`, **not** `delta == 0` — see [why](writing-a-verifier.md#degeneracy) |
 | `.project(state)` | `Y -> (S, Z_perp)`, eq. (10) |
 | `.reconstruct(s, z_perp)` | `(S, Z_perp) -> Y`, eq. (11) |

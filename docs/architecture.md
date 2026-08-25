@@ -138,7 +138,7 @@ sequenceDiagram
     Note over S: round starts at step n, root = Y_n
     S->>P: on_round_start(n, Y_n)
     loop level = 1 .. L_n
-        S->>P: means(states[parents], steps)
+        S->>P: means(indices_in_batch, states[parents], steps)
         P-->>S: m^p per parent
         Note over S: children = m^p + sigma * noise
     end
@@ -193,9 +193,9 @@ Three consequences, and they are the whole design of `batched.py`:
    `mean_isolated_speedup`, and the gap is the straggler cost you tune batch size against.
 
 The batched path adds two requirements: the tree must be **level-uniform** (so a level's
-candidates form a rectangular `(batch, K, *shape)` array), and the proposal must be a
-`BatchedProposal`. Verification rules need no change — `verify_batch` defaults to a row-wise
-loop over the `verify` you already wrote.
+candidates form a rectangular `(batch, K, *shape)` array). The proposal needs no change —
+`ProposalTransition` is the same interface at every batch size. Verification rules need no
+change either: `verify_batch` defaults to a row-wise loop over the `verify` you already wrote.
 
 ## Key decisions
 
