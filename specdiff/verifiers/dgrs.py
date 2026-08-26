@@ -1,13 +1,11 @@
 """Algorithm 2: diffusion greedy rejection sampling (D-GRS).
 
-The rule a branching draft tree exists for. Where
-:mod:`specdiff.verifiers.rmc` couples one proposal maximally, this one sweeps
+Where :mod:`specdiff.verifiers.rmc` couples one proposal maximally, D-GRS sweeps
 ``K`` proposals *in the order they were drafted* and takes the first that
 satisfies the acceptance rule -- a *sequence* coupling, not a list coupling.
 
-Three traps, the first two of which only exist once ``K > 1``; at ``K = 1``
-there is no order to get wrong and only one residual to carry, so Algorithm 1
-gets both for free:
+Three implementation constraints apply. The first two become relevant for
+``K > 1``:
 
 *   The children arrive in ``request.children`` in sampling order and a
     sequence coupling must keep it. Sorting them, or examining them by
@@ -16,12 +14,11 @@ gets both for free:
     ``Z_perp,k`` on acceptance of child ``k`` but ``Z_perp,1`` on the residual
     branch (lines 9 and 18). Note the subscript indexes the *child*, not a
     coordinate: ``Z_perp,1`` is the first drafted child's orthogonal residual.
-*   Check ``frame.degenerate`` before dividing by ``delta``. The regime that
-    breaks a rule is small-and-nonzero ``delta``, which is exactly what a good
-    proposal produces.
+*   Check ``frame.degenerate`` before dividing by ``delta`` to handle small,
+    nonzero mean differences safely.
 
-A note on conventions, because the paper is not self-consistent here: the main
-text (eqs. 8-11) standardises by ``mu_p``, giving ``S ~ N(0, 1)`` under ``P``
+A note on conventions: the main text (Equations 8--11) standardizes by
+``mu_p``, giving ``S ~ N(0, 1)`` under ``P``
 and ``N(delta, 1)`` under ``Q``, while Appendix B.2 standardises by the
 *midpoint*, giving ``N(-delta/2, 1)`` and ``N(+delta/2, 1)``. This module
 follows the main text, matching :class:`~specdiff.verifiers.rank1.Rank1Frame`;
@@ -49,14 +46,10 @@ def _sample_residual(frame: Rank1Frame, level: float, mass: float, u: float) -> 
         F(s) = [Q([t, s]) - level * P([t, s])] / mass
 
     is continuous and strictly increasing there. Inverting it by bisection needs
-    only ``Phi_bar``, which keeps the rule free of SciPy and of any quadrature:
-    the alternative -- rejection sampling against a truncated Gaussian -- would
-    need an inverse normal CDF the backend does not provide, and its acceptance
-    rate degrades exactly when ``level`` is large.
+    only ``Phi_bar`` and requires neither SciPy nor numerical quadrature.
 
-    This runs only on the branch where all ``K`` proposals were rejected, so a
-    hundred-odd ``erfc`` pairs cost nothing next to the target evaluation that
-    produced the node.
+    This path runs only after all ``K`` proposals are rejected. Its scalar
+    ``erfc`` evaluations are small relative to the target model evaluation.
     """
     delta = frame.delta
     threshold = frame.tau(level) + 0.5 * delta

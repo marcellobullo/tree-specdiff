@@ -1,21 +1,18 @@
-"""A closed-form stand-in for an SD3.5 pipeline, so the wiring is testable on a laptop.
+"""Closed-form SD3.5 pipeline substitute for CPU integration tests.
 
-SD3.5-medium is 16 GiB of weights and wants a GPU. None of that is needed to
-check the parts of the adapter that can actually be wrong: the prompt table and
-its two levels of indexing, the CFG stack and its ``chunk(2)``, the timestep
-scaling, the churn kernel, the VAE decode, and the sampler plumbing.
+SD3.5-medium uses approximately 16 GiB of weights and generally requires a GPU.
+This substitute tests prompt indexing, classifier-free guidance, timestep
+scaling, the churn kernel, VAE decoding, and sampler integration on CPU.
 
-So this supplies a pipeline with the *interface* ``SD3Denoiser`` uses, whose
+The module supplies the pipeline interface used by ``SD3Denoiser``, with an
 transformer is exact. Take each prompt to name a constant latent ``mu``. Under
 the linear interpolant ``x_t = (1 - t) mu + t xi`` the velocity is available in
 closed form,
 
     v = E[xi - mu | x_t] = (x_t - mu) / t,
 
-so a finished trajectory lands on that prompt's ``mu``. That turns "did image
-3's caption reach image 3's entries?" into an assertion -- the failure this
-whole prompt-table design exists to prevent, and one that would otherwise
-produce plausible images of the wrong caption.
+so a completed trajectory lands on the prompt's ``mu``. This makes prompt
+routing directly testable.
 
 Under guidance the target moves predictably rather than vanishing: with
 ``v_u = (x - a)/t`` and ``v_c = (x - b)/t``, the guided velocity is
@@ -57,8 +54,8 @@ class _Config:
 class _ToyTransformer:
     """``v = (x - mu) / t``, with ``mu`` read out of the pooled projection.
 
-    Reads its conditioning exactly where the real transformer does, so the CFG
-    stack and the ``chunk(2)`` split are genuinely exercised: each of the ``2B``
+    Reads conditioning through the same inputs as the real transformer, so the
+    CFG stack and ``chunk(2)`` split are exercised: each of the ``2B``
     rows carries its own pooled vector and gets its own ``mu``.
     """
 
@@ -114,7 +111,7 @@ class ToySD3Pipeline:
         self.transformer = _ToyTransformer(in_channels, patch_size)
         self.vae = _ToyVAE(vae_scale_factor, self.device, dtype)
         self.scheduler = _Config(config={"shift": shift, "num_train_timesteps": 1000})
-        # Something for free_text_encoders() to drop, so that path is exercised.
+        # Placeholder modules allow tests to exercise free_text_encoders().
         self.text_encoder = object()
         self.text_encoder_2 = object()
         self.text_encoder_3 = object()

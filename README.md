@@ -3,9 +3,9 @@
 Algorithm 3 of *Accelerating Diffusion Sampling via Speculative Draft Trees*: speculative
 diffusion sampling over an arbitrary draft tree, with a pluggable verification rule.
 
-The paper's own framing is the design brief — RMC and D-GRS "differ only in the two
-components the paper varies: the *draft topology* and the *verification rule*". So those are
-the two things you supply, and the sampler knows nothing about either.
+The implementation follows the paper's central abstraction: RMC and D-GRS differ in the
+*draft topology* and the *verification rule*. Applications provide those components, while
+the sampler remains independent of their implementation.
 
 ```python
 from specdiff import DraftTree, DelayedDriftProposal, SpeculativeSampler
@@ -23,17 +23,18 @@ result = sampler.sample(y0, rng=rng)
 print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ```
 
-## Install
-Create the environment
+## Installation
+
+Create a Python environment:
 ```bash
 conda create -n specdiff python=3.12 && conda activate specdiff
 ```
-Install from the repository root (the `.` is the project, not the `specdiff/`
-package directory):
+Install from the repository root. Here, `.` refers to the project rather than the
+`specdiff/` package directory:
 ```bash
 pip install -e '.[dev]'
 ```
-Run the tests
+Run the test suite:
 ```bash
 python -m pytest tests -q
 ```
@@ -41,7 +42,7 @@ Optional extras. For the PyTorch backend:
 ```bash
 pip install -e '.[torch]'
 ```
-Or everything in one go — tests, plotting, and the image experiments:
+To install all optional dependencies, including tests, plotting, and image experiments:
 ```bash
 pip install -e '.[all]'
 ```
@@ -53,15 +54,14 @@ pip install -e '.[all]'
 | `edm` | pretrained EDM checkpoints and multi-GPU sharding, see [experiments/images/](experiments/images/README.md) |
 | `all` | everything above |
 
-The library core itself imports nothing outside the standard library — you pick
-a backend with `[numpy]` or `[torch]`. That is deliberate, and why none of the
-above is a hard dependency.
-On a CUDA box, install `torch` first from the PyTorch index if you need a
-specific CUDA build; the plain PyPI wheel is what `pip` picks otherwise.
+The core library depends only on the Python standard library. Select an array backend with
+`[numpy]` or `[torch]`. On CUDA systems, install PyTorch from the appropriate PyTorch index
+before installing this package if a specific CUDA build is required; otherwise, `pip` uses
+the standard PyPI wheel.
 
 ## Notation
 
-Everything in the code and docs uses these, and nothing else:
+The code and documentation use the following notation consistently:
 
 | symbol | in code | meaning |
 | --- | --- | --- |
@@ -109,24 +109,23 @@ examples/    gaussian_mixture.py
 pip install -e '.[dev]' && python -m pytest tests -q
 ```
 
-States must be floating point. An integer array would truncate every Gaussian draw to
-zero and hand back a silently wrong trajectory, so `sample()` rejects one outright
-rather than letting it through; `float32` and `float64` both work.
+States must use a floating-point dtype. Integer arrays truncate Gaussian draws and invalidate
+the trajectory, so `sample()` rejects them. Both `float32` and `float64` are supported.
 
 ## Documentation
 
 | | |
 | --- | --- |
-| [docs/writing-a-verifier.md](docs/writing-a-verifier.md) | **start here to implement a coupling** — the contract, rank-1 coordinates, exactness testing, the traps |
+| [docs/writing-a-verifier.md](docs/writing-a-verifier.md) | verifier contract, rank-1 coordinates, exactness testing, and implementation guidance |
 | [docs/models.md](docs/models.md) | plugging in your own diffusion model, proposals, trees, backends |
 | [docs/architecture.md](docs/architecture.md) | how a round works, data flow, cost accounting, design decisions |
 | [docs/api-reference.md](docs/api-reference.md) | every exported symbol |
 | [notebooks/](notebooks/README.md) | one runnable tutorial per component — trees, kernels, verifiers, the two samplers, backends, and an end-to-end walkthrough |
 
-`examples/gaussian_mixture.py` runs the whole thing end to end on a Gaussian mixture, with no
-network involved.
+`examples/gaussian_mixture.py` provides an end-to-end example using a Gaussian mixture and
+requires no neural network.
 
-## The one contract
+## Verifier contract
 
 ```python
 class MyRule(Verifier):
@@ -138,14 +137,14 @@ class MyRule(Verifier):
 
 `VerifyRequest` gives you `proposal_mean`, `target_mean`, `sigma`, and `children`
 (shape `(K, *state_shape)`, **in drafting order**). You return a state, whether it was
-accepted, and which child it was. That is the whole interface — a rule written this way
-also runs under the batched sampler, unchanged.
+accepted, and the selected child index. The same rule works with both scalar and batched
+samplers.
 
 Three obligations:
 
 1. `state` is an exact sample from `N(target_mean, sigma^2 I)`.
 2. If `accepted`, `state` *is* `children[child_index]` — not a copy-with-correction. The
-   sampler descends into that child's subtree, so a mismatch silently corrupts the chain.
+   sampler descends into that child's subtree, so a mismatch invalidates the trajectory.
 3. Children are examined in the order given, if your rule is a sequence coupling.
 
 Obligation 2 is enforced by `check_contract=True`. Obligation 1 cannot be checked per call,
@@ -158,8 +157,8 @@ assert report.passed, report
 ```
 
 This projects the returned state onto the displacement direction, where exactness implies
-`N(delta, 1)` regardless of what the rule did internally, and runs a KS test. It catches the
-coupling bugs that produce plausible-looking but wrong samples.
+`N(delta, 1)` regardless of the rule's internal implementation, and runs a KS test. It detects
+coupling errors that can otherwise produce samples from the wrong distribution.
 
 `seed` controls every draw — the direction, the children, and whatever your rule consumes
 via `request.rng` — so a report is reproducible. Keep it: this is a hypothesis test at level
@@ -188,10 +187,10 @@ accepting unconditionally is the correct limit rather than an approximation.
 
 ## Batching over images
 
-Speculation breaks the thing that makes image batching trivial in a standard sampler:
-trajectories accept different prefixes and fall out of step immediately. `batched.py`
-handles that; the round structure is identical, but each trajectory carries its own `n_i`,
-and one target call serves every live trajectory.
+Unlike a standard sampler, speculative trajectories may accept prefixes of different lengths
+and therefore advance asynchronously. `batched.py` preserves the same round structure while
+tracking a separate step `n_i` for each trajectory. A single target call serves all active
+trajectories.
 
 ```python
 from specdiff import BatchedSpeculativeSampler, DelayedDriftProposal
@@ -281,24 +280,3 @@ instance rather than `.means()`. Cost is reported as `target_calls` (the paper's
 batched call per round) and separately as `target_states_evaluated` (batch volume). The target
 is evaluated only at *internal* nodes — leaves are never parents, so `|I| = B / K` for a
 uniform tree, which is where a tree buys back some of its verification cost.
-
-## Limitations, and what I would revisit
-
-- **Two samplers, one algorithm.** `sampler.py` and `batched.py` implement the same three
-  phases and can drift apart. The scalar one is kept because it is the readable reference and
-  the natural thing for a single image; a test asserts the two agree on accounting for a batch of 1.
-  If the pair grows a third variant, collapse them and have `SpeculativeSampler` be a
-  `batch = 1` façade.
-- **Batch occupancy decays.** Trajectories that finish early leave the batch, so late
-  iterations run under-full. Refilling with fresh trajectories (continuous batching, as
-  serving stacks do for LLMs) would recover it and is a natural next step, since
-  `indices_in_batch` is already first-class.
-- **Static topology.** The tree is fixed at construction. The paper's closing paragraph wants
-  it adapted online to proposal quality and budget; that fits as a `TopologyPolicy` returning
-  a tree per round, given the previous round's `RoundRecord`. The sampler already truncates a
-  tree per round, so the hook is one line.
-- **`check_exactness` is a smoke test.** A KS test on 4k samples catches gross errors, not
-  subtle bias in the tail. For a rule you intend to publish, also verify the analytic
-  acceptance probability (eq. 15) against the measured one.
-- **No `float16` guard.** The rank-1 reduction takes a norm and divides by it; in half
-  precision, small `delta` will be noisy. Cast to `float32` for the coupling.

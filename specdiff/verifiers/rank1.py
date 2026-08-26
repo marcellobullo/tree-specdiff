@@ -1,7 +1,7 @@
 """The rank-1 reduction of eqs. (8)-(11).
 
-This is not a coupling. It is the change of coordinates that Section 3
-introduces *before* either RMC or D-GRS, and that both then use: because
+This module implements the coordinate transformation from Section 3, which is
+shared by RMC and D-GRS. Because
 ``P = N(mu_p, sigma^2 I)`` and ``Q = N(mu_q, sigma^2 I)`` differ only in their
 means, everything orthogonal to ``mu_q - mu_p`` has the same law under both,
 and the d-dimensional coupling collapses to a scalar one::
@@ -12,9 +12,8 @@ and the d-dimensional coupling collapses to a scalar one::
 A rule therefore only has to move the scalar ``S``; the orthogonal residual of
 whichever proposal it keeps is carried through untouched.
 
-Provided here because it belongs to the template, not to any one rule, and
-because getting the reconstruction wrong is a silent-correctness bug: the
-sample still looks Gaussian, just not from the right distribution.
+Centralizing the transformation keeps projection and reconstruction consistent
+across verification rules.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ globally, or pass ``tol=`` to :meth:`Rank1Frame.from_request`.
 """
 
 DEFAULT_DEGENERATE_TOL: float = 1e-10
-"""The threshold itself: a constant, and deliberately *not* dtype-derived.
+"""Constant degeneracy threshold, independent of the state dtype.
 
 Every quantity that can break down here -- ``delta``, ``tau = ln(lambda)/delta``
 and the D-GRS masses ``G_k`` -- is a Python float, computed in float64 no matter
@@ -49,19 +48,9 @@ is mathematically ``delta / sqrt(2 pi)``, and float64 resolves it down to about
 that by five orders of magnitude while admitting only ``~4e-11`` of total
 variation (the shortcut's cost is ``TV = delta / sqrt(2 pi)``).
 
-Previously this was ``sqrt(eps)`` of the state dtype. That was ~1.5e-8 in
-float64 -- harmless -- but ~3.1e-2 in float16 and ~8.8e-2 in bfloat16, where
-accepting unconditionally admits 1.2% and 3.5% total variation *per node*. Both
-are large enough for :func:`specdiff.testing.check_exactness` to detect as
-non-exact, so on half-precision states the shortcut stopped being "the correct
-limit" and became a silent approximation, in exactly the small-``delta`` regime
-a good proposal produces.
-
-The dtype dependence had no mechanism behind it. The frame is self-consistent by
-construction -- ``delta * direction == diff`` identically -- so the coupling is
-exact with respect to the mean gap *as computed*, whatever precision the means
-carry. A coarse dtype makes that gap less accurate, but the shortcut cannot
-repair that and only adds bias on top.
+The frame is self-consistent by construction: ``delta * direction == diff``.
+A constant threshold therefore avoids dtype-dependent bias in the
+small-``delta`` regime.
 """
 
 
@@ -89,7 +78,7 @@ class Rank1Frame:
 
     @classmethod
     def from_request(cls, request: VerifyRequest, *, tol: Optional[float] = None) -> "Rank1Frame":
-        ops = resolve_backend(request.children)
+        ops = request.backend or resolve_backend(request.children)
         diff = (request.target_mean - request.proposal_mean) / request.sigma
         delta = ops.norm(diff)
         direction = diff / delta if delta > 0.0 else diff
@@ -108,7 +97,7 @@ class Rank1Frame:
 
     @property
     def degenerate(self) -> bool:
-        """``delta`` is zero to working precision: accept anything.
+        """Return whether ``delta`` is zero to working precision.
 
         Remark 2: the acceptance probability is 1 for every ``K``, and
         ``tau = ln(lambda) / delta`` is undefined, so rules must special-case
@@ -128,10 +117,9 @@ class Rank1Frame:
         ``delta ~ 1e-16``, and a short-circuit; it is not what makes small
         ``delta`` safe.
 
-        Keep it cheap, therefore. The shortcut is not free: it accepts
-        unconditionally, which costs ``TV = delta / sqrt(2 pi)`` of exactness
-        every time it fires. A tolerance chosen loosely spends that silently,
-        and only in the small-``delta`` regime a good proposal produces.
+        The shortcut accepts unconditionally and introduces
+        ``TV = delta / sqrt(2 pi)`` whenever used. Keep the tolerance close to
+        the numerical floor to limit this approximation.
         """
         return self.delta <= self.tol
 
@@ -140,8 +128,8 @@ class Rank1Frame:
 
         The threshold whose half-space masses give the super-level set masses
         ``Q(H) = Phi_bar(tau - delta/2)`` and ``P(H) = Phi_bar(tau + delta/2)``.
-        Raises on a degenerate frame rather than returning an infinity that
-        would silently propagate into a zero residual mass.
+        Raises on a degenerate frame to prevent an infinite threshold from
+        propagating into a zero residual mass.
         """
         if self.degenerate:
             raise ZeroDivisionError(

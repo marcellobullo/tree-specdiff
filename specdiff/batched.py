@@ -1,27 +1,22 @@
-"""Algorithm 3 over a batch of trajectories.
+"""Run Algorithm 3 over a batch of trajectories.
 
-The parallelism inside a round -- one batched target call for a whole draft
-tree -- is orthogonal to the parallelism across images, and a real generation
-job wants both. Doing them together is not just a reshape, because speculation
-breaks the property that makes image batching trivial in a standard sampler:
-**trajectories accept different prefixes and immediately fall out of step.**
-After one round, trajectory 0 may sit at step 4 and trajectory 1 at step 1.
+Within-round parallelism and image batching are independent. Combining them
+requires explicit scheduling because trajectories can accept prefixes of
+different lengths and advance to different steps.
 
-Three consequences, and they are the whole design:
+This behavior has three consequences:
 
 1.  ``sigma`` becomes per-row. Rows of one verification batch belong to
     different steps, so :class:`~specdiff.types.BatchedVerifyRequest` carries
     ``sigmas``, not ``sigma``.
 2.  Live rows shrink as the round descends. A trajectory that rejects at level
-    1 takes no part in level 2. Rather than mask, the sampler *compacts*: each
-    level's request contains only rows still walking down their tree, so a rule
-    never sees a dead row.
+    1 takes no part in level 2. The sampler compacts active rows at each level,
+    so verifiers do not require validity masks.
 3.  Cost is no longer the mean. One target call serves every live trajectory,
     so the batch advances at the pace of its slowest member and the wall-clock
     speedup is ``N / iterations``, strictly below the mean of what the
     trajectories would achieve alone. :class:`BatchedSamplingResult` reports
-    both, plus occupancy, because the gap is the thing you tune batch size
-    against.
+    both values and occupancy to support batch-size selection.
 
 Trajectory state is held in flat buffers indexed ``row * tree.size + node``, so
 the backend needs no gather beyond the row indexing it already had.
@@ -49,8 +44,8 @@ Array = Any
 class BatchedSpeculativeSampler:
     """Algorithm 3 run on ``batch_size`` independent trajectories at once.
 
-    Same components as :class:`~specdiff.sampler.SpeculativeSampler`, with two
-    added requirements:
+    Uses the same components as :class:`~specdiff.sampler.SpeculativeSampler`,
+    with two additional requirements:
 
     * the draft tree must be **level-uniform** (every node at a given depth has
       the same number of children), so that one level's candidates form a
@@ -59,8 +54,8 @@ class BatchedSpeculativeSampler:
       :class:`~specdiff.kernels.ProposalTransition` works unchanged, since the
       interface is the same one the single-image sampler uses.
 
-    The verifier needs no change: :meth:`Verifier.verify_batch` falls back to a
-    row-wise loop over the rule you already have.
+    Verifiers need no changes because :meth:`Verifier.verify_batch` defaults to
+    a row-wise loop over :meth:`Verifier.verify`.
 
     Trajectories are independent, but they share an RNG stream, so a given
     trajectory is *not* bit-reproducible across different batch sizes. Its law
@@ -107,6 +102,7 @@ class BatchedSpeculativeSampler:
         size = self.tree.size
 
         self.target.reset_stats()
+        self.proposal.configure_backend(ops)
         self.proposal.reset(batch)
         self.verifier.reset()
 
@@ -276,6 +272,7 @@ class BatchedSpeculativeSampler:
                 children=ops.group_rows(ops.take(states, child_ids), width),
                 parent_state=ops.take(states, parent_ids),
                 rng=rng,
+                backend=ops,
                 # rows sit at different tree nodes, so the node is a tuple here;
                 # BatchedVerifyRequest.row() turns it back into info["node"].
                 info={"level": level, "nodes": tuple(cursor[r] for r in rows)},

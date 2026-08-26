@@ -1,29 +1,28 @@
 """Lazy round simulation: realise only the committed branch of the draft tree.
 
-Why this exists
----------------
+Purpose
+-------
 :class:`~specdiff.sampler.SpeculativeSampler` drafts every node of the tree,
 because it is a *sampler*: it must produce the trajectory, and Algorithm 3's
-single batched target call covers all internal nodes at once. That is honest and
-it is what you would run. It is also why ``(7, 7)`` needs **7.9 GB** -- 960,800
+single batched target call covers all internal nodes at once. Consequently,
+``(7, 7)`` needs approximately 7.9 GB for 960,800
 states and as many proposal means.
 
-But nothing off the committed branch survives the round. The trajectory depends
+Only the committed branch survives a round. The trajectory depends
 only on the committed node at each level and that node's ``K`` children, which is
-``K * L = 49`` states at ``(7, 7)`` rather than a million. This module exploits
-that to make the top corner of the sweep runnable.
+``K * L = 49`` states at ``(7, 7)``. This simulator uses that property to make
+the largest sweep configurations tractable.
 
-What it is not
---------------
-**This is a cost simulator, not a sampler.** Realising the branch lazily means
+Limitations
+-----------
+This is a cost simulator, not a sampler. Realising the branch lazily means
 the target mean of each level's parent is needed *sequentially* -- you cannot
 know which parent to evaluate until the level above has been verified -- so a
 faithful lazy sampler would spend ``L`` calls per round instead of one, which is
-precisely what Algorithm 3 exists to avoid. This module instead evaluates on
-demand and **counts one call per round**, which is the right answer for the NFE
-metric and the wrong answer for wall-clock. Do not use it to sample.
+the behavior Algorithm 3 avoids. This module evaluates on demand and counts one
+call per round, which is valid for NFE accounting but not wall-clock estimates.
 
-Two consequences worth stating:
+Two consequences follow:
 
 * ``target_rows`` is **analytic** here -- the count the eager sampler *would*
   have made (``verification_budget`` of the truncated tree per round) -- not a
@@ -54,9 +53,9 @@ from specdiff.ops import resolve_backend  # noqa: E402
 def verification_budget(K: int, depth: int, evaluate_leaves: bool = False) -> int:
     """``DraftTree.uniform(K, depth).verification_budget(...)``, in closed form.
 
-    Building the tree just to count its nodes would allocate ~420 MB at
-    ``(7, 7)`` -- per worker, once parallelised -- to answer a question that is
-    a geometric series. ``|I| = 1 + K + ... + K^(depth-1)``, plus ``K^depth``
+    Constructing the tree only to count nodes would allocate approximately
+    420 MB per worker at ``(7, 7)``. The closed form is
+    ``|I| = 1 + K + ... + K^(depth-1)``, plus ``K^depth``
     when the leaf level is evaluated.
     """
     internal = depth if K == 1 else (K**depth - 1) // (K - 1)

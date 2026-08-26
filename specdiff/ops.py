@@ -1,9 +1,8 @@
 """Minimal array-backend shim.
 
-Every array primitive the sampler and the verifiers need lives here, and
-nowhere else. Porting the library to a new framework (JAX, MLX, ...) means
-writing one ~40-line subclass of :class:`Backend` and registering it; no other
-module touches a framework API.
+This module contains the array operations used by the sampler and verifiers.
+Supporting another framework, such as JAX or MLX, requires a :class:`Backend`
+subclass and registration.
 
 State arrays are always *stacks*: shape ``(num_nodes, *state_shape)``, where
 ``state_shape`` is whatever the diffusion state is (``(d,)``, ``(C, H, W)``,
@@ -35,8 +34,8 @@ class Backend(ABC):
         """``(n, *ref.shape)`` standard normal draws.
 
         Must reject a non-floating ``ref``: casting a standard normal to an
-        integer dtype truncates every draw towards zero, which turns the
-        sampler into a silent no-op rather than an error. Use
+        integer dtype truncates every draw toward zero and invalidates the
+        sample. Use
         :meth:`check_state_dtype`.
         """
 
@@ -61,7 +60,7 @@ class Backend(ABC):
         Exposed for rules that want a dtype-aware tolerance of their own.
         Note that the *degeneracy* tolerance is deliberately **not** one of
         them -- see :data:`specdiff.verifiers.rank1.DEFAULT_DEGENERATE_TOL`
-        for why a dtype-derived threshold was the wrong choice there.
+        for the rationale behind the constant threshold.
         """
 
     @abstractmethod
@@ -71,9 +70,8 @@ class Backend(ABC):
     def check_state_dtype(self, ref: Array, where: str = "state") -> None:
         """Raise unless ``ref`` is floating point.
 
-        A diffusion state is a real vector; an integer array silently destroys
-        every noise draw and every mean update, so the run completes, reports a
-        speedup, and returns zeros. Fail loudly instead.
+        Diffusion states represent real-valued vectors. Integer arrays truncate
+        noise draws and mean updates, invalidating the trajectory.
         """
         if not self.is_floating(ref):
             raise TypeError(

@@ -174,7 +174,7 @@ def test_rules_are_exact_in_half_precision(dtype, name, num_children):
 
 
 def test_old_dtype_derived_tolerance_is_detectably_biased():
-    """The regression guard, exercising the real rules rather than the reasoning.
+    """Exercise both verifiers to prevent regression to dtype-derived tolerance.
 
     `DEFAULT_DEGENERATE_TOL` used to be `sqrt(eps)` of the state dtype, which is
     0.031 in float16. Inside that window the coupling skipped its acceptance

@@ -1,10 +1,10 @@
-# CIFAR-10, class-conditional — the full protocol
+# Class-conditional CIFAR-10 protocol
 
-End-to-end run on `edm-cifar10-32x32-cond-vp.pkl`: generate, then score FID and
-Inception Score. This is the experiment; [`server-checklist.md`](server-checklist.md)
-is the smoke test that should pass before you start it.
+This protocol generates samples with `edm-cifar10-32x32-cond-vp.pkl`, then computes FID and
+Inception Score. Complete the checks in [`server-checklist.md`](server-checklist.md) before
+starting a full run.
 
-## What is fixed, and what is yours to choose
+## Fixed and configurable settings
 
 Fixed by the protocol:
 
@@ -17,10 +17,9 @@ Fixed by the protocol:
 | labels | `--labels auto` → one uniform class per image, i.e. the class marginal |
 | matching | `--match verification`: the rmc chain gets the same target batch `\|I\|` as the tree |
 
-**`eps` is a parameter, not a constant.** The reference implementation swept
+**Choose `eps` explicitly.** The reference implementation swept
 `0.1`, `0.3`, `0.5`, `0.6` in different scripts; its FID script defaulted to
-`0.5`. Pick the value you intend to report and keep it fixed across every arm —
-comparing arms at different `eps` compares nothing.
+`0.5`. Keep the selected value fixed across all comparison arms.
 
 ## 0. Prerequisites
 
@@ -30,13 +29,13 @@ git clone https://github.com/NVlabs/edm.git ~/edm
 curl -L -o ~/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
 ```
 
-Find free GPUs — this matters, wall clock is set by the slowest rank:
+Check GPU availability. Wall-clock time is limited by the slowest rank:
 
 ```bash
 nvidia-smi --query-gpu=index,memory.free,memory.total --format=csv
 ```
 
-## 1. Size the batch before committing hours
+## 1. Select a batch size
 
 `--sample-batch` sets memory *and* throughput: one target call carries
 `sample_batch × |I|` states, and `|I| = 7` for `K=2, L=3`. Too small and the
@@ -47,10 +46,9 @@ python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl -
 ```
 
 Read the `memory:` line in the banner and the `img/s` in the progress line.
-Double `--sample-batch` until it stops helping or stops fitting. If a large
-batch is near the edge, keep it and add `--forward-batch` — it caps the
-activation peak and is exact (same RNG, same accept/reject, same NFE), just
-keep it fixed across every arm.
+Increase `--sample-batch` until throughput stops improving or memory is exhausted. Use
+`--forward-batch` to limit peak activation memory while preserving RNG behavior, acceptance
+decisions, and NFE counts. Keep it fixed across comparison arms.
 
 ## 2. Generate the three arms
 
@@ -88,16 +86,15 @@ Runs are resumable — re-issuing the same command reuses finished shards.
 python experiments/images/fid.py --samples results/cifar10-cond/plain-target results/cifar10-cond/K2_L3/d-grs results/cifar10-cond/K2_L3/rmc --dataset cifar10 --num-real 50000 --device cuda:4 --inception-score --cache-dir results/cifar10-cond --output results/cifar10-cond/fid_report.json
 ```
 
-The first invocation featurises 50k real images; `--cache-dir` means every
-later arm reuses those statistics exactly, so scoring more cells is nearly free.
+The first invocation featurizes 50,000 real images. `--cache-dir` lets subsequent cells reuse
+the same reference statistics.
 
 ## 4. What the results must show
 
-**The three FIDs must agree within sampling noise.** This is the scientific
-check, not a nicety: at temperature 1 the speculative rules sample *the same
-law* as plain target sampling, so a real FID gap means a coupling bug, not a
-worse method. At 50k samples FID noise is roughly ±0.1; a gap of several points
-is a bug.
+**The three FIDs should agree within sampling noise.** At temperature 1, speculative and plain
+target sampling follow the same distribution. A persistent FID difference therefore indicates
+a correctness issue in the coupling. At 50,000 samples, expected FID variation is roughly
+±0.1.
 
 **Speedup must exceed 1 for both speculative arms**, and `acceptance_rate`
 must sit strictly between 0 and 1. An acceptance of 1.0 means the verifier is
@@ -114,7 +111,7 @@ numbers, is what that invalidates.
 
 ## Sweeping (K, L) instead
 
-For the grid rather than one cell:
+To run the full grid:
 
 ```bash
 NETWORK=~/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,4,5,7 EPS=0.5 NUM_SAMPLES=50000 bash experiments/images/sweep.sh
@@ -123,8 +120,7 @@ NETWORK=~/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,4,5,7 EPS=0.5 NUM_
 It runs the baseline first, then every `(K, L)` cell for both rules, sizes
 `--sample-batch` per cell from `NODE_BUDGET / |I|` so memory stays flat as `K`
 grows, skips finished cells, and prints the `fid.py` command at the end. Start
-with `NUM_SAMPLES=256 CONFIGS="2,2 2,3"` to confirm it behaves before letting
-it loose.
+with `NUM_SAMPLES=256 CONFIGS="2,2 2,3"` to validate the launch before starting the full grid.
 
 ## Comparability
 

@@ -1,8 +1,8 @@
 # Experiments
 
-Paper replications. These are long-running and produce artifacts, which is why
-they live here rather than in `examples/` (seconds, pedagogical) or `tests/`
-(correctness).
+This directory contains reproducible experiments that generate persistent artifacts and may
+run for several hours. Short examples remain in `examples/`, while correctness checks remain
+in `tests/`.
 
 | directory | setting |
 | --- | --- |
@@ -25,15 +25,14 @@ python experiments/gm/plot_gm.py  --out $RUN                        # summary.cs
 | `figure3_grid_speedup.{pdf,png}` | the `(K, L)` grid, speed-up per cell, one panel per rule |
 | `figure3_grid_calls.{pdf,png}` | the same grid in raw target calls |
 
-One plotting script rather than two, because both figures come from the same
-`raw.csv -> summary.csv` reduction; splitting them would duplicate that step or
-make one import the other.
+One plotting script produces both figures from the shared
+`raw.csv -> summary.csv` reduction.
 
 Defaults match the reference run's protocol: `d=512`, 5 components, `T=30`,
 `eps=0.06`, mixture seed `20260714`, `K, L in 1..7`, 100 trajectories per cell.
-The one exception is the sampling seed — `results/gm/20260820-193412` used
+The reference directory `results/gm/20260820-193412` used sampling seed
 `--seed 14`, where the default is `20260714`, so add it to reproduce that
-directory cell for cell rather than only in distribution.
+directory cell by cell.
 
 `gm_sweep.py` writes each cell as it completes and skips cells already present,
 so an interrupted run resumes.
@@ -58,13 +57,11 @@ evaluation order. Verified by hashing the sorted CSV at 1 and 6 workers, in both
 modes. BLAS thread counts are pinned to 1 in the workers; without that, NumPy
 oversubscribes the cores and parallel is *slower* than serial.
 
-One caveat under `--no-lazy`: each worker holds its own copy of the current
+Under `--no-lazy`, each worker holds its own copy of the current
 cell's tree and states, so memory scales with worker count. Lower
 `--max-verification-budget` accordingly, or use `--lazy`. It also writes `config.json` next to the results
-and refuses to append to a directory produced by a different configuration —
-the reference implementation computed its config and discarded it, which is why
-recovering what produced a given results directory meant digging through shell
-history. Cells whose verification batch exceeds
+and refuses to append to a directory produced by a different configuration.
+Cells whose verification batch exceeds
 `--max-internal` are skipped and reported; at `d=512` the top corner is
 memory-bound (`(7,7)` needs ~20 GB, `(6,7)` ~7 GB), everything else fits.
 
@@ -124,17 +121,15 @@ Without leaves, D-GRS's advantage comes from depth instead, and appears from
 
 ### `--prefetch` — which drift the next round reuses
 
-This matters more than anything else in this file. Every mode is **exact**; the
-proposal only decides which states get drafted, and the verifier guarantees the
-committed state is a target draw however stale the drift is. They trade
-acceptance rate, never correctness.
+Every prefetch mode is exact. The proposal determines which states are drafted, while the
+verifier ensures that committed states follow the target distribution. Prefetch modes affect
+acceptance rates, not correctness.
 
 - `nearest` (default) — the freshest drift available *at the committed step*:
   the committed leaf's own if `--evaluate-leaves` (exact), else the nearest
   drafted sibling at that depth, else the parent. Costs no extra evaluation.
-- `parent` — the last verified parent's drift. Wrong on two axes at once: the
-  wrong state *and* the previous step's noise level. specdiff's historical
-  behaviour.
+- `parent` — the last verified parent's drift, evaluated at the parent state
+  and the previous step's noise level.
 - `none` — reuse nothing, re-evaluate the target at every round's root. The
   best possible proposal, at **+1 NFE per round** — which more than eats the
   gain (1.11x against `nearest`'s 1.77x).

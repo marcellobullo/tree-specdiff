@@ -1,8 +1,8 @@
 # Gaussian mixture — replicating Figures 1 and 3
 
-The Section 5.1 sweep: every `(K, L)` cell for both rules, on the analytic
-Gaussian-mixture target. **No GPU and no network** — this is pure NumPy, and it
-is the setting to check the sampler in before pointing it at a real model.
+This experiment reproduces the Section 5.1 `(K, L)` sweep for both verifiers on an analytic
+Gaussian-mixture target. It runs with NumPy and requires neither a GPU nor a neural network,
+making it suitable for validating an installation before running image models.
 
 | file | |
 | --- | --- |
@@ -37,7 +37,7 @@ before any sweep that uses `--lazy`.
 python experiments/gm/gm_sweep.py --out /tmp/gm-smoke --dimension 64 --num-steps 12 --K-values 1 2 3 --L-values 1 2 --replicates 5 --n-workers 2
 ```
 
-Seconds. Confirms the whole path runs before you commit hours to it.
+This short run validates the complete experiment path before starting the full sweep.
 
 ## 3. The full sweep
 
@@ -72,12 +72,11 @@ step alone; the sweep does not need repeating.
 | `figure3_grid_calls.{pdf,png}` | the same grid in raw target calls |
 | `speedup_vs_k.{pdf,png}`, `calls_vs_budget.png`, `speedup_vs_budget.png` | supporting plots |
 
-## Two things to know
+## Reproducibility settings
 
 **The seed.** `--seed 14` is what `results/gm/20260820-193412` used; the CLI
-default is `20260714`. Both are valid runs of the same experiment, but only
-`--seed 14` reproduces that directory's numbers cell for cell rather than merely
-in distribution.
+default is `20260714`. Both produce valid runs, but `--seed 14` is required to reproduce that
+directory cell by cell.
 
 **`--match` decides what the RMC arm is.** The default, `verification`, gives
 both rules the same *target* batch `|I|` — the hardware-matched comparison.
@@ -86,5 +85,5 @@ protocol, and a chain `K` times longer. At `d=512, eps=0.06` that is the
 difference between **1.27x and 1.77x**, so it is not a detail. It is recorded in
 `config.json` for every run.
 
-For why any of this is set up the way it is — the two budgets, leaves, prefetch
-policies, the deterministic endpoints — see [`../README.md`](../README.md).
+For details on budgets, leaf evaluation, prefetch policies, and deterministic endpoints, see
+[`../README.md`](../README.md).

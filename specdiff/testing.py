@@ -1,23 +1,20 @@
 """Tools for validating a verification rule.
 
-Exactness is the property the whole method is sold on, and it is the one the
-sampler cannot verify at runtime: a rule that returns a plausible-looking
-Gaussian from the wrong distribution produces a run that finishes, reports a
-speedup, and is silently wrong. So it needs a test, and the test belongs in the
-library rather than in each user's repo.
+The sampler cannot establish distributional exactness from a single verifier
+call. A verifier can return a Gaussian sample from the wrong distribution
+without raising an error, so the library provides a reusable statistical test.
 
 :func:`check_exactness` exploits the rank-1 reduction: under exactness the
 projection of the returned state onto ``e`` is ``N(delta, 1)`` for any
 ``delta``, whatever the rule did internally. A one-sample KS test on that
-scalar catches every coupling bug the author has managed to write by accident,
-without needing SciPy.
+scalar detects distributional errors without requiring SciPy.
 
 Note that the harness projects onto the direction it *built* the synthetic node
 from, not onto one recovered from the request. The two agree whenever
 ``delta > 0``; the distinction only matters at ``delta = 0``, where the mean
 displacement vanishes and a recovered direction would be the zero vector. That
-case has to work, because ``delta = 0`` is the regime a good proposal
-approaches and Remark 2 says every rule must handle it.
+case must be supported because ``delta = 0`` is the limiting regime described
+by Remark 2.
 """
 
 from __future__ import annotations
@@ -66,9 +63,9 @@ def check_exactness(
 ) -> ExactnessReport:
     """Run a rule ``num_samples`` times on a synthetic node and KS-test its output.
 
-    The synthetic node is the general case, not a special one: isotropic
+    The synthetic node represents the general case: isotropic
     Gaussians in ``dim`` dimensions whose means differ by ``delta * sigma`` in a
-    random direction, which is exactly the structure eq. (24) guarantees at
+    random direction, matching the structure guaranteed by Equation 24 at
     every node of every tree.
 
     ``array_like`` sets the backend: pass ``torch.zeros(dim)`` to test a
@@ -77,10 +74,9 @@ def check_exactness(
     ``seed`` controls **every** draw -- the mean direction, the children, and
     whatever the rule itself consumes, because the seeded generator is handed
     to the rule as ``request.rng``. Two calls with the same seed therefore give
-    byte-identical reports. That matters more here than anywhere else in the
-    library: this is a hypothesis test run at level ``alpha``, so a correct
-    rule fails it about ``alpha`` of the time, and an irreproducible failure is
-    one you cannot tell apart from a real coupling bug.
+    byte-identical reports. Because this is a level-``alpha`` hypothesis test,
+    a correct verifier fails with probability approximately ``alpha``. Retain
+    the seed when investigating failures.
     """
     if array_like is None:
         array_like = default_state(dim)

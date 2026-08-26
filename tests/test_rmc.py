@@ -61,7 +61,7 @@ def _request(delta, rng, dim=DIM, sigma=SIGMA, dtype=np.float64):
 
 # ------------------------------------------------------------------- exactness
 def test_exactness_across_delta():
-    """The one obligation the sampler cannot check per call.
+    """Verify distributional exactness across representative `delta` values.
 
     `alpha=0.001` rather than the default: a sweep runs many tests, so at
     `alpha=0.01` the chance that some cell trips on a correct rule grows with
@@ -221,8 +221,7 @@ def test_both_endpoints_of_the_uniform_are_handled():
 
 # ---------------------------------------------------------------- the topology
 def test_refuses_a_branching_tree():
-    """`max_children = 1`, so misconfiguration fails at build time rather than
-    silently ignoring siblings at every node."""
+    """Reject branching trees for a verifier with `max_children = 1`."""
     ReflectionMaximalCoupling().check_topology(DraftTree.chain(4))
     try:
         ReflectionMaximalCoupling().check_topology(DraftTree.uniform(branching=3, lookahead=2))

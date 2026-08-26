@@ -1,13 +1,12 @@
 """Transitions: the two mean maps and the shared variance schedule.
 
-Appendix C, eq. (24) is the entire model interface::
+The model interface follows Appendix C, Equation 24::
 
     P_n(. | y) = N(m^p_n(y), sigma_n^2 I)
     Q_n(. | y) = N(m^q_n(y), sigma_n^2 I)
 
-Anything that can produce those means plugs in: a real denoiser, a distilled
-draft network, an analytic score, or the paper's delayed reverse drift. The
-sampler never learns which.
+Any component that produces these means can be used, including a denoiser,
+distilled draft network, analytic score, or delayed reverse drift.
 """
 
 from __future__ import annotations
@@ -61,12 +60,12 @@ class ConstantSchedule(NoiseSchedule):
 
 
 class TargetTransition(ABC):
-    """``m^q``. Evaluating this is the expensive thing we are trying to avoid.
+    """Expensive target mean map ``m^q``.
 
     Implementations override :meth:`means`, which is called **once per round**
     with the whole verification batch (all internal nodes of the round's tree).
-    Call the instance, don't call ``means`` directly: ``__call__`` keeps the
-    NFE accounting that the cost metric is defined on.
+    Invoke the instance through ``__call__`` rather than calling ``means``
+    directly, because ``__call__`` maintains NFE accounting.
     """
 
     def __init__(self) -> None:
@@ -81,11 +80,10 @@ class TargetTransition(ABC):
 
         ``indices_in_batch[i]``, ``states[i]`` and ``steps[i]`` all describe
         entry ``i``: which of the ``batch_size`` images it belongs to, its
-        value, and its step. Same convention as
-        :meth:`ProposalTransition.means`, and for the same reason: one call
-        carries entries from several images, so a target that conditions on
-        anything per-image -- a class label, a text prompt -- needs to know
-        which is which. A target that conditions on nothing ignores it.
+        value, and step. This matches :meth:`ProposalTransition.means`. Targets
+        conditioned on per-image data, such as labels or prompts, use the
+        index to select the corresponding condition. Unconditional targets may
+        ignore it.
 
         Must be a single batched evaluation of the target network.
         """
@@ -116,27 +114,17 @@ class TargetTransition(ABC):
 
 
 class ProposalTransition(ABC):
-    """``m^p``. Cheap by assumption; called once per tree level while drafting.
+    """Proposal mean map ``m^p``, called once per drafted tree level.
 
     Every call carries ``indices_in_batch``: for each entry of the stack,
-    which of the ``batch_size`` images it belongs to. There is one interface,
-    not two -- sampling a single image is ``batch_size = 1``, where
-    ``indices_in_batch`` is all zeros, and not a separate world with its own
-    class hierarchy. A proposal that keeps no per-image memory simply ignores
-    the argument.
+    which of the ``batch_size`` images it belongs to. Scalar sampling uses the
+    same interface with ``batch_size = 1`` and zero-valued indices. Stateless
+    proposals may ignore this argument; stateful proposals use it to isolate
+    cached values by trajectory.
 
-    That uniformity is why no adapter classes exist. Lifting a one-image
-    proposal into a batch used to need a wrapper, and a wrapper that shared one
-    object across images would silently apply image 0's memory to image 3 --
-    so a second wrapper existed to make one object per image, and a flag to
-    say which wrapper you needed. None of that is reachable now: a proposal is
-    told which image each entry belongs to, so it can always do the right
-    thing in one call.
-
-    The three hooks exist because the interesting proposals carry memory. A
-    delayed reverse drift has to be told when a round starts and which target
-    drifts have become available; a distilled draft network needs neither and
-    inherits the no-ops.
+    The lifecycle hooks support proposals with per-trajectory state. Delayed
+    reverse drift uses them to observe round boundaries and newly available
+    target drifts. Stateless draft networks inherit the no-op implementations.
     """
 
     @abstractmethod
@@ -163,9 +151,8 @@ class ProposalTransition(ABC):
     ) -> None:
         """Called for each *committed* node whose target mean was computed.
 
-        This is the channel that makes root-drift prefetching possible: the
-        drift the proposal will reuse next round is one this round already paid
-        for during verification.
+        This hook supports root-drift prefetching by exposing target drifts
+        already evaluated during verification.
         """
 
     def configure_prefetch(self, mode: str) -> None:
@@ -179,6 +166,9 @@ class ProposalTransition(ABC):
         this; the default does nothing.
         """
 
+    def configure_backend(self, backend) -> None:
+        """Receive the sampler-selected backend for internal array operations."""
+
     def reset(self, batch_size: int) -> None:
         """Drop any cached memory and size it for ``batch_size`` images.
 
@@ -187,11 +177,11 @@ class ProposalTransition(ABC):
 
 
 class IdentityProposal(ProposalTransition):
-    """``m^p(y) = y``: the worst useful proposal, and free.
+    """Zero-cost baseline proposal defined by ``m^p(y) = y``.
 
     Used by :func:`specdiff.sampler.standard_sampler`, where the drafts are
-    discarded anyway, and as a floor when measuring how much proposal quality
-    is buying you. Keeps no per-image memory, so ``indices_in_batch`` is
+    discarded, and as a baseline for measuring proposal quality. It keeps no
+    per-image memory, so ``indices_in_batch`` is
     ignored and one instance serves any batch size.
     """
 
@@ -200,11 +190,10 @@ class IdentityProposal(ProposalTransition):
 
 
 class MirrorProposal(ProposalTransition):
-    """``m^p = m^q``: a perfect proposal (``delta = 0``, everything accepts).
+    """Ideal diagnostic proposal defined by ``m^p = m^q``.
 
-    Useless in production, invaluable in tests: it isolates bugs in a
-    verification rule from bugs in the coupling, and it makes the sampler's
-    accounting easy to reason about. Keeps no per-image memory.
+    It produces ``delta = 0`` and isolates sampler or verifier behavior from
+    proposal error. It keeps no per-image memory.
     """
 
     def __init__(self, target: TargetTransition) -> None:
@@ -227,10 +216,10 @@ class DelayedDriftProposal(ProposalTransition):
 
         m^p(y) = y + (m^q_{n'}(Y~) - Y~)
 
-    Because the increment is read off a target mean that verification already
-    computed in an earlier round, no extra target call is needed per round
-    (Appendix C, "root-drift prefetching"). Exactly one warm-up call per image
-    is unavoidable at ``n = 0``, and it is counted.
+    Because the increment is read from a target mean already computed during
+    verification, no additional target call is needed per round (Appendix C,
+    "root-drift prefetching"). One warm-up call per image is required at
+    ``n = 0`` and included in the counters.
 
     ``_delayed_drift`` holds those increments in a ``(batch_size, *state_shape)``
     buffer, one row per image, indexed by ``indices_in_batch`` -- so drafting is
@@ -255,6 +244,10 @@ class DelayedDriftProposal(ProposalTransition):
         self._delayed_drift: Optional[Array] = None
         self._have: list[bool] = []
         self._batch_size = 0
+        self._backend = None
+
+    def configure_backend(self, backend) -> None:
+        self._backend = backend
 
     def reset(self, batch_size: int) -> None:
         self._delayed_drift = None
@@ -268,7 +261,7 @@ class DelayedDriftProposal(ProposalTransition):
     def on_round_start(self, indices_in_batch, steps, roots) -> None:
         from .ops import resolve_backend
 
-        ops = resolve_backend(roots)
+        ops = self._backend or resolve_backend(roots)
         if self._delayed_drift is None:
             self._delayed_drift = ops.zeros_stack(self._batch_size, roots[0])
         missing = [
@@ -290,7 +283,7 @@ class DelayedDriftProposal(ProposalTransition):
             return
         from .ops import resolve_backend
 
-        ops = resolve_backend(states)
+        ops = self._backend or resolve_backend(states)
         ops.put(self._delayed_drift, list(indices_in_batch), target_means - states)
         for b in indices_in_batch:
             self._have[b] = True
@@ -300,5 +293,5 @@ class DelayedDriftProposal(ProposalTransition):
 
         if self._delayed_drift is None:
             raise RuntimeError("on_round_start must run before drafting")
-        ops = resolve_backend(states)
+        ops = self._backend or resolve_backend(states)
         return states + ops.take(self._delayed_drift, list(indices_in_batch))

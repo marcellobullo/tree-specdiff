@@ -1,22 +1,19 @@
-"""Port fidelity: this adapter vs the reference implementation, on identical inputs.
+"""Compare this adapter with the reference implementation on identical inputs.
 
-The test suite proves the adapter is *self-consistent* -- the change of
-variables matches an independently derived velocity, the schedule matches
-diffusers. It cannot prove the adapter is the *same model* the reference
-implementation samples, and that is the claim any comparison against previously
-published numbers rests on.
+The local test suite validates the adapter's internal consistency. This script
+adds a cross-implementation check for comparisons with previously published
+results.
 
-So this runs both step-math implementations side by side and prints the
-disagreement. It needs a checkout of `accelerating-diffusion-sampling`, which
-is why it is a script and not a test: nothing in this repo depends on that one.
+It runs both transition implementations side by side and reports their
+difference. A separate `accelerating-diffusion-sampling` checkout is required.
 
     python experiments/images/crosscheck_reference.py \\
         --reference-repo /path/to/accelerating-diffusion-sampling
 
-Expected: velocity and transition std agree *exactly* (they are the same
-closed form), the sigma grid and kernel mean to float32 epsilon (~1e-7). A
-larger gap means the two have drifted apart and any cross-repo number
-comparison is void.
+Expected: velocity and transition standard deviation agree exactly; the sigma
+grid and kernel mean agree within float32 precision (approximately `1e-7`).
+Larger differences indicate that results from the two implementations are not
+directly comparable.
 """
 
 from __future__ import annotations

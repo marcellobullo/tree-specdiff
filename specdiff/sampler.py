@@ -1,9 +1,8 @@
 """Algorithm 3: speculative diffusion sampling for an arbitrary draft tree.
 
-The class below is a transcription of the pseudocode, with line numbers in the
-comments. It owns the loop and the bookkeeping and nothing else -- topology
-lives in :mod:`specdiff.trees`, the models in :mod:`specdiff.kernels`, and the
-coupling in :mod:`specdiff.verify`.
+The implementation follows the pseudocode, with line references in comments.
+It owns the execution loop and accounting; topology, transition models, and
+verification are defined in separate modules.
 """
 
 from __future__ import annotations
@@ -25,8 +24,7 @@ PREFETCH_MODES = ("none", "parent", "nearest")
 
 ``"none"``
     Reuse nothing: re-evaluate the target at every round's root. Costs one
-    extra NFE per round, and gives the best proposal there is -- the drift is
-    exact at the root by construction.
+    extra NFE per round and provides an exact root drift.
 ``"parent"``
     The last verified parent's drift. Free, but one step behind the state the
     next round starts from: it was computed at step ``n + level - 1`` from the
@@ -36,9 +34,9 @@ PREFETCH_MODES = ("none", "parent", "nearest")
     committed leaf's own when ``evaluate_leaves`` is on (exact), else the
     nearest drafted sibling at that depth, else the parent.
 
-Every mode is exact. The proposal only decides which states get drafted; the
-verifier guarantees the committed state is a target draw however stale the
-drift is. These trade acceptance rate, never correctness.
+Every mode preserves exactness. The proposal affects which states are drafted,
+while the verifier ensures that committed states follow the target distribution.
+The modes trade acceptance rate against target-evaluation cost.
 """
 
 
@@ -60,18 +58,17 @@ class SpeculativeSampler:
     num_steps:
         Horizon ``N``.
     check_contract:
-        Wrap the verifier in :class:`~specdiff.verify.CheckedVerifier`. Cheap;
-        leave it on while developing a new rule.
+        Wrap the verifier in :class:`~specdiff.verify.CheckedVerifier`.
+        Recommended while developing a new rule.
 
     Notes
     -----
     One instance samples one trajectory at a time. The parallelism the method
-    exploits is *within* a round -- the whole draft tree goes through the
+    exploits is *within* a round: the draft tree passes through the
     target model in a single batched call -- which is a different axis from
     batching over images. Batching trajectories as well is possible but not
-    free: independent trajectories accept different prefixes and so fall out of
-    step, which needs either ragged batching or per-trajectory masking. See
-    ``README.md``.
+    automatic because independent trajectories can accept different prefix
+    lengths. See :class:`specdiff.batched.BatchedSpeculativeSampler`.
     """
 
     def __init__(
@@ -93,8 +90,8 @@ class SpeculativeSampler:
         if prefetch not in PREFETCH_MODES:
             raise ValueError(
                 f"prefetch must be one of {sorted(PREFETCH_MODES)}; got {prefetch!r}. "
-                "It used to be a bool on DelayedDriftProposal: True is now "
-                '"parent", False is now "none".'
+                'Use "parent" to reuse the verified parent drift or "none" '
+                "to re-evaluate the root."
             )
         verifier.check_topology(tree)
         self.target = target
@@ -127,6 +124,7 @@ class SpeculativeSampler:
         ops = self._backend or resolve_backend(init)
         ops.check_state_dtype(init, "init")
         self.target.reset_stats()
+        self.proposal.configure_backend(ops)
         self.proposal.reset(1)
         self.proposal.configure_prefetch(self.prefetch)
         self._exact_root_mean = None
@@ -246,6 +244,7 @@ class SpeculativeSampler:
                 children=ops.take(states, children),
                 parent_state=states[u],
                 rng=rng,
+                backend=ops,
                 info={"level": level, "node": u},
             )
             result: VerifyResult = self.verifier(request)
@@ -288,19 +287,18 @@ class SpeculativeSampler:
             accepted_depth=committed - 1 if rejected else committed,
             rejected=rejected,
             drafted=tree.budget,
-            verified=len(internal),
+            verified=len(evaluated),
             proposals_examined=tuple(examined),
         )
 
     def _verify_exact_root(self, ops, states, target_means, n: int) -> None:
-        """Assert the reused root mean is what a fresh evaluation would give.
+        """Validate a reused root mean against a fresh evaluation.
 
         The optimisation rests on an invariant -- that the committed leaf of the
-        previous round is this round's root, at the same step -- which nothing
-        else enforces. Truncation, a topology change or an off-by-one in the
-        step bookkeeping would break it silently and bias every trajectory, so
-        under ``check_contract`` it is checked. Uses ``target.means`` directly
-        rather than ``target(...)``, so the check itself costs no NFE.
+        previous round is this round's root at the same step. Truncation,
+        topology changes, or indexing errors can violate that invariant.
+        ``check_contract`` enables this validation. It calls ``target.means``
+        directly, so the check does not increment the NFE counter.
         """
         fresh = self.target.means((0,), states[ROOT][None], (n,))[0]
         if not ops.allclose(fresh, target_means[ROOT]):
@@ -316,31 +314,28 @@ class SpeculativeSampler:
     ) -> None:
         """Hand the proposal the freshest drift available at the committed step.
 
-        The delayed-drift proposal reuses one target drift for the whole of the
-        next round, so what matters is how close that drift is to the state the
-        next round starts from. ``prefetch="parent"`` hands over the last
-        verified parent's, which is wrong on two axes at once: it was computed
-        from the parent, and at the previous step's noise level. This picks a
-        drift at the right step instead.
+        The delayed-drift proposal reuses one target drift for the next round.
+        This method selects a drift evaluated at the committed step and, when
+        possible, near the committed state.
 
         Three cases, in order of what is available:
 
         1.  **Full acceptance.** The round exhausted its lookahead, so the
             committed state is a leaf. With ``evaluate_leaves`` its own drift
-            was computed in Phase 2 and is *exact* at the next root -- nothing
-            stale at all. Without it, leaves have no target mean and we fall
+            was computed in Phase 2 and is exact at the next root. Without it,
+            leaves have no target mean and the method falls
             through to the parent.
         2.  **Rejection above the last level.** The committed state is a
             residual draw, not a drafted node, so no exact drift exists. Its
             siblings at that depth do sit at the same step and were verified in
             Phase 2, so carry the nearest one's. The residual is drawn close to
-            the drafts by construction, which is what makes "nearest" a good
-            proxy rather than an arbitrary pick.
+            the drafts by construction, making the nearest sibling a useful
+            approximation.
         3.  **Rejection at the last level** (siblings are leaves, no
             ``evaluate_leaves``), or anything else unavailable: the parent's.
 
-        Never costs an additional target evaluation -- every drift it can reach
-        was already paid for by Phase 2.
+        All candidate drifts were evaluated in Phase 2, so this method adds no
+        target evaluations.
         """
         depth = tree.depth_of(parent) + 1
 

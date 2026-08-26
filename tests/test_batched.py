@@ -361,7 +361,7 @@ def test_irregular_tree_is_rejected_with_a_useful_message():
 
 # ------------------------------------------------------ sampler-parity guarantees
 def test_batched_sampler_rejects_a_non_floating_init():
-    """An integer init would truncate every noise draw to zero, silently."""
+    """Reject integer initial states before they truncate Gaussian noise."""
     _, sampler = _sampler(AcceptFirstVerifier(), batch=3, N=6, K=2, L=2)
     try:
         sampler.sample(np.ones((3, 4), dtype=np.int64))

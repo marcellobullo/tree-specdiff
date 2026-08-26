@@ -3,8 +3,8 @@
 Karras et al. (2022) publish CIFAR10 and FFHQ checkpoints
 (https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/, CC BY-NC-SA 4.0) whose
 ``EDMPrecond`` network is a *denoiser*. specdiff wants eq. (24): a transition
-mean ``m^q_n`` and a shared scale ``sigma_n``. Getting from one to the other is
-two exact changes of variables and no retraining, and they are the whole module.
+mean ``m^q_n`` and a shared scale ``sigma_n``. The adapter applies two exact
+changes of variables and requires no retraining.
 
 1.  **Denoiser -> velocity.** EDM's ``D(y; s) = E[x0 | y = x0 + s n]`` lives on
     an additive-noise parameterisation; specdiff's trajectory lives on the
@@ -29,7 +29,8 @@ two exact changes of variables and no retraining, and they are the whole module.
         std        = eps sqrt(g^2) sqrt(-dt)
 
     ``mean`` is ``m^q_n``; ``std`` is ``sigma_n``, and it is *state-independent*,
-    which is exactly the condition the rank-1 reduction of eqs. (8)-(11) needs.
+    satisfying the shared-covariance condition required by the rank-1 reduction
+    in Equations 8--11.
     So the schedule is a plain :class:`~specdiff.TabulatedSchedule`.
 
 Deterministic endpoints
@@ -39,8 +40,7 @@ Deterministic endpoints
 zero churn -- the two kernels become distinct point masses, TV distance 1 --
 and ``NoiseSchedule`` refuses a non-positive scale outright (Remark 3). Like
 ``experiments/gm/models.py``, :func:`build` exposes only the stochastic steps
-and *reports* the skipped ones rather than silently reindexing. Unlike the GM
-setting, here we want the actual images, so :func:`sample_trajectory` stitches
+and reports the skipped ones explicitly. :func:`sample_trajectory` stitches
 the deterministic prologue and epilogue back on: a ``T = 100`` run is 98
 speculative steps plus 2 Euler steps that every sampler pays.
 
@@ -53,8 +53,8 @@ batch can mix classes. Set it per batch with :meth:`ChurnKernelTarget.set_class_
 **EDM's conditional networks have no null class.** They were not trained for
 classifier-free guidance, so there is no "unconditional" setting of a
 ``*-cond-*`` checkpoint: passing no label makes ``EDMPrecond`` fall back to a
-zero embedding, which is not a trained null token and gives plausible-looking
-samples from the wrong distribution. To sample the class marginal -- the usual
+zero embedding, which is not a trained null token and does not represent the
+intended distribution. To sample the class marginal -- the usual
 FID protocol, and what the reference implementation did -- draw a label per
 image uniformly. Unconditional generation means an unconditional *checkpoint*
 (``label_dim == 0``), not a conditional one with the label omitted. Both guards

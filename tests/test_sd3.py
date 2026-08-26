@@ -3,8 +3,8 @@
 The toy pipeline in `experiments/images/toy_sd3.py` makes each prompt name a
 constant latent, so a finished trajectory lands *exactly* on that prompt's
 value -- the last step is deterministic and pulls `x + dt (x - mu)/sigma` to
-`mu` regardless of the path. That turns prompt routing, the thing this design
-exists to get right, into an equality rather than an eyeball.
+`mu` regardless of the path. This makes prompt routing directly testable with
+an equality assertion.
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def make(prompts=PROMPTS, *, guidance_scale=1.0, px=64, forward_batch=0, **kw):
 
 class TestSchedule:
     def test_matches_the_pixel_adapter_exactly(self):
-        """The two files duplicate this on purpose; nothing may drift.
+        """Verify that the duplicated pixel and latent implementations remain equivalent.
 
         `sd3_models.py` copies `sigma_grid`/`churn_std_grid` from `models.py`
         rather than importing them, so the latent and pixel experiments stay
@@ -88,7 +88,7 @@ class TestVelocity:
         assert torch.allclose(got, want, atol=1e-5)
 
     def test_rows_of_one_call_carry_their_own_prompt(self):
-        """The whole point of the prompt table: one forward, several captions."""
+        """Verify that one forward pass can use a distinct caption per row."""
         den, _ = make()
         den.set_prompt_batch([0, 1, 2])
         x = torch.zeros((3, *den.state_shape))
@@ -200,7 +200,7 @@ class TestSampling:
         assert torch.allclose(y, want.expand_as(y), atol=1e-3)
 
     def test_permuting_the_prompts_permutes_the_images(self):
-        """The sharpest form: same seed, prompt order reversed."""
+        """Verify prompt routing by reversing prompt order with a fixed seed."""
         den, s = make()
         sampler = BatchedSpeculativeSampler(
             target=s.target, proposal=DelayedDriftProposal(s.target),
@@ -389,8 +389,7 @@ class TestClipScoring:
             ["a photo of a cat"] * 2
 
     def test_images_are_paired_with_their_own_caption(self, tmp_path):
-        """The failure that matters: an off-by-one scores every image against
-        its neighbour's caption and still returns a plausible number."""
+        """Detect off-by-one errors in caption-to-image alignment."""
         from images import clip
 
         f = tmp_path / "p.txt"
@@ -423,10 +422,11 @@ class TestClipScoring:
 
         a = clip.summarise(Path("a"), shifted, "fake", None)
         b = clip.summarise(Path("b"), base_scores, "fake", None)
+        a["pairing_signature"] = b["pairing_signature"] = "same-pairs"
         d = clip.paired_delta(a, b)
 
         assert d["paired_mean_delta"] == pytest.approx(0.3, abs=1e-4)
-        assert d["paired_sem"] < d["unpaired_sem"] / 100     # the whole point
+        assert d["paired_sem"] < d["unpaired_sem"] / 100     # validates paired scoring
         assert abs(d["z"]) > 10                              # visible when paired
 
     def test_incomparable_cells_give_no_delta(self, tmp_path):
@@ -495,3 +495,35 @@ class TestCocoPrompts:
 
         with pytest.raises(SystemExit, match="exceeds"):
             select(self._annotations(tmp_path, n=10), 20, 0, seed=7)
+
+
+def test_paired_delta_refuses_different_pairing_signatures():
+    from images import clip
+
+    scores = torch.tensor([1.0, 2.0, 3.0])
+    a = clip.summarise(Path("a"), scores, "fake", None)
+    b = clip.summarise(Path("b"), scores, "fake", None)
+    a["pairing_signature"], b["pairing_signature"] = "seed-1", "seed-2"
+    assert clip.paired_delta(a, b) is None
+
+
+def test_clip_cache_signature_tracks_model_prompts_and_samples(tmp_path):
+    from images import clip
+
+    cell = tmp_path / "cell"
+    cell.mkdir()
+    prompts = tmp_path / "prompts.txt"
+    prompts.write_text("a cat\n")
+    torch.save(torch.zeros((1, 3, 8, 8), dtype=torch.uint8), cell / "samples.pt")
+    meta = {"prompts_file": str(prompts), "seed": 0,
+            "prompt_seed_rule": "image i = line i"}
+    (cell / "meta.json").write_text(json.dumps(meta))
+    args = TestDriver._args(cell, prompts=str(prompts), num_samples=1)
+    args.model, args.dtype = "model-a", "float32"
+
+    first = clip.cache_signature(cell, args, meta)
+    args.model = "model-b"
+    assert clip.cache_signature(cell, args, meta) != first
+    args.model = "model-a"
+    prompts.write_text("a dog\n")
+    assert clip.cache_signature(cell, args, meta) != first

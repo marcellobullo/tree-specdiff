@@ -1,8 +1,8 @@
 """Score saved samples: FID, and optionally Inception Score.
 
-Scoring is separate from generation so a 50k run is paid once and can be
-measured repeatedly -- against different reference sets, or with metrics added
-later. Reads the `samples.pt` that `run_edm.py` writes (uint8 `(N, C, H, W)`),
+Scoring is separate from generation so a 50,000-sample run can be measured
+against multiple reference sets or additional metrics. The script reads the
+``samples.pt`` written by ``run_edm.py`` (uint8 ``(N, C, H, W)``),
 and scores several runs in one invocation against one shared real set:
 
     python experiments/images/fid.py --samples results/edm/*/ \\
@@ -11,17 +11,15 @@ and scores several runs in one invocation against one shared real set:
 
 FID is computed with `torchmetrics`' `FrechetInceptionDistance(feature=2048,
 normalize=False)` -- the same implementation the reference implementation uses,
-so numbers are comparable with the ones already computed there. FID values are
-*not* comparable across Inception implementations, so this is not an
-interchangeable detail.
+so results are comparable with existing measurements from that implementation.
+FID values from different Inception implementations should not be compared.
 
 The real-side statistics are cached. FID depends on the real images only
 through three accumulators -- `sum(f)`, `sum(f f^T)` and the count -- so
-caching them is exact, not an approximation, and it is what makes scoring a
-twelve-cell sweep cheap: InceptionV3 runs over the real set once rather than
-twelve times. The cache filename carries the dataset, the real count and the
+caching them preserves the metric exactly. InceptionV3 therefore processes the
+real set once per cache. The cache filename includes the dataset, real count, and
 resolution, because FID against a different real N or size is a different
-number and must not silently reuse a cache.
+number and require distinct cache entries.
 
 `--dataset cifar10` fetches the real images through Hugging Face `datasets`.
 `--dataset ffhq` needs `--data <directory or zip of images>`.
@@ -30,6 +28,7 @@ number and must not silently reuse a cache.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import zipfile
@@ -146,16 +145,45 @@ def load_samples(spec: str) -> torch.Tensor:
     return samples
 
 
+def real_cache_signature(args, size: int) -> dict:
+    """Identify the real-image source whose feature accumulators are cached."""
+    base = {"version": 1, "dataset": args.dataset,
+            "num_real": args.num_real, "size": size}
+    if args.dataset == "cifar10":
+        base["source"] = {"dataset_id": "uoft-cs/cifar10", "split": "train"}
+        return base
+    if not args.data:
+        raise SystemExit(f"--dataset {args.dataset} needs --data (the real images)")
+    path = Path(args.data).resolve()
+    if path.is_file():
+        stat = path.stat()
+        base["source"] = {"path": str(path), "size": stat.st_size,
+                          "mtime_ns": stat.st_mtime_ns}
+        return base
+    digest = hashlib.sha256()
+    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in IMAGE_SUFFIXES)
+    for item in files:
+        stat = item.stat()
+        digest.update(str(item.relative_to(path)).encode())
+        digest.update(f"\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    base["source"] = {"path": str(path), "files": len(files),
+                      "manifest_sha256": digest.hexdigest()}
+    return base
+
+
 # --------------------------------------------------------------------------- fid
 def fill_real(metric, args, size: int, cache: Path) -> int:
     """Populate the real side, from cache when possible."""
+    signature = real_cache_signature(args, size)
     if cache.exists():
         state = torch.load(cache, map_location=args.device, weights_only=True)
-        for name in _REAL_STATE:
-            setattr(metric, name, state[name].to(args.device))
-        n = int(metric.real_features_num_samples.item())
-        print(f"real stats: {n} images from cache {cache.name}")
-        return n
+        if state.get("_signature") == signature:
+            for name in _REAL_STATE:
+                setattr(metric, name, state[name].to(args.device))
+            n = int(metric.real_features_num_samples.item())
+            print(f"real stats: {n} images from cache {cache.name}")
+            return n
+        print(f"real stats: ignoring stale cache {cache.name}")
 
     print(f"real stats: featurising up to {args.num_real} {args.dataset} images "
           f"(cached afterwards at {cache.name})")
@@ -170,7 +198,9 @@ def fill_real(metric, args, size: int, cache: Path) -> int:
         if seen % (args.batch_size * 20) == 0:
             print(f"  {seen}/{args.num_real}", flush=True)
     cache.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({n: getattr(metric, n) for n in _REAL_STATE}, str(cache) + ".tmp")
+    state = {n: getattr(metric, n) for n in _REAL_STATE}
+    state["_signature"] = signature
+    torch.save(state, str(cache) + ".tmp")
     Path(str(cache) + ".tmp").replace(cache)
     return seen
 

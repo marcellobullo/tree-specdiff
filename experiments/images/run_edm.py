@@ -1,8 +1,8 @@
 """Generate images from a pretrained EDM checkpoint through specdiff.
 
-One (rule, K, L, eps) configuration per invocation. No metrics: this writes
-samples and the NFE accounting, and scoring is a separate step, so a large
-generation run is paid once and can be measured many ways.
+Each invocation runs one ``(rule, K, L, eps)`` configuration and writes samples
+with NFE accounting. Scoring is a separate step, allowing one generation run to
+support multiple metrics.
 
     python experiments/images/run_edm.py \\
         --network /path/edm-cifar10-32x32-uncond-vp.pkl --edm-repo /path/edm \\
@@ -10,19 +10,18 @@ generation run is paid once and can be measured many ways.
         --num-samples 64 --num-steps 100 --eps 0.25 \\
         --device cuda:0 --out results/edm/cifar10-dgrs
 
-FFHQ is the same command with a different ``--network``: resolution and channel
-count are read off the checkpoint, so nothing else changes.
+For FFHQ, change ``--network``; resolution and channel count are read from the
+checkpoint.
 
     --network /path/edm-ffhq-64x64-uncond-vp.pkl
 
-With no checkpoint at hand, ``--toy`` swaps in the closed-form denoiser of
-``toy.py`` and runs on CPU. It exercises every line of the pipeline except the
-network itself, which is the point: the wiring is what breaks.
+``--toy`` uses the closed-form denoiser in ``toy.py`` and runs on CPU. It
+validates the pipeline without loading a checkpoint.
 
 Output (``--out``):
     samples.pt   uint8 (N, 3, H, W) -- the layout the FID scorer expects
     meta.json    protocol + NFE accounting
-    grid.png     8x8 montage for eyeballing
+    grid.png     8x8 preview montage
 
 Conditional and unconditional checkpoints are interchangeable: ``--labels auto``
 (the default) reads the checkpoint and either samples unconditionally or draws
@@ -30,8 +29,8 @@ one class per image, so swapping ``--network`` between a ``-cond-`` and a
 ``-uncond-`` file needs no other change.
 
 EDM's conditional networks have no null class, so a ``-cond-`` checkpoint cannot
-be run without labels -- ``--labels none`` on one is refused rather than
-silently sampling the wrong distribution. See ``models.py``'s module docstring.
+be run without labels. ``--labels none`` is rejected for these checkpoints; see
+the ``models.py`` module documentation.
 """
 
 from __future__ import annotations
@@ -58,6 +57,10 @@ from specdiff import (  # noqa: E402
 )
 
 from images import models  # noqa: E402
+from images.run_common import (  # noqa: E402
+    add_metrics, file_identity, load_shards, merged_metrics, metric_totals,
+    run_signature, save_grid, summarise_metrics, validate_reusable_shard,
+)
 
 REPORT_EVERY_S = 60.0     # progress line / progress.json cadence
 
@@ -118,7 +121,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def resolve_label_mode(args, denoiser) -> str:
-    """`--labels auto` resolved against what the checkpoint actually is.
+    """Resolve ``--labels auto`` from checkpoint metadata.
 
     EDM's conditional networks have no null class -- they were not trained for
     classifier-free guidance -- so a conditional checkpoint cannot be run
@@ -147,9 +150,9 @@ def resolve_label_mode(args, denoiser) -> str:
 
 
 def all_labels(mode: str, num_samples: int, denoiser, seed: int):
-    """Every image's class, drawn once for the whole run, or ``None``.
+    """Return one class per image for the full run, or ``None``.
 
-    Deliberately drawn for **all** ``num_samples`` up front from a generator
+    Labels are drawn for all ``num_samples`` before sharding from a generator
     seeded only by ``--seed``, then sliced per process -- so image ``i``'s class
     depends on ``i`` and the seed alone, never on how many GPUs the run used or
     what ``--sample-batch`` was. Two runs of the same seed at different process
@@ -237,20 +240,6 @@ def build_sampler(setting: models.Setting, tree: DraftTree, args):
     )
 
 
-def save_grid(samples: torch.Tensor, path: Path) -> None:
-    import PIL.Image
-
-    n = min(64, samples.shape[0])
-    side = max(1, int(n**0.5))
-    h, w = samples.shape[2], samples.shape[3]
-    grid = PIL.Image.new("RGB", (side * w, side * h))
-    for i in range(side * side):
-        arr = samples[i].permute(1, 2, 0).numpy()
-        if arr.shape[2] == 1:
-            arr = arr.repeat(3, axis=2)
-        grid.paste(PIL.Image.fromarray(arr), ((i % side) * w, (i // side) * h))
-    grid.save(path)
-
 
 def barrier(accelerator) -> None:
     """Wait for every process, tolerating a broken accelerator barrier.
@@ -288,24 +277,39 @@ def shard_bounds(num_samples: int, rank: int, world: int):
     return start, count
 
 
+def experiment_signature(args, setting, tree, denoiser):
+    return run_signature(
+        "edm", args, setting, tree,
+        extra={
+            "network": "toy" if args.toy else file_identity(args.network),
+            "edm_repo": None if args.toy else file_identity(args.edm_repo),
+            "num_classes": denoiser.num_classes,
+        },
+    )
+
+
 def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, rank):
     """Generate this process's block and write it atomically."""
+    if count < 1:
+        raise SystemExit("each process must receive at least one sample")
     shard = out / f"shard_{rank:03d}.pt"
+    signature = experiment_signature(args, setting, sampler.tree, denoiser)
     if shard.exists() and not args.overwrite:
+        validate_reusable_shard(
+            shard, signature=signature, rank=rank, start=start, count=count
+        )
         print(f"rank {rank}: reusing {shard.name}")
         return shard
 
     batch = args.sample_batch or count
-    # Rank-offset, or every process would draw identical starting noise.
     generator = torch.Generator(device=args.device).manual_seed(args.seed + rank)
     n_endpoints = len(setting.deterministic_steps)
-    chunks, calls, rows = [], 0, 0
-    speedups, end_to_end, isolated, occupancies, accepts = [], [], [], [], []
+    chunks, metrics = [], {}
     t0, done, last_report = time.time(), 0, 0.0
 
     while done < count:
         n = min(batch, count - done)
-        first = start + done                          # global index of this batch
+        first = start + done
         setting.target.set_class_labels(
             None if labels is None else labels[first : first + n].to(args.device)
         )
@@ -317,26 +321,11 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
             setting, sampler, y0, rng=generator, generator=generator
         )
         chunks.append(models.to_uint8(y).cpu())
-        calls += result.target_calls
-        rows += result.target_states_evaluated
-        speedups.append(result.speedup)
-        # The two Euler endpoints are one network call each for the whole batch,
-        # and every sampler pays them -- so they belong in the end-to-end figure
-        # and not in the speculative-window one.
-        end_to_end.append(
-            (setting.num_steps + n_endpoints) / (result.target_calls + n_endpoints)
-        )
-        isolated.append(result.mean_isolated_speedup)
-        occupancies.append(result.occupancy)
-        accepts.append(result.acceptance_rate)
+        add_metrics(metrics, metric_totals(
+            result, num_steps=setting.num_steps, deterministic_steps=n_endpoints
+        ))
         done += n
 
-        # tqdm is useless under `accelerate launch` with stderr redirected to a
-        # log, so emit a pollable progress file instead. *Every* rank writes its
-        # own -- the batch finishes when the slowest one does, so a rank stuck on
-        # a contended GPU is exactly what you need to be able to see. Only rank 0
-        # prints, because four interleaved progress streams in one log are worse
-        # than none:  `cat <out>/progress_rank*.json` shows them all.
         now = time.time()
         if now - last_report > REPORT_EVERY_S or done == count:
             rate = done / max(now - t0, 1e-9)
@@ -350,19 +339,19 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
                       flush=True)
             last_report = now
 
-    mean = lambda xs: sum(xs) / len(xs)  # noqa: E731
+    summary = summarise_metrics(metrics)
     torch.save(
         {
             "samples": torch.cat(chunks),
-            "target_calls": calls,
-            "target_states_evaluated": rows,
-            "speedup": mean(speedups),
-            "end_to_end_speedup": mean(end_to_end),
-            "mean_isolated_speedup": mean(isolated),
-            "occupancy": mean(occupancies),
-            "acceptance_rate": mean(accepts),
-            "seconds": round(time.time() - t0, 1),
             "rank": rank,
+            "start": start,
+            "count": count,
+            "run_signature": signature,
+            "metric_totals": metrics,
+            "target_calls": metrics["target_calls"],
+            "target_states_evaluated": metrics["target_states_evaluated"],
+            **summary,
+            "seconds": time.time() - t0,
         },
         str(shard) + ".tmp",
     )
@@ -370,12 +359,14 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
     return shard
 
 
-def merge_shards(args, setting, tree, denoiser, label_mode, out):
-    """Concatenate the per-rank shards into one `samples.pt` plus `meta.json`."""
-    shards = sorted(out.glob("shard_*.pt"))
-    parts = [torch.load(p, map_location="cpu", weights_only=False) for p in shards]
-    samples = torch.cat([p["samples"] for p in parts])
-    mean = lambda key: sum(p[key] for p in parts) / len(parts)  # noqa: E731
+def merge_shards(args, setting, tree, denoiser, label_mode, out, world=None):
+    """Validate and concatenate per-rank shards into one completed run."""
+    signature = experiment_signature(args, setting, tree, denoiser)
+    shards, parts = load_shards(
+        out, signature=signature, num_samples=args.num_samples, world=world
+    )
+    samples = torch.cat([part["samples"] for part in parts])
+    totals, summary = merged_metrics(parts)
 
     meta = {
         "rule": args.rule,
@@ -389,8 +380,6 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out):
         "shift": args.shift,
         "branching": args.branching if args.rule != "target" else 1,
         "lookahead": args.lookahead if args.rule != "target" else 1,
-        # For rmc these are the (K, L) it was *matched against*, not its own
-        # topology -- `chain_depth` is what it actually ran.
         "match": args.match if args.rule == "rmc" else None,
         "chain_depth": tree.depth if args.rule == "rmc" else None,
         "proposal_budget": tree.budget,
@@ -401,51 +390,42 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out):
         "num_processes": len(parts),
         "conditional": denoiser.num_classes > 0,
         "num_classes": denoiser.num_classes,
-        # Labels are reproducible from (labels, seed) and independent of the
-        # process count, so 50k of them do not belong in every meta.json.
         "labels": label_mode,
-        # `speedup` is over the speculative window; `end_to_end_speedup` adds the
-        # two deterministic Euler endpoints every sampler pays, and is the figure
-        # comparable with implementations that run all T steps through one loop.
-        # `mean_isolated_speedup` is what each trajectory would manage alone --
-        # the gap to `speedup` is the straggler cost of sharing a batch.
-        "speedup": mean("speedup"),
-        "end_to_end_speedup": mean("end_to_end_speedup"),
-        "mean_isolated_speedup": mean("mean_isolated_speedup"),
-        "occupancy": mean("occupancy"),
-        "acceptance_rate": mean("acceptance_rate"),
-        "target_calls": sum(p["target_calls"] for p in parts),
-        "target_states_evaluated": sum(p["target_states_evaluated"] for p in parts),
-        # Wall clock is the slowest rank, not the sum: they run concurrently.
-        "seconds": max(p["seconds"] for p in parts),
-        # Per rank, so a straggler is diagnosable after the fact. A spread here
-        # means one GPU was contended or slower, and the whole run waited on it.
-        "seconds_per_rank": [p["seconds"] for p in sorted(parts, key=lambda q: q["rank"])],
+        **summary,
+        "target_calls": totals["target_calls"],
+        "target_states_evaluated": totals["target_states_evaluated"],
+        "metric_totals": totals,
+        "seconds": max(part["seconds"] for part in parts),
+        "seconds_per_rank": [part["seconds"] for part in parts],
+        "run_signature": signature,
     }
 
     torch.save(samples, out / "samples.pt.tmp")
     os.replace(out / "samples.pt.tmp", out / "samples.pt")
-    for p in shards:
-        p.unlink()
+    for path in shards:
+        path.unlink()
     with open(out / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
     save_grid(samples, out / "grid.png")
-    for f in out.glob("progress_rank*.json"):
-        f.unlink()
+    for path in out.glob("progress_rank*.json"):
+        path.unlink()
 
     secs = meta["seconds_per_rank"]
     if len(secs) > 1:
         slowest, fastest = max(secs), min(secs)
         print(f"per-rank seconds: {secs}")
-        if slowest > 1.15 * fastest:
+        if fastest > 0.0 and slowest > 1.15 * fastest:
             print(f"  note: slowest rank took {slowest / fastest:.2f}x the fastest "
                   f"({slowest:.0f}s vs {fastest:.0f}s). Wall clock is the slowest "
                   f"rank, so a contended or slower GPU costs the whole run.")
     return meta
 
-
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.num_samples < 1:
+        raise SystemExit("--num-samples must be >= 1")
+    if args.sample_batch < 0 or args.forward_batch < 0:
+        raise SystemExit("--sample-batch and --forward-batch must be >= 0")
     # Long tree runs allocate and free many differently-sized activation blocks;
     # without this the allocator can fragment itself out of memory even when the
     # total is fine. Harmless when memory is plentiful. Set before any CUDA
@@ -460,6 +440,11 @@ def main(argv=None) -> None:
         accelerator = Accelerator(cpu=args.cpu)
         rank, world = accelerator.process_index, accelerator.num_processes
         args.device = str(accelerator.device)
+
+    if args.num_samples < world:
+        raise SystemExit(
+            f"--num-samples ({args.num_samples}) must be >= process count ({world})"
+        )
 
     out = Path(args.out)
     if rank == 0:
@@ -500,7 +485,7 @@ def main(argv=None) -> None:
 
     barrier(accelerator)
     if rank == 0:
-        meta = merge_shards(args, setting, tree, denoiser, label_mode, out)
+        meta = merge_shards(args, setting, tree, denoiser, label_mode, out, world=world)
         print(json.dumps(meta, indent=2))
 
     # Tear the process group down explicitly. Without this NCCL warns at exit

@@ -1,12 +1,11 @@
-# Plugging in your model
+# Integrating a model
 
-What you have to supply to sample from your own diffusion model, and what the library
-supplies for you.
+This guide describes the components required to sample from a diffusion model.
 
-Two objects are mandatory — a `TargetTransition` and a `NoiseSchedule`. Everything else has a
-usable default.
+A `TargetTransition` and a `NoiseSchedule` are required. The remaining components provide
+default implementations.
 
-## The contract: eq. (24)
+## Transition contract: Equation (24)
 
 ```
 P_n(. | y) = N(m^p_n(y), sigma_n^2 I)     proposal
@@ -14,17 +13,16 @@ Q_n(. | y) = N(m^q_n(y), sigma_n^2 I)     target
 ```
 
 Both kernels must be isotropic Gaussians that **share the variance schedule** and differ only
-in their means. This is an assumption of the template, not an implementation detail — it is
-what makes the rank-1 reduction legal, and a rule receiving a `VerifyRequest` is entitled to
-rely on it. If your sampler does not fit this shape, it does not fit this library.
+in their means. This structural requirement enables the rank-1 reduction, and verifiers may
+rely on it. Samplers with different covariance structures are not supported.
 
-Anything that can produce those means plugs in: a real denoiser, a distilled draft network, an
-analytic score, or the paper's delayed reverse drift.
+Any implementation that produces these means can be used, including a denoiser, distilled
+draft network, analytic score, or delayed reverse drift.
 
 ## The target
 
-Override `means`; **call the instance**, not `means` — `__call__` keeps the NFE accounting the
-whole cost metric is defined on.
+Override `means`, but invoke the target instance through `__call__`, which maintains NFE
+accounting.
 
 ```python
 from specdiff import TargetTransition
@@ -43,8 +41,8 @@ class MyDenoiser(TargetTransition):
 
 `means` is called **once per round** with the round's entire verification batch — every
 internal node of the draft tree, and under the batched sampler every live trajectory's
-internal nodes too. It must be a single batched evaluation of the network. Batching it is the
-whole point; a loop over rows throws the speedup away.
+internal nodes too. Implement it as one batched network evaluation; evaluating rows
+individually removes the intended parallelism.
 
 `steps` is a tuple of plain Python ints, and rows may sit at **different** steps. If your
 network takes a scalar timestep, group by step:
@@ -61,8 +59,8 @@ network takes a scalar timestep, group by step:
 That is what `examples/gaussian_mixture.py` does. It costs one network call per *distinct*
 step rather than one per row, and within a round the distinct steps number at most `L`.
 
-`__call__` checks that you returned one row per input step, so a broadcasting slip fails
-immediately rather than corrupting a trajectory.
+`__call__` validates that the result contains one row per input step, so shape errors fail
+before sampling continues.
 
 ## The schedule
 
@@ -81,8 +79,9 @@ class MySchedule(NoiseSchedule):              # or compute it
 the largest index that ever reaches the schedule is `N - 1`. A `TabulatedSchedule` therefore
 needs exactly `N` entries, not `N + 1`.
 
-**Zero is refused.** `NoiseSchedule.__call__` raises on a non-positive scale: at zero churn
-both kernels are point masses, their TV distance is 1, and speculation is vacuous (Remark 3).
+**Scales must be positive.** `NoiseSchedule.__call__` raises on a non-positive scale. At zero
+churn, both kernels are point masses, their total-variation distance is 1, and speculation
+provides no benefit (Remark 3).
 If your schedule ends at `sigma = 0`, stop the speculative sampler one step short and take the
 final step with your own deterministic update.
 
@@ -94,11 +93,11 @@ If you already have an Euler–Maruyama loop of the form
 y_{n+1} = y_n + gamma * drift(y_n, t_n) + sigma_n * xi
 ```
 
-then `m^q_n(y) = y + gamma * drift(y, t_n)` is your target mean and `sigma_n` your schedule —
-that is the entire port. `examples/gaussian_mixture.py` does exactly this for a Gaussian
+then `m^q_n(y) = y + gamma * drift(y, t_n)` is the target mean and `sigma_n` is the schedule.
+`examples/gaussian_mixture.py` applies this conversion to a Gaussian
 mixture, where the reverse drift is available in closed form (eqs. 32 and 35, discretised per
-eqs. 4–5) and no network is involved, which makes it a good place to check your wiring before
-pointing the sampler at a real model.
+Equations 4–5). Because the example requires no network, it is a useful integration check
+before using a learned model.
 
 ## The proposal
 
@@ -107,9 +106,9 @@ The cheap mean map `m^p`. Called once per tree level while drafting.
 | class | `m^p(y)` | use |
 | --- | --- | --- |
 | `DelayedDriftProposal` | `y + (m^q(Y~) - Y~)` | **the paper's, eq. (7)** — self-speculative, no draft network needed |
-| `IdentityProposal` | `y` | the worst useful proposal, and free — a floor for measuring proposal quality |
-| `MirrorProposal` | `m^q(y)` | perfect (`delta = 0`, everything accepts). Useless in production, invaluable in tests |
-| your own | anything | a distilled draft network is the obvious one |
+| `IdentityProposal` | `y` | zero-cost baseline for measuring proposal quality |
+| `MirrorProposal` | `m^q(y)` | ideal proposal (`delta = 0`) for tests and diagnostics |
+| custom | application-defined | for example, a distilled draft network |
 
 `DelayedDriftProposal` is the default choice and needs no second model. The target mean is
 `m^q_n(y) = y + gamma b^q(y)`, so the increment can be read off a mean the sampler already
@@ -120,9 +119,9 @@ gamma b^q(Y~) = m^q(Y~) - Y~
 ```
 
 The proposal freezes that increment and reuses it at every depth of the tree. Because it is
-read off a target mean that **verification already paid for** in an earlier round, no extra
-target call is needed per round — this is Appendix C's root-drift prefetching. Exactly one
-warm-up call is unavoidable at `n = 0`, and it is counted in `target_calls`.
+read from a target mean already evaluated during verification, no additional target call is
+needed per round. This is Appendix C's root-drift prefetching. One warm-up call is required at
+`n = 0` and included in `target_calls`.
 
 ```python
 DelayedDriftProposal(target, prefetch=True)    # the paper's default
@@ -130,8 +129,8 @@ DelayedDriftProposal(target, prefetch=False)   # re-evaluate at each round's roo
                                                # +1 NFE per round, strictly better proposal
 ```
 
-`prefetch=False` is a diagnostic, not a production setting: it isolates how much of your
-acceptance rate is lost to drift staleness rather than to the proposal being weak.
+Use `prefetch=False` for diagnostics. It measures how much acceptance loss is attributable to
+drift staleness instead of proposal error.
 
 ### Writing your own
 
@@ -149,20 +148,19 @@ class DraftNetProposal(ProposalTransition):
 `indices_in_batch[i]` says which of the `batch_size` images entry `i` belongs to. A proposal
 that keeps no per-image memory — a draft network, `Identity`, `Mirror` — ignores it, as above.
 
-Three optional hooks exist because the interesting proposals *do* keep per-image memory:
+Three optional hooks support proposals with per-image state:
 `on_round_start(indices_in_batch, steps, roots)`,
 `on_verified(indices_in_batch, steps, states, target_means)`, and `reset(batch_size)`.
 A distilled draft network needs none of them and inherits the no-ops.
 
-**If your proposal caches anything across calls, key it on `indices_in_batch`.** Store it in a
-`(batch_size, *state_shape)` buffer sized by `reset`, the way `DelayedDriftProposal` does, so
-one image's cached drift can never be handed to another sitting at a different step.
+**Key cached proposal state by `indices_in_batch`.** Store it in a
+`(batch_size, *state_shape)` buffer allocated by `reset`, as `DelayedDriftProposal` does. This
+prevents state from being shared between trajectories at different steps.
 
 ## Batching over images
 
-Nothing to wrap. A proposal already takes `indices_in_batch` on every call, so the object you
-pass to the single-image sampler is the same object you pass to the batched one — batch size 1
-is just `batch_size = 1`, not a different interface.
+Proposals already receive `indices_in_batch`, so the same object works with scalar and batched
+samplers. A scalar sample is represented by `batch_size = 1`.
 
 ```python
 from specdiff import BatchedSpeculativeSampler, DelayedDriftProposal
@@ -180,8 +178,8 @@ result = sampler.sample(y0_batch)     # (batch, *state_shape)
 ```
 
 `DelayedDriftProposal` collects the warm-up evaluations that images need before they hold any
-drift into **one** batched target call, not one per image, and indexes its drift buffer by
-`indices_in_batch` so no image can pick up another's.
+drift into one batched target call and indexes its drift buffer by `indices_in_batch` to keep
+trajectory state isolated.
 
 Two further requirements: the tree must be level-uniform, and — see below — states must be
 floating point.
@@ -214,8 +212,8 @@ construction with a message that says so.
 
 ## dtype and devices
 
-**States must be floating point.** `float32` and `float64` both work; an integer array is
-rejected outright:
+**States must use a floating-point dtype.** Both `float32` and `float64` are supported; integer
+arrays are rejected:
 
 ```
 TypeError: init has non-floating dtype dtype('int64'). Diffusion states must be
@@ -223,8 +221,8 @@ floating point: an integer array truncates every Gaussian draw to zero and the
 sampler would return a silently wrong trajectory. Cast with e.g. `init.astype(float)`.
 ```
 
-The guard exists because the failure it prevents is silent — an integer state truncates every
-noise draw towards zero, and the run completes and reports a speedup while returning zeros.
+Integer states truncate noise draws toward zero and invalidate the result. The dtype check
+prevents sampling from continuing in that state.
 
 The backend is resolved from the array you pass to `sample()`, and every intermediate inherits
 its dtype and device. Under PyTorch that means a CUDA `init` keeps the whole run on device;
@@ -232,8 +230,8 @@ pass a `torch.Generator` on the same device as `rng`.
 
 ## Adding a backend
 
-`ops.py` is the only module that touches NumPy or PyTorch. Porting to JAX, MLX or anything else
-is one `Backend` subclass and no other edits:
+`ops.py` contains the NumPy and PyTorch integration. Supporting another framework such as JAX
+or MLX requires a new `Backend` subclass:
 
 ```python
 from specdiff.ops import Backend
@@ -254,7 +252,7 @@ arrays themselves.
 `resolve_backend` picks NumPy or PyTorch automatically from the type of the array you pass in,
 so an explicit `backend=` is only needed for a framework it does not know.
 
-## Sanity checks before you trust a run
+## Integration checks
 
 ```python
 from specdiff import standard_sampler
@@ -272,5 +270,5 @@ print(ref.sample(y0, rng=rng).summary())     # must report exactly 1.000x
 
 `standard_sampler` is `K = L = 1` with a rule that always resamples: one committed step per
 target call, i.e. `N` NFEs, which is a plain Euler–Maruyama loop. If Algorithm 3 with that rule
-does not match your existing sampler in distribution, the bug is in the wiring, not in the
-coupling.
+does not match the existing sampler in distribution, inspect the model and schedule
+integration before evaluating the coupling.

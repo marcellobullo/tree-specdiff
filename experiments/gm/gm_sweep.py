@@ -1,8 +1,7 @@
-"""The (K, L) sweep of Section 5.1 on specdiff -- the data behind both figures.
+"""Run the Section 5.1 ``(K, L)`` sweep for both figures.
 
 Runs every ``(K, L)`` cell for both of the paper's rules and writes one row per
-trajectory to a resumable CSV. Plotting lives in ``plot_gm.py``; a sweep
-that takes hours should not be coupled to a plotting library.
+trajectory to a resumable CSV. Plotting is handled separately by ``plot_gm.py``.
 
     python experiments/gm/gm_sweep.py --out results/gm/$(date +%Y%m%d-%H%M%S)
 
@@ -15,7 +14,7 @@ is what has to fit in memory and what the expensive network actually evaluates.
 ``--match budget`` gives the paper's protocol instead, equal *proposal* budget
 ``B = K + ... + K^L`` (eq. 12); it is what produced the committed
 ``results/figure3``, and at ``d=512, eps=0.06`` the two differ by 1.27x vs
-1.77x, so the choice is not cosmetic. A chain deeper than the horizon is pointless --
+1.77x, so the choice materially affects the comparison. A chain deeper than the horizon is unnecessary:
 a round starting at step ``n`` truncates to ``min(depth, N - n)`` -- so the
 chain is built at ``min(B, N)``, identical in behaviour and vastly cheaper to
 construct than ``chain(960799)``.
@@ -23,8 +22,8 @@ construct than ``chain(960799)``.
 Leaves
 ------
 Only internal nodes are verified (eq. 26: ``|I| = B / K``), so the leaf level is
-never evaluated. That is the cheap regime: including leaves would buy a few
-percent of NFE speedup for a factor of ``K`` in target rows. ``--carry`` selects
+not evaluated. Including leaves can improve NFE speedup by a few percent at a
+factor-of-``K`` increase in target rows. ``--carry`` selects
 what the delayed-drift proposal reuses between rounds; ``nearest`` matches the
 reference implementation and needs no extra evaluation.
 
@@ -48,7 +47,7 @@ Both are recorded, because they answer different questions:
 ``target_rows``
     States actually pushed through the target over the whole trajectory. The
     RMC chain saturates near the horizon while the D-GRS tree keeps growing
-    with ``K`` -- not an unfairness but the point of the comparison: a chain
+    with ``K``. This difference is part of the comparison: a chain
     cannot spend a budget deeper than the trajectory is long, so extra hardware
     buys it nothing. Absorbing that budget through width is what the tree adds.
 """
@@ -87,7 +86,7 @@ FIELDS = ("rule", "K", "L", "B", "verification_budget", "chain_depth", "replicat
 
 
 def trajectory_rngs(seed: int, K: int, L: int, replicate: int):
-    """Independent, indexable, resumable -- and shared by both rules.
+    """Return independent, indexable streams shared by both rules.
 
     Keyed by ``(K, L, replicate)`` rather than spawned in sequence, so re-running
     one cell after an interruption reproduces it exactly without knowing how
@@ -262,9 +261,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_path = out_dir / "raw.csv"
 
-    # Write the configuration next to the results. The reference implementation
-    # computed its config and then threw it away, which is why recovering what
-    # produced a given results directory meant digging through shell history.
+    # Persist the configuration so resumed runs reject incompatible settings.
     config = {k: v for k, v in sorted(vars(args).items()) if k != "out"}
     config_path = out_dir / "config.json"
     if config_path.exists():

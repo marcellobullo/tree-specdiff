@@ -1,10 +1,9 @@
-"""Both paper figures from `gm_sweep.py`'s CSV.
+"""Generate both paper figures from ``gm_sweep.py`` output.
 
     python experiments/plot_gm.py --out results/gm/<run>
 
-One script rather than two, because both figures come from the same
-`raw.csv -> summary.csv` reduction; splitting them would either duplicate that
-step or make one script import the other. Writes `summary.csv` and:
+Both figures use the same ``raw.csv -> summary.csv`` reduction. The script
+writes ``summary.csv`` and:
 
 `figure3_grid_speedup.{pdf,png}` / `figure3_grid_calls.{pdf,png}`
     The `(K, L)` grid, one panel per rule on a shared colour scale, plus a
@@ -15,7 +14,7 @@ step or make one script import the other. Writes `summary.csv` and:
     arms are matched on under `--match verification`: `|I| = B / K` target rows
     per round, not the proposal budget `B`. Drafting is a vector add under the
     delayed drift; `|I|` is what the hardware has to hold, so it is the fair
-    x-axis for "what does more compute buy".
+    x-axis for comparing compute budgets.
 
     Each curve is an efficiency frontier -- the best speed-up reachable at a
     budget of at most `|I|` -- which removes the aliasing that makes a pooled
@@ -24,7 +23,7 @@ step or make one script import the other. Writes `summary.csv` and:
 
     The RMC curve flattens because a chain truncates to `min(depth, N - n)`:
     past `|I| = N` there is no more trajectory to look ahead into, so the extra
-    budget is unspendable. That ceiling is the point of the comparison.
+    budget cannot be used.
 """
 
 from __future__ import annotations
@@ -46,8 +45,8 @@ def internal_nodes(K: int, L: int) -> int:
 
     Not the same as the row's `verification_budget`, which for the RMC arm is
     the chain's *actual* batch after truncation to the horizon. Plotting the
-    allocated budget is what makes the two arms comparable -- the whole point
-    being that RMC cannot spend all of it.
+    allocated budget keeps the two arms comparable even when RMC cannot use all
+    of it.
     """
     return L if K == 1 else (K**L - 1) // (K - 1)
 
@@ -476,10 +475,7 @@ def main() -> None:
         plot_calls_by_depth(summary, out / "calls_vs_budget_by_depth")
         plot_speedup_vs_k(summary, out / "speedup_vs_k")
     except ImportError as exc:
-        # Name the module that is actually missing. This used to say
-        # "matplotlib not available" for any ImportError raised anywhere in the
-        # six calls above -- including `import pandas` inside plot_heatmaps --
-        # which sent at least one person installing the wrong package.
+        # Report the dependency that raised the import error.
         missing = getattr(exc, "name", None) or str(exc)
         print(f"cannot plot: {missing} is not installed "
               f"({exc}). summary.csv was written; figures skipped.")

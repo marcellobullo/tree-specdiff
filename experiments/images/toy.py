@@ -1,11 +1,11 @@
-"""A closed-form stand-in for an EDM checkpoint, so the wiring is testable on a laptop.
+"""Closed-form EDM checkpoint substitute for CPU integration tests.
 
 The real checkpoints are hundreds of MB, need a NVlabs/edm checkout on
-``sys.path``, and want a GPU. None of that is needed to check the part of the
-port that can actually be wrong: the change of variables, the churn kernel, the
-deterministic-endpoint bookkeeping, and the sampler plumbing.
+``sys.path``, and generally require a GPU. This substitute tests the change of
+variables, churn kernel, endpoint bookkeeping, and sampler integration without
+those dependencies.
 
-So this module supplies a network with the ``EDMPrecond`` *interface* whose
+The module supplies a network with the ``EDMPrecond`` interface whose
 denoiser is exact. Take the data distribution to be a per-class isotropic
 Gaussian ``x0 ~ N(mu_c, s^2 I)``. Under EDM's additive-noise convention
 ``y = x0 + sigma xi`` the posterior mean is available in closed form,
@@ -18,8 +18,8 @@ and under the interpolant ``x_t = (1 - t) x0 + t xi`` so is the velocity,
     v           = (x_t - E[x0 | x_t]) / t.
 
 :func:`analytic_velocity` computes the second directly. It is *not* derived from
-the first, which is what makes comparing them a real test of
-:meth:`EDMDenoiser.velocity` rather than a restatement of it.
+the first, so comparing them validates :meth:`EDMDenoiser.velocity`
+independently.
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 # API reference
 
-Everything exported from `specdiff`. Symbols follow the paper's notation — see the
-[notation table](../README.md#notation).
+This reference covers the public symbols exported by `specdiff`. Symbols follow the paper's
+notation; see the [notation table](../README.md#notation).
 
 - [Samplers](#samplers) · [Results](#results) · [Draft trees](#draft-trees)
 - [Models](#models) · [Proposals](#proposals) · [Batched proposals](#batched-proposals)
@@ -28,11 +28,11 @@ SpeculativeSampler(
 )
 ```
 
-Algorithm 3 over one trajectory. The verifier's topology constraints are checked here, at
-construction, not per node.
+Runs Algorithm 3 for one trajectory. Verifier topology constraints are checked during
+construction.
 
 - `num_steps` — the horizon `N`. Must be `>= 1`.
-- `check_contract` — wrap the rule in `CheckedVerifier`. Cheap; leave it on while developing.
+- `check_contract` — wrap the rule in `CheckedVerifier`; recommended during development.
 - `backend` — only needed for a framework `resolve_backend` does not know.
 
 ```python
@@ -54,8 +54,8 @@ BatchedSpeculativeSampler(
 )
 ```
 
-The same, over `batch_size` independent trajectories at once. Two added requirements: the tree
-must be **level-uniform**. Any `ProposalTransition` works unchanged.
+Runs the algorithm over `batch_size` independent trajectories. The tree must be
+**level-uniform**. Any `ProposalTransition` can be used without an adapter.
 
 - `keep_trajectories` — retain the full `(batch, N+1, *shape)` history rather than terminal
   states only. Costs memory.
@@ -74,9 +74,9 @@ unaffected.
 standard_sampler(target, schedule, *, num_steps) -> SpeculativeSampler
 ```
 
-The reference non-speculative Euler–Maruyama loop, as a degenerate case: `K = L = 1` with a
-rule that always resamples, so one committed step per target call and `N` NFEs. The denominator
-of every speedup number, and a distributional ground truth in tests.
+Reference non-speculative Euler–Maruyama loop, represented by `K = L = 1` and a verifier that
+always resamples. It commits one step per target call for a total of `N` NFEs and serves as the
+speedup baseline and distributional reference in tests.
 
 ---
 
@@ -113,9 +113,8 @@ of every speedup number, and a distributional ground truth in tests.
 | `acceptance_rate` | property: pooled over every trajectory and round |
 | `summary()` | |
 
-`speedup` is strictly below `mean_isolated_speedup`: one call serves every live trajectory, so
-the batch advances at the pace of its slowest member. The gap is the straggler cost you tune
-batch size against.
+`speedup` is no greater than `mean_isolated_speedup`: each call serves all active trajectories,
+so progress is limited by the slowest member. Their difference measures straggler overhead.
 
 ### `RoundRecord` / `BatchedRoundRecord`
 
@@ -134,7 +133,7 @@ aligned with `active`.
 ### `DraftTree(parents)`
 
 A finite rooted tree `T = (V, pa)`. `parents[0]` must be `-1`; `parents[u] < u` for `u > 0`,
-which both rules out cycles and forces the breadth-first ordering the class relies on.
+which prevents cycles and establishes the breadth-first ordering used by the class.
 
 **Constructors**
 
@@ -184,8 +183,8 @@ convention as `ProposalTransition`. One call carries entries from several images
 that conditions per image (a class label, a text prompt) needs it; one that conditions on
 nothing ignores it.
 
-Must be a single batched evaluation. `steps` is a tuple of ints and rows may sit at different
-steps.
+Implement this as a single batched evaluation. `steps` is a tuple of integers, and rows may
+belong to different steps.
 
 ### `NoiseSchedule`
 
@@ -199,7 +198,7 @@ needs exactly `N` entries.
 
 ### `ProposalTransition`
 
-Abstract. `m^p` — cheap by assumption, called once per tree level while drafting.
+Abstract proposal mean `m^p`, called once per tree level during drafting.
 
 ```python
 means(indices_in_batch, states, steps) -> Array           # required
@@ -210,9 +209,9 @@ reset(batch_size)
 ```
 
 `indices_in_batch[i]` is which of the `batch_size` images entry `i` belongs to. This is the
-same interface at every batch size — the single-image sampler passes all zeros — so one
-proposal object works with either sampler and no adapter classes exist. A proposal with no
-per-image memory ignores the argument; one that caches should key its buffer on it.
+same interface at every batch size; the single-image sampler passes all zeros. One proposal
+object therefore works with either sampler. Stateless proposals may ignore the argument;
+stateful proposals should use it as the cache key.
 
 | class | `m^p(y)` |
 | --- | --- |
@@ -228,10 +227,10 @@ better proposal.
 
 ## Proposals and batching
 
-There is one proposal interface at every batch size. `ProposalTransition` takes
+`ProposalTransition` uses the same interface at every batch size and takes
 `indices_in_batch` on every call — `indices_in_batch[i]` is which of the `batch_size` images
-entry `i` belongs to — and the single-image sampler passes all zeros. So the same proposal
-object works with either sampler, and no adapter classes exist.
+entry `i` belongs to, while the single-image sampler passes all zeros. The same proposal
+object therefore works with either sampler.
 
 `DelayedDriftProposal` holds a `(batch_size, *state_shape)` buffer of frozen drifts, so
 drafting is one gather-and-add regardless of batch size, and the warm-up evaluations are
@@ -258,18 +257,18 @@ reset()                                # drop per-run state
 backend_for(request) -> Backend        # static; a backend without importing ops
 ```
 
-`verify_batch` defaults to a row-wise loop over `verify`, so every rule works under batching
-unrewritten. An override must stay **row-independent**: row `j` may depend only on
+`verify_batch` defaults to a row-wise loop over `verify`, so every rule supports batching
+without changes. An override must remain **row-independent**: row `j` may depend only on
 `request.row(j)`.
 
 See [writing-a-verifier.md](writing-a-verifier.md) for the contract and the obligations.
 
 ### `ResampleVerifier`
 
-Always rejects and draws a fresh `Y ~ N(mu_q, sigma^2 I)`. Trivially exact and trivially
-useless — it commits one state per target call, reproducing the standard sampler at `1.00x`.
-That makes it the sampler's reference point: if Algorithm 3 with this rule does not match a
-plain Euler–Maruyama loop in distribution, the bug is in the sampler, not in the coupling.
+Always rejects and draws a fresh `Y ~ N(mu_q, sigma^2 I)`. It commits one state per target call,
+reproducing the standard sampler at `1.00x`. This provides a reference configuration: if
+Algorithm 3 with this verifier does not match an Euler–Maruyama loop in distribution, inspect
+the sampler independently of the coupling.
 
 ### `CheckedVerifier(inner)`
 
@@ -297,7 +296,7 @@ Algorithm 2 (any `K`); see [the paper's two algorithms](writing-a-verifier.md#th
 
 ### `VerifyRequest`
 
-Everything a rule is allowed to see at one node.
+Inputs available to a verifier at one node.
 
 | field | |
 | --- | --- |
@@ -306,7 +305,8 @@ Everything a rule is allowed to see at one node.
 | `children` | `(K, *state_shape)`, **in drafting order** |
 | `parent_state` | `Y_u`; optional |
 | `index_in_batch` | which image this row is — always `0` under the scalar sampler |
-| `rng` | the run's generator. Rules must use this one |
+| `rng` | the run's generator; rules should use it for reproducibility |
+| `backend` | the sampler-selected array backend; custom frameworks receive it explicitly |
 | `info` | free-form; carries `"level"` and `"node"` |
 | `.num_children`, `.state_shape`, `.child(i)` | properties/helpers |
 
@@ -364,16 +364,16 @@ check_exactness(
 ```
 
 Runs a rule on a synthetic node `num_samples` times and KS-tests the projection of its output,
-which under exactness is `N(delta, 1)` regardless of what the rule did internally.
+which follows `N(delta, 1)` for an exact verifier.
 
 `delta=0.0` is supported and worth testing: the harness projects onto the direction it
 constructed the node from, so the statistic stays meaningful where the mean displacement
 vanishes. For a sweep over many `(delta, K)` cells, tighten `alpha` — more tests means more
 chances for a correct rule to trip one.
 
-`seed` controls **every** draw, including whatever the rule consumes via `request.rng`, so a
-report is reproducible. Keep it: this is a level-`alpha` test, so a correct rule fails about
-`alpha` of the time, and an irreproducible failure cannot be told apart from a real bug.
+`seed` controls every draw, including values consumed through `request.rng`, and makes reports
+reproducible. Because this is a level-`alpha` hypothesis test, a correct verifier fails with
+probability approximately `alpha`; retain the seed when investigating failures.
 
 `ExactnessReport`: `delta`, `num_children`, `num_samples`, `ks_statistic`, `critical_value`,
 `acceptance_rate`, `mean_examined`, `.passed`, `str()`.

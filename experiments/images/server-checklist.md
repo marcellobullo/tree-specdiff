@@ -1,13 +1,11 @@
-# Server checklist — what is still unverified
+# Environment validation
 
-Everything in `experiments/images/` was built and tested on a laptop with no
-GPU, against `toy.py`'s closed-form stand-in denoiser. This file lists what that
-could **not** cover, in rough order of risk, with the command for each and what
-a correct result looks like.
+Run these checks after configuring a new GPU environment or downloading a checkpoint. Each
+section provides a command and the expected result before starting a full experiment.
 
-## Already verified — do not redo
+## Automated CPU validation
 
-On CPU, with the toy denoiser, all of this passes (`pytest tests -q`, 120 tests):
+The test suite covers the following behavior with the toy denoiser:
 
 - the denoiser→velocity change of variables, against a velocity derived
   independently of the denoiser (exact to 1e-12 in float64);
@@ -21,12 +19,18 @@ On CPU, with the toy denoiser, all of this passes (`pytest tests -q`, 120 tests)
 - per-image class labels routed correctly through the batched sampler;
 - shard arithmetic, shard reuse, merge, and a real **two-process** run (on CPU).
 
-## Still unverified
+Run it with:
+
+```bash
+python -m pytest tests -q
+```
+
+## Environment-dependent validation
 
 ### 1. Loading a real checkpoint
 
-The single largest unknown. Unpickling needs EDM's `torch_utils` and `dnnlib`
-importable, and **executes code from the pickle**.
+Unpickling requires EDM's `torch_utils` and `dnnlib` modules and executes code stored in the
+pickle. Use checkpoints from a trusted source.
 
 ```bash
 git clone https://github.com/NVlabs/edm.git ~/specdiff/edm
@@ -64,7 +68,7 @@ Then the rmc arm, which should report `"match": "verification"` and
 python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule rmc --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-rmc
 ```
 
-### 3. FFHQ — the "same command, one path changed" claim
+### 3. FFHQ checkpoint metadata
 
 ```bash
 curl -L -o ~/specdiff/edm/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
@@ -74,10 +78,9 @@ python experiments/images/run_edm.py --network ~/specdiff/edm/edm-ffhq-64x64-unc
 Expect `(3, 64, 64)` in the banner with no other flag changed, and faces in
 `grid.png`.
 
-### 4. The conditional path against real weights
+### 4. Conditional checkpoint
 
-Only ever exercised against the toy network — the one-hot plumbing has never
-met a real `EDMPrecond`.
+Use this check to validate one-hot conditioning with a pretrained `EDMPrecond`.
 
 ```bash
 curl -L -o ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
@@ -91,13 +94,12 @@ check the guard too — this must be **refused**, not silently sampled:
 python experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --no-accelerate --labels none --rule d-grs --num-samples 4 --num-steps 100 --out results/edm/should-fail
 ```
 
-A stronger check if you want one: generate with `--labels 3` and confirm the
-grid is visibly one class.
+For an additional conditioning check, generate with `--labels 3` and confirm
+that the grid contains a single visible class.
 
 ### 5. Multi-GPU
 
-Only ever run as two CPU processes. NCCL, `--multi_gpu`, and per-rank device
-placement are untested.
+Use this check to validate NCCL, `--multi_gpu`, and per-rank CUDA placement.
 
 ```bash
 accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/specdiff/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.25 --sample-batch 64 --out results/edm/smoke-4gpu
@@ -110,13 +112,12 @@ behind after the merge. Then re-run the same command: it should print
 
 There is a `barrier()` helper in `run_edm.py` with a fallback for a Mac-only
 torch bug (no MPS `c10d::barrier`). On CUDA the first call should always
-succeed, so **the fallback should never fire** — if you see it engage, something
-is wrong with the process group.
+succeed. If the fallback is used on CUDA, inspect the process-group configuration.
 
 ### 6. The sweep
 
-`nvidia-smi` preflight and `accelerate launch --multi_gpu` inside the script are
-untested. Start small:
+Start with a small sweep to validate GPU discovery and the nested
+`accelerate launch --multi_gpu` command:
 
 ```bash
 NETWORK=~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,1,2,3 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
@@ -126,22 +127,10 @@ Expect a per-cell `|I|` table, the plain-target baseline first, then each cell.
 Kill it mid-cell and re-run: finished cells must be skipped and the interrupted
 cell must resume from its shards.
 
-### 7. Port fidelity, on the real environment
+### 7. Reference cross-check
 
 ```bash
 python experiments/images/crosscheck_reference.py --reference-repo <accelerating-diffusion-sampling checkout>
 ```
 
 Expect `OK: agreement within 1e-06`.
-
-### 8. FID — not ported
-
-specdiff has no scorer. `samples.pt` is written in exactly the layout the
-reference implementation's `scripts/fid_from_samples.py` reads (uint8
-`(N, C, H, W)`), so use that one; it also keeps the numbers comparable with
-FIDs already computed there. Setting `FID_REPO=<checkout>` makes `sweep.sh`
-print the command.
-
-**Note on comparability:** the rmc arm here is *verification*-matched
-(`chain(|I|)`), while the reference implementation budget-matched (`chain(B)`).
-The d-grs numbers are comparable; the rmc ones are not.

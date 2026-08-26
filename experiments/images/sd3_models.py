@@ -1,8 +1,8 @@
 """Stable Diffusion 3.5 behind specdiff's ``TargetTransition``, in latent space.
 
 The pixel-space adapter is ``models.py``; this is its latent-space counterpart,
-kept separate because the two differ in every way that matters operationally
-even though the churn math is identical:
+kept separate because their operational requirements differ even though the
+churn equations are identical:
 
 * states are VAE **latents** ``(16, px/8, px/8)``, not images, so a decode step
   stands between the sampler and anything that looks at pixels;
@@ -12,7 +12,7 @@ even though the churn math is identical:
 
 Unlike EDM there is no change of variables: SD3 is trained on the same linear
 flow-matching interpolant specdiff samples, so the transformer's output *is* the
-velocity. All this module does is guide it and wrap the churn step around it.
+velocity. This module applies classifier-free guidance and the churn transition.
 
 Prompts
 -------
@@ -22,18 +22,8 @@ a single embedding is ~2.7 MB, so a 30k COCO set is 82 GB and cannot live on
 the GPU. :meth:`SD3Denoiser.set_prompt_batch` uploads only the rows a batch
 needs; ``indices_in_batch`` then selects within them.
 
-That second indexing level is why the port is clean: specdiff already hands
-every entry of a target call its ``indices_in_batch``, and those are already
-batch-local, so nothing in the sampler had to learn about prompts. (The
-reference implementation had to route the index through its class-label channel
-for want of anywhere else to put it.)
-
-Duplication, deliberately
--------------------------
-``sigma_grid`` and ``churn_std_grid`` are copied from ``models.py`` rather than
-imported, so the latent and pixel experiments stay independent files. That
-invites drift, so ``tests/test_sd3.py`` asserts the two implementations agree
-exactly; if you change one, that test tells you about the other.
+The second indexing level uses the batch-local ``indices_in_batch`` already
+provided by specdiff, so prompt routing requires no sampler changes.
 """
 
 from __future__ import annotations

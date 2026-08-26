@@ -1,7 +1,6 @@
-"""The data types that define the pluggable boundary.
+"""Data types for the verifier extension boundary.
 
-The whole library is organised around one contract, taken from the paragraph
-that defines ``Verify`` in Appendix C:
+Appendix C defines the verifier contract as follows:
 
     Given a parent node ``u``, its associated proposal and target means, the
     corresponding step scale, and its set of drafted children, the rule outputs
@@ -9,9 +8,8 @@ that defines ``Verify`` in Appendix C:
     ``Q(. | Y_u)``; either ``accepted`` is true and ``Y`` is one of the
     children, or ``accepted`` is false and ``Y`` came from the residual.
 
-:class:`VerifyRequest` is the left-hand side of that sentence and
-:class:`VerifyResult` is the right-hand side. A verification rule is any
-callable between the two.
+:class:`VerifyRequest` represents the inputs, and :class:`VerifyResult`
+represents the output. A verification rule maps between these types.
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ Array = Any
 
 @dataclass(frozen=True)
 class VerifyRequest:
-    """Everything a verification rule is allowed to see at one node.
+    """Inputs available to a verification rule at one node.
 
     The template assumes (Appendix C, eq. 24) that proposal and target
     transitions are isotropic Gaussians that *share* the variance schedule and
@@ -33,9 +31,8 @@ class VerifyRequest:
         P_step(. | parent_state) = N(proposal_mean, sigma^2 I)
         Q_step(. | parent_state) = N(target_mean,   sigma^2 I)
 
-    That assumption is baked into this type on purpose: it is exactly what the
-    rank-1 reduction (eqs. 8-11) exploits, so a rule that receives a
-    ``VerifyRequest`` may rely on it.
+    This type encodes the shared-covariance assumption used by the rank-1
+    reduction in Equations 8--11, so verifiers may rely on it.
 
     Attributes
     ----------
@@ -73,6 +70,9 @@ class VerifyRequest:
     trajectory, which a rule holding per-trajectory state needs in order to
     behave the same way whether it is called row-wise or in a batch."""
     rng: Any = None
+    backend: Any = None
+    """Array backend selected by the sampler. Custom backends are carried
+    explicitly because their array types are not known to ``resolve_backend``."""
     info: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -97,9 +97,9 @@ class VerifyResult:
     state:
         ``Y``, which **must** be an exact sample from
         ``N(request.target_mean, request.sigma^2 I)``. This is the one
-        obligation the library cannot check for you at runtime; see
+        obligation the library cannot check at runtime; see
         :func:`specdiff.testing.check_exactness` for a statistical test to run
-        in your own test-suite.
+        in the verifier's test suite.
     accepted:
         Whether ``state`` is one of the drafted children.
     child_index:
@@ -218,6 +218,7 @@ class BatchedVerifyRequest:
     children: Array  # (batch, K, *shape)
     parent_state: Optional[Array] = None
     rng: Any = None
+    backend: Any = None
     info: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -252,6 +253,7 @@ class BatchedVerifyRequest:
             parent_state=None if self.parent_state is None else self.parent_state[j],
             index_in_batch=self.indices_in_batch[j],
             rng=self.rng,
+            backend=self.backend,
             info=info,
         )
 

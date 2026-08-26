@@ -50,7 +50,7 @@ def test_project_reconstruct_round_trips():
 
 
 def test_projection_law_is_the_scalar_reduction():
-    """Y ~ N(mu_q, sigma^2 I)  =>  S ~ N(delta, 1). This is the whole point."""
+    """Verify the projected law ``S ~ N(delta, 1)`` for target samples."""
     delta, sigma, n = 1.3, 0.7, 20000
     f = _frame(delta, sigma=sigma)
     rng = np.random.default_rng(1)

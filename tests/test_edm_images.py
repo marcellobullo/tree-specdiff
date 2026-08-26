@@ -75,7 +75,7 @@ class TestChangeOfVariables:
     @pytest.mark.parametrize("dtype,rtol", [(torch.float64, 1e-12),
                                             (torch.float32, 1e-3)])
     def test_matches_interpolant_velocity(self, dtype, rtol):
-        """In float64 the algebra is exact to 1e-12; float32 is the honest limit.
+        """Validate algebraic agreement at the precision supported by each dtype.
 
         ``(x - D) / t`` divides a cancellation by ``t``, so at ``t = 0.01`` a
         float32 denoiser's last bits become a ~1e-4 relative error in the
@@ -278,7 +278,7 @@ class TestSampling:
         assert models.to_uint8(y).dtype == torch.uint8
 
     def test_matches_the_standard_sampler_in_law(self):
-        """The whole point: speculation must not move the marginal.
+        """Verify that speculation preserves the target marginal distribution.
 
         Both arms sample the same 8x8x3 model over the same horizon; a
         two-sample KS test on a fixed linear projection of the final state is
@@ -398,7 +398,7 @@ class TestConditional:
         assert torch.equal(nearest, labels), f"got classes {nearest.tolist()}"
 
     def test_permuting_labels_permutes_the_images(self):
-        """The sharpest form of the check: same seed, labels reversed."""
+        """Verify label routing by reversing labels while holding the seed fixed."""
         from specdiff import BatchedSpeculativeSampler
 
         net, s = self._separable_setting()
@@ -479,12 +479,20 @@ class TestSharding:
         setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
         tree = run_edm.build_tree(args, setting.num_steps)
 
-        base = dict(target_calls=1, target_states_evaluated=1, speedup=1.0,
-                    end_to_end_speedup=1.0, mean_isolated_speedup=1.0,
-                    occupancy=1.0, acceptance_rate=0.5)
+        signature = run_edm.experiment_signature(args, setting, tree, denoiser)
+        totals = {
+            "baseline_calls": 1, "target_calls": 1,
+            "end_to_end_baseline_calls": 1, "end_to_end_target_calls": 1,
+            "isolated_speedup_sum": 2.0, "sample_count": 2,
+            "occupancy_active": 2, "occupancy_slots": 2,
+            "accepted_levels": 1, "verified_levels": 2,
+            "target_states_evaluated": 1,
+        }
         for rank, secs in ((0, 10.0), (1, 40.0)):        # rank 1 four times slower
             torch.save({"samples": torch.zeros((2, *setting.state_shape), dtype=torch.uint8),
-                        "rank": rank, "seconds": secs, **base},
+                        "rank": rank, "start": rank * 2, "count": 2,
+                        "run_signature": signature, "metric_totals": totals,
+                        "seconds": secs},
                        tmp_path / f"shard_{rank:03d}.pt")
 
         meta = run_edm.merge_shards(args, setting, tree, denoiser, "none", tmp_path)
@@ -546,7 +554,7 @@ class TestMatchedChain:
     """
 
     def test_verification_matching_equalises_the_target_batch(self):
-        """The invariant the whole protocol rests on: chain(m) verifies m nodes."""
+        """Verify that `chain(m)` evaluates `m` verification nodes."""
         from images.run_edm import matched_chain_depth
 
         for K, L in ((2, 3), (3, 2), (2, 5), (4, 3)):
@@ -563,7 +571,7 @@ class TestMatchedChain:
             assert DraftTree.chain(depth).budget == tree.budget
 
     def test_the_two_protocols_differ_by_a_factor_of_k(self):
-        """Not a rounding difference -- the reason the choice has to be recorded."""
+        """Verify that proposal- and verification-matched protocols differ by `K`."""
         from images.run_edm import matched_chain_depth
 
         tree = DraftTree.uniform(branching=4, lookahead=3)
@@ -577,3 +585,87 @@ class TestMatchedChain:
         tree = DraftTree.uniform(branching=4, lookahead=4)      # B = 340, |I| = 85
         assert matched_chain_depth(tree, 20, "verification") == 20
         assert matched_chain_depth(tree, 20, "budget") == 20
+
+
+class TestExperimentBookkeeping:
+    def test_ratios_are_reconstructed_from_additive_counters(self):
+        from images.run_common import add_metrics, summarise_metrics
+
+        def counters(calls):
+            return {
+                "baseline_calls": 10, "target_calls": calls,
+                "end_to_end_baseline_calls": 12,
+                "end_to_end_target_calls": calls + 2,
+                "isolated_speedup_sum": 2.0, "sample_count": 1,
+                "occupancy_active": 1, "occupancy_slots": 2,
+                "accepted_levels": 1, "verified_levels": 2,
+                "target_states_evaluated": 3,
+            }
+
+        total = {}
+        add_metrics(total, counters(1))
+        add_metrics(total, counters(9))
+        summary = summarise_metrics(total)
+        assert summary["speedup"] == pytest.approx(2.0)  # 20 baseline / 10 actual
+        assert summary["speedup"] != pytest.approx((10.0 + 10.0 / 9.0) / 2)
+        assert summary["acceptance_rate"] == 0.5
+
+    def test_changed_configuration_refuses_a_reused_shard(self, tmp_path):
+        from images import run_edm
+
+        args = TestSharding._args(tmp_path, num_samples=2, sample_batch=2)
+        denoiser = run_edm.build_denoiser(args)
+        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        tree = run_edm.build_tree(args, setting.num_steps)
+        sampler = run_edm.build_sampler(setting, tree, args)
+        mode = run_edm.resolve_label_mode(args, denoiser)
+        labels = run_edm.all_labels(mode, args.num_samples, denoiser, args.seed)
+        run_edm.generate_shard(args, setting, sampler, denoiser, labels,
+                               0, 2, tmp_path, 0)
+
+        args.seed += 1
+        with pytest.raises(SystemExit, match="incompatible"):
+            run_edm.generate_shard(args, setting, sampler, denoiser, labels,
+                                   0, 2, tmp_path, 0)
+
+    def test_zero_work_shard_is_refused(self, tmp_path):
+        from images import run_edm
+
+        args = TestSharding._args(tmp_path, num_samples=1)
+        denoiser = run_edm.build_denoiser(args)
+        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        tree = run_edm.build_tree(args, setting.num_steps)
+        sampler = run_edm.build_sampler(setting, tree, args)
+        with pytest.raises(SystemExit, match="at least one"):
+            run_edm.generate_shard(args, setting, sampler, denoiser, None,
+                                   1, 0, tmp_path, 1)
+
+    def test_grid_keeps_a_non_square_tail(self, tmp_path):
+        import PIL.Image
+        from images.run_common import save_grid
+
+        path = tmp_path / "grid.png"
+        save_grid(torch.zeros((2, 3, 8, 8), dtype=torch.uint8), path)
+        assert PIL.Image.open(path).size == (16, 8)
+
+    def test_ffhq_cache_identity_includes_the_data_source(self, tmp_path):
+        from argparse import Namespace
+        from images.fid import real_cache_signature
+
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir(); b.mkdir()
+        (a / "one.png").write_bytes(b"a")
+        (b / "one.png").write_bytes(b"b")
+        args = Namespace(dataset="ffhq", data=str(a), num_real=1)
+        first = real_cache_signature(args, 64)
+        args.data = str(b)
+        assert real_cache_signature(args, 64) != first
+
+
+def test_merge_refuses_unexpected_extra_rank(tmp_path):
+    from images.run_common import load_shards
+
+    for rank in range(3):
+        (tmp_path / f"shard_{rank:03d}.pt").touch()
+    with pytest.raises(SystemExit, match="expected shards"):
+        load_shards(tmp_path, signature={}, num_samples=2, world=2)

@@ -1,12 +1,12 @@
-# Image experiments — pretrained EDM
+# Image experiments
 
-Steps 1 and 2 of the port: the Karras et al. (2022) CIFAR-10 and FFHQ
-checkpoints behind specdiff's `TargetTransition` contract, on a single device.
-Multi-GPU sharding, the `(K, L)` sweep, and SD3 are step 3 onwards.
+These experiments integrate Karras et al. (2022) CIFAR-10 and FFHQ checkpoints with
+`TargetTransition`, then extend the same workflow to multi-GPU sweeps and SD3.5.
 
-| file | what it is |
+**Pixel space (EDM)**
+
+| file | purpose |
 | --- | --- |
-**Pixel space** (EDM):
 
 | `models.py` | the adapter: denoiser → velocity → churn transition, plus the schedule |
 | `toy.py` | a closed-form stand-in denoiser, so the wiring is testable with no checkpoint and no GPU |
@@ -17,12 +17,11 @@ Multi-GPU sharding, the `(K, L)` sweep, and SD3 are step 3 onwards.
 | [`ffhq.md`](ffhq.md) | the same for FFHQ 64x64 — what differs, and why |
 | [`server-checklist.md`](server-checklist.md) | smoke tests to pass before either protocol |
 | `crosscheck_reference.py` | port fidelity against the sibling implementation |
-| `../../tests/test_edm_images.py` | the test suite for all of the above (CPU, ~5 s) |
+| `../../tests/test_edm_images.py` | CPU tests for the EDM adapter and experiment utilities |
 
-**Latent space** (SD3.5) — separate files by design; the two will become
-separate directories:
+**Latent space (SD3.5)**
 
-| file | what it is |
+| file | purpose |
 | --- | --- |
 | `sd3_models.py` | the latent adapter: guided velocity, prompt table, churn transition |
 | `toy_sd3.py` | a closed-form stand-in pipeline, so this is testable with no 16 GiB download |
@@ -31,12 +30,11 @@ separate directories:
 | `clip.py` | CLIP score from saved samples — per-image, so cells can be compared *paired* |
 | `coco_prompts.py` | build a deterministic, prefix-stable COCO caption set |
 | [`sd3.md`](sd3.md) | full protocol: generate + score |
-| `../../tests/test_sd3.py` | 19 tests (CPU, ~1 s) |
+| `../../tests/test_sd3.py` | CPU tests for the SD3 adapter and experiment utilities |
 
-`sigma_grid`/`churn_std_grid` and the shard/matching helpers are *duplicated*
-between the two rather than shared. `tests/test_sd3.py` asserts each copy
-agrees with its pixel-space counterpart exactly, so the duplication cannot
-drift silently.
+`sigma_grid`, `churn_std_grid`, and the shard and matching helpers are duplicated between the
+pixel and latent implementations to keep each experiment self-contained. `tests/test_sd3.py`
+checks that both copies remain equivalent.
 
 SD3 conditions on **text**, one caption per image. `--prompts FILE` gives image
 `i` line `i` at noise seed `--seed + i`, so every rule sees identical
@@ -50,14 +48,14 @@ dataset distribution.
 python experiments/images/run_edm.py --toy --rule d-grs --branching 2 --lookahead 3 --num-samples 16 --num-steps 40 --out results/toy
 ```
 
-That needs no checkpoint and no GPU. On a real checkpoint:
+The toy configuration requires no checkpoint or GPU. For a pretrained checkpoint:
 
 ```bash
 python experiments/images/run_edm.py --network /path/edm-cifar10-32x32-uncond-vp.pkl --edm-repo /path/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/cifar10-dgrs
 ```
 
-FFHQ is the **same command with a different `--network`**. Resolution and
-channel count are read off the checkpoint, so nothing else changes:
+For FFHQ, change `--network`; resolution and channel count are read from the
+checkpoint:
 
 ```bash
 python experiments/images/run_edm.py --network /path/edm-ffhq-64x64-uncond-vp.pkl --edm-repo /path/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/ffhq-dgrs
@@ -76,9 +74,10 @@ merges them into one `samples.pt`.
 accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network /path/edm-cifar10-32x32-cond-vp.pkl --edm-repo /path/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.25 --sample-batch 285 --out results/edm/dgrs
 ```
 
-Two properties worth relying on. **Shards are reused**, so a crashed run
-restarts at the shard boundary rather than at zero (`--overwrite` forces
-regeneration). And **class labels do not depend on the process count**: every
+The sharding workflow provides two guarantees. **Compatible shards are reused**, so a crashed run
+restarts at the shard boundary rather than at zero. Every shard carries the run
+configuration and global sample range; a mismatch is refused instead of merged
+under misleading metadata (`--overwrite` forces regeneration). And **class labels do not depend on the process count**: every
 image's label is drawn up front from `--seed` alone and then sliced per rank, so
 the same seed at 1 GPU and at 4 conditions on identical labels and the two runs'
 FIDs are comparable.
@@ -112,7 +111,7 @@ roughly flat across the grid instead of growing with `K`.
 
 ## What the adapter does
 
-Two exact changes of variables, and nothing else.
+The adapter applies two exact changes of variables.
 
 **Denoiser → velocity.** EDM's network is `D(y; s) = E[x0 | y = x0 + s n]`;
 specdiff's trajectory lives on the interpolant `x_t = (1 - t) x0 + t xi`.
@@ -124,7 +123,7 @@ std that is **independent of the state** — which is exactly the premise the
 rank-1 reduction of eqs. (8)–(11) rests on, and why the schedule is a plain
 `TabulatedSchedule` rather than a callback into the model.
 
-## Two things to know before reading numbers
+## Interpreting results
 
 **The horizon is `T`, the speculative window is `T - 2`.** The transition std
 vanishes at the first step (`sigma = 1`, where `g` diverges) and the last
@@ -144,7 +143,7 @@ slowest member and the first is strictly below the second. The gap is the
 straggler cost of sharing a batch — it is what you tune `--sample-batch`
 against, and quoting only the second flatters a batched run.
 
-## Limits, deliberately
+## Checkpoint conditioning and scoring
 
 **Conditional and unconditional are interchangeable.** `--labels auto` (the
 default) reads the checkpoint: an `-uncond-` one samples unconditionally, a
@@ -152,8 +151,8 @@ default) reads the checkpoint: an `-uncond-` one samples unconditionally, a
 protocol. So swapping `--network` between them needs no other flag. Use
 `--labels 7` to pin one class.
 
-The one trap the flag exists to prevent: **EDM's conditional networks have no
-null class** — they were never trained for classifier-free guidance, so a
+**EDM's conditional networks have no null class.** They were not trained for
+classifier-free guidance, so a
 `-cond-` checkpoint cannot be run "unconditionally" by omitting the label.
 Omitting it makes `EDMPrecond` fall back to a zero embedding, which is not a
 trained null token and yields plausible images from the wrong distribution.
@@ -174,23 +173,23 @@ that is a fixed choice rather than a detail.
 
 The real-side statistics are cached (`fid_real_<dataset>_<N>_<size>px.pt`).
 FID depends on the real images only through `sum(f)`, `sum(f f^T)` and the
-count, so this is exact, not an approximation — verified to the last decimal —
-and it is what makes scoring a twelve-cell sweep cheap. The filename carries the
-count and resolution, because FID against a different real N or size is a
-different number and must not silently reuse a cache.
+count, so the cache stores exact sufficient statistics rather than an approximation.
+This makes repeated scoring across a sweep inexpensive. The filename carries the count and resolution, and the cache payload carries a
+signature of the actual real-image source. A changed FFHQ directory or archive
+is re-featurised instead of silently reusing stale statistics.
 
 ## Verification
 
-`tests/test_edm_images.py` (19 tests, CPU, no checkpoint) covers the change of
+`tests/test_edm_images.py` runs on CPU without a checkpoint and covers the change of
 variables against a velocity derived independently of the denoiser, the
 clamping at both singular endpoints, the schedule against
 `diffusers.FlowMatchEulerDiscreteScheduler`, state-independence of the std,
 `--forward-batch` exactness and its non-effect on NFE, and a KS test that the
 speculative sampler reproduces the standard sampler's law.
 
-The adapter was also cross-checked against the reference implementation
+The adapter can also be checked against the reference implementation
 (`accelerating-diffusion-sampling`, `src/models/edm.py` and
 `src/schedulers/churn_flow_match_euler.py`) on identical inputs: velocity and
 transition std agree exactly, the sigma grid and kernel mean to float32
-epsilon. That check lives outside the repo because it needs the other
-checkout; rerun it if either side's step math changes.
+epsilon. Run `crosscheck_reference.py` with a separate checkout after changing
+the transition calculations in either implementation.

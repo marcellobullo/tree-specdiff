@@ -130,8 +130,7 @@ def test_degenerate_delta_always_accepts_the_first_child():
 
 # ------------------------------------------------------------------ acceptance
 def test_acceptance_rate_matches_theorem_2():
-    """`1 - G_{K+1}` from eqs. (14)-(15), not a constant: the whole point of
-    Algorithm 2 is that this rises with `K`."""
+    """Verify ``1 - G_{K+1}`` from Equations 14--15 across values of ``K``."""
     n = 20000
     for delta in (0.25, 1.0, 3.0):
         for num_children in (1, 2, 4, 8):

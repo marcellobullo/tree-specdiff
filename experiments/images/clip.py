@@ -1,28 +1,23 @@
-"""CLIP score for saved SD3 samples. No generation.
+"""Compute CLIP scores for saved SD3 samples.
 
 FID is not the measurement for SD3: these are samples of a *text conditional*,
 not of a dataset distribution, so there is no real set to be Frechet-distant
-from. CLIPScore (Hessel et al. 2021) answers the question that does apply --
-whether two rules that sample the same law at temperature 1 produce equally
-prompt-faithful images:
+from. CLIPScore (Hessel et al. 2021) instead measures image--prompt alignment:
 
     CLIPScore = max(100 * cos(E_image, E_text), 0)
 
     python experiments/images/clip.py --samples results/sd3/*/ \\
         --device cuda:0 --output results/sd3/clip_report.json
 
-Per-image scores are the point
-------------------------------
-Every cell is scored image by image and the whole vector is kept, not just its
-mean. When two cells were generated from the same (caption, seed) pairs -- which
-`run_sd3.py --prompts` guarantees -- the **paired** difference has far lower
-variance than the difference of two means, so a real gap shows up at sample
-counts where the marginal means are indistinguishable. `--baseline` reports that
-paired comparison directly; without per-image scores the pairing built into
-generation would be thrown away at scoring time.
+Paired scores
+-------------
+The scorer retains one value per image. When two cells use the same caption and
+seed pairs, as guaranteed by ``run_sd3.py --prompts``, paired differences have
+lower variance than differences between marginal means. ``--baseline`` reports
+this paired comparison directly.
 
 Captions come from each cell's `meta.json` (`prompts_file` -> line i for image
-i, else `prompt` for all), so the scorer reconstructs exactly what each image
+i, else `prompt` for all), allowing the scorer to recover what each image
 was generated from. `--prompts` overrides, for samples predating the field.
 
 Writes `clip.json` beside each `samples.pt` and a combined `--output` report.
@@ -31,6 +26,7 @@ Writes `clip.json` beside each `samples.pt` and a combined `--output` report.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -72,11 +68,55 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def cell_prompts(cell: Path, num_images: int, override: Optional[str]) -> List[str]:
-    """The caption per image, from `meta.json` unless overridden.
+def _digest(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
 
-    Raises rather than guessing: a silently wrong caption-to-image alignment
-    produces a plausible-looking score that means nothing.
+
+def _file_stamp(path: Path) -> dict:
+    stat = path.stat()
+    return {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _prompt_source_identity(source) -> dict:
+    if source is None:
+        return {"value": None}
+    path = Path(source)
+    if len(str(source)) < 4096 and path.exists() and path.is_file():
+        return {"path": str(path.resolve()), "sha256": _digest(path.read_bytes())}
+    return {"value": str(source)}
+
+
+def cache_signature(cell: Path, args, meta: dict) -> dict:
+    source = (args.prompts if args.prompts is not None
+              else meta.get("prompts_file") or meta.get("prompt"))
+    return {
+        "version": 1,
+        "model": args.model,
+        "dtype": args.dtype,
+        "samples": _file_stamp(cell / "samples.pt"),
+        "meta_sha256": _digest((cell / "meta.json").read_bytes()),
+        "prompt_source": _prompt_source_identity(source),
+    }
+
+
+def pairing_signature(meta: dict, prompts: List[str]) -> Optional[str]:
+    # Only --prompts runs use per-image starting-noise seeds. A repeated single
+    # prompt uses a shared RNG stream and is not paired across rules/batching.
+    if not meta.get("prompt_seed_rule") or "seed" not in meta:
+        return None
+    payload = {
+        "seed": meta["seed"],
+        "prompt_seed_rule": meta["prompt_seed_rule"],
+        "prompts": prompts,
+    }
+    return _digest(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+
+
+def cell_prompts(cell: Path, num_images: int, override: Optional[str]) -> List[str]:
+    """Return the caption for each image from ``meta.json`` or an override.
+
+    Raises when the mapping is ambiguous to prevent invalid caption--image
+    alignment.
     """
     source = override
     if source is None:
@@ -105,13 +145,12 @@ def cell_prompts(cell: Path, num_images: int, override: Optional[str]) -> List[s
 
 
 def projected(out) -> torch.Tensor:
-    """The projected embedding, whatever the transformers version returns.
+    """Return the projected embedding across supported Transformers versions.
 
     <=4.x `get_*_features` returned the projected tensor directly; 5.x returns a
     `BaseModelOutputWithPooling` with the projection in `pooler_output`. Reading
-    `.pooler_output` off a bare tensor would raise, and silently scoring an
-    *unprojected* embedding would give a plausible but wrong number -- so branch
-    on the type rather than pinning a version.
+    The return type changed between major versions, so this helper branches on
+    the type instead of requiring one package version.
     """
     return out if isinstance(out, torch.Tensor) else out.pooler_output
 
@@ -130,10 +169,9 @@ class Scorer:
 
     @torch.no_grad()
     def text_features(self, prompts: List[str]) -> torch.Tensor:
-        """Unit-norm text embeddings, memoised -- cells reuse the same captions.
+        """Return memoized unit-norm text embeddings.
 
-        Across a twelve-cell sweep every caption is encoded once rather than
-        twelve times, and within a cell a repeated caption costs nothing.
+        Each unique caption is encoded once and reused across cells.
         """
         missing = [p for p in dict.fromkeys(prompts) if p not in self._text_cache]
         for i in range(0, len(missing), 256):
@@ -196,6 +234,9 @@ def paired_delta(a: dict, b: dict) -> Optional[dict]:
     """
     if a["num_images"] != b["num_images"] or a["num_images"] < 2:
         return None
+    if (not a.get("pairing_signature")
+            or a.get("pairing_signature") != b.get("pairing_signature")):
+        return None
     d = torch.tensor(a["per_image"]) - torch.tensor(b["per_image"])
     n = d.numel()
     sem = float(d.std(unbiased=True)) / (n**0.5)
@@ -219,14 +260,22 @@ def main(argv=None) -> None:
     results: Dict[str, dict] = {}
     for spec in args.samples:
         cell = Path(spec)
+        samples_path, meta_path = cell / "samples.pt", cell / "meta.json"
+        if not samples_path.exists() or not meta_path.exists():
+            raise SystemExit(f"{cell}: expected samples.pt and meta.json")
+        meta = json.loads(meta_path.read_text())
+        expected_cache = cache_signature(cell, args, meta)
         cached = cell / "clip.json"
         if cached.exists() and not args.overwrite:
-            results[str(cell)] = json.loads(cached.read_text())
-            print(f"  {cell}: reusing clip.json "
-                  f"(CLIP {results[str(cell)]['clip_score_mean']:.3f})", flush=True)
-            continue
+            entry = json.loads(cached.read_text())
+            if entry.get("cache_signature") == expected_cache:
+                results[str(cell)] = entry
+                print(f"  {cell}: reusing clip.json "
+                      f"(CLIP {entry['clip_score_mean']:.3f})", flush=True)
+                continue
+            print(f"  {cell}: clip.json inputs changed; rescoring", flush=True)
 
-        images = torch.load(cell / "samples.pt", map_location="cpu", weights_only=True)
+        images = torch.load(samples_path, map_location="cpu", weights_only=True)
         if images.dtype != torch.uint8:
             raise SystemExit(f"{cell}: expected uint8 images, got {images.dtype}")
         prompts = cell_prompts(cell, int(images.shape[0]), args.prompts)
@@ -235,7 +284,8 @@ def main(argv=None) -> None:
 
         entry = summarise(cell, scorer.scores(images, prompts, args.batch_size),
                           args.model, args.prompts)
-        meta = json.loads((cell / "meta.json").read_text())
+        entry["cache_signature"] = expected_cache
+        entry["pairing_signature"] = pairing_signature(meta, prompts)
         entry.update({k: meta[k] for k in
                       ("rule", "branching", "lookahead", "guidance_scale",
                        "speedup", "end_to_end_speedup", "acceptance_rate")
@@ -258,7 +308,7 @@ def main(argv=None) -> None:
                 continue
             d = paired_delta(entry, base)
             if d is None:
-                print(f"  {key}: not comparable (different image counts)")
+                print(f"  {key}: not comparable (pairing signature or image count differs)")
                 continue
             entry["paired"] = d
             print(f"  {key}: {d['paired_mean_delta']:+.4f} +/- {d['paired_sem']:.4f} "

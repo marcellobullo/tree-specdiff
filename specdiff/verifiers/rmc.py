@@ -85,5 +85,5 @@ class ReflectionMaximalCoupling(Verifier):
             state=state,
             accepted=accepted,
             child_index=child_index,
-            proposals_examined=1,       
+            proposals_examined=1,
         )

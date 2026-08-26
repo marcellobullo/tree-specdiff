@@ -1,25 +1,21 @@
-# FFHQ 64×64 — the full protocol
+# FFHQ 64×64 protocol
 
-End-to-end run on `edm-ffhq-64x64-uncond-vp.pkl`. Structurally identical to
-[`cifar10-conditional.md`](cifar10-conditional.md); this file records only what
-differs, and there are three things.
+This protocol runs `edm-ffhq-64x64-uncond-vp.pkl`. It follows
+[`cifar10-conditional.md`](cifar10-conditional.md) and documents the FFHQ-specific settings.
 
-## The three differences
+## Differences from CIFAR-10
 
-**1. It is unconditional, and there is no choice about that.** FFHQ has no
+**1. The checkpoint is unconditional.** FFHQ has no
 class labels, so EDM publishes only a `-uncond-` checkpoint. `--labels auto`
-resolves to `none` on its own — nothing to pass, nothing to match against a
-conditional baseline.
+resolves to `none`; no label configuration is required.
 
-**2. 64×64, read from the checkpoint.** The command is otherwise the *same* as
-CIFAR-10's with one path changed; resolution and channel count come off the
-`.pkl`. The banner printing `(3, 64, 64)` with no size flag is the check that
-this works.
+**2. Resolution is read from the checkpoint.** Confirm that the banner reports
+`(3, 64, 64)` without an explicit size flag.
 
 **3. You must supply the real images.** `--dataset cifar10` fetches them; FFHQ
 does not. `fid.py` needs `--data` pointing at a directory or zip of FFHQ images
-at 64×64, and images of another size are resized bicubic rather than refused —
-so build the reference set at the right resolution rather than relying on that.
+at 64×64. Images with other dimensions are resized with bicubic interpolation, so build the
+reference set at 64×64 to avoid implicit resizing.
 The reference implementation used an `ffhq-64x64.zip`; if you already have one
 from that repo, point at it and your numbers stay comparable.
 
@@ -37,11 +33,11 @@ curl -L -o ~/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/p
 Plus the real set, as a directory or zip of 64×64 images — call it
 `~/ffhq-64x64.zip` below.
 
-## 1. Size the batch — lower than CIFAR-10
+## 1. Select a batch size
 
 64×64 is **four times the pixels** of 32×32, so an activation-bound forward
 costs roughly four times as much. Expect the batch that fits to be around a
-quarter of what CIFAR-10 tolerated. Probe rather than assume:
+quarter of the CIFAR-10 batch size. Measure memory use with a short run:
 
 ```bash
 python experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 128 --num-steps 100 --eps 0.5 --sample-batch 16 --device cuda:4 --out /tmp/probe-ffhq
@@ -65,7 +61,7 @@ accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/im
 accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --rule rmc --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 16 --out results/ffhq/K2_L3/rmc
 ```
 
-Same `eps` and `--seed` across all three, as always.
+Use the same `eps` and `--seed` for all three arms.
 
 ## 3. Score
 
@@ -85,9 +81,9 @@ Identical to CIFAR-10: the three FIDs must agree within sampling noise (the
 speculative rules sample the same law as plain target at temperature 1),
 speedup above 1, acceptance strictly between 0 and 1.
 
-The one FFHQ-specific check is visual — `grid.png` should be faces. At 64×64 a
-broken change of variables produces plausible-looking texture that survives a
-glance at a thumbnail, so look at it properly.
+The FFHQ-specific validation is visual: `grid.png` should contain recognizable faces. Inspect
+the full-resolution grid because an incorrect change of variables may still produce plausible
+texture at thumbnail size.
 
 ## Sweeping
 

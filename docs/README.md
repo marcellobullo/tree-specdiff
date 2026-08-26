@@ -1,13 +1,13 @@
 # specdiff documentation
 
-Start with the [project README](../README.md) for what this is, the notation table, and a
-five-line quick start. These four documents go deeper.
+Begin with the [project README](../README.md) for an overview, notation, and quick start. The
+documents below cover implementation and extension details.
 
 | document | read it if you want to |
 | --- | --- |
-| [writing-a-verifier.md](writing-a-verifier.md) | **implement a verification rule** — the contract, rank-1 coordinates, how to test for exactness, and the traps. This is the library's primary extension point and the guide most readers want |
+| [writing-a-verifier.md](writing-a-verifier.md) | implement a verification rule: contract, rank-1 coordinates, exactness tests, and common implementation errors |
 | [models.md](models.md) | sample from your own diffusion model: the target, the schedule, proposals, choosing a draft tree, dtype rules, adding an array backend |
-| [architecture.md](architecture.md) | understand or modify the sampler: the three phases of a round, step indexing, horizon truncation, cost accounting, and why the seams are where they are |
+| [architecture.md](architecture.md) | understand or modify the sampler: round phases, step indexing, horizon truncation, cost accounting, and component boundaries |
 | [api-reference.md](api-reference.md) | look up a signature or an attribute |
 
 ## Common starting points
@@ -24,14 +24,13 @@ that is exact by construction, so it is safe against a production model, and rep
 speedup ceiling before you write any coupling.
 
 **"My rule passes `check_contract` but samples look wrong."**
-That is exactly what [`check_exactness`](writing-a-verifier.md#testing-for-exactness) is for.
-`check_contract` only covers the checkable half of the contract; exactness needs the
-statistical test.
+Use [`check_exactness`](writing-a-verifier.md#testing-for-exactness). `check_contract` covers
+structural invariants, while distributional exactness requires a statistical test.
 
 **"Where did the number in `result.summary()` come from?"**
 [Cost accounting](architecture.md#cost-accounting), and
 [Results](api-reference.md#results) for the field list.
 
 **"Why is the batched speedup lower than the per-trajectory speedup?"**
-It is supposed to be — one target call serves every live trajectory, so the batch advances at
-the pace of its slowest member. [The batched sampler](architecture.md#the-batched-sampler).
+One target call serves every active trajectory, so the batch advances at the pace of its
+slowest member. See [The batched sampler](architecture.md#the-batched-sampler).

@@ -1,10 +1,10 @@
-# Stable Diffusion 3.5 — the full protocol
+# Stable Diffusion 3.5 protocol
 
-End-to-end run on SD3.5-medium: generate from a caption set, then score prompt
-faithfulness. Structurally like [`cifar10-conditional.md`](cifar10-conditional.md),
-but SD3 differs in three ways that change what you run and what you conclude.
+This protocol generates images from a caption set with SD3.5-medium and measures prompt
+alignment. It follows the CIFAR-10 workflow but changes the conditioning, quality metric, and
+memory requirements.
 
-## The three differences
+## Key differences
 
 **1. Conditioning is text, one caption per image.** `--prompts FILE` gives image
 `i` line `i`, and its starting noise comes from seed `--seed + i`. So every rule
@@ -42,7 +42,7 @@ writes `.image_ids.txt` and a `.meta.json` recording the source file's SHA-256.
 Defaults match the reference implementation, so an existing `coco30k.txt` from
 there is reproduced exactly.
 
-## 1. Check it runs before it runs for hours
+## 1. Run a smoke test
 
 ```bash
 python experiments/images/run_sd3.py --network stabilityai/stable-diffusion-3.5-medium --no-accelerate --prompts ~/coco30k.txt --rule d-grs --branching 2 --lookahead 3 --num-samples 8 --num-steps 28 --eps 0.25 --guidance-scale 7.0 --sample-batch 2 --forward-batch 16 --device cuda:4 --out /tmp/probe-sd3
@@ -88,23 +88,22 @@ python experiments/images/clip.py --samples results/sd3/plain-target results/sd3
 ```
 
 Captions are recovered from each run's `meta.json`, which records the prompts
-file and the index rule — so the scorer cannot be pointed at the wrong set by
-accident, and it refuses rather than guessing. CLIP loads once for every cell,
-and text embeddings are cached across cells, so a twelve-cell sweep encodes
-each caption once rather than twelve times.
+file and the index rule. `clip.json` is reused only when the model, dtype,
+samples, metadata and prompt source still match. CLIP loads once for every
+cell, and text embeddings are cached across cells, so a twelve-cell sweep
+encodes each caption once rather than twelve times.
 
 **Use `--baseline`.** Every image's score is kept, not just the mean, and cells
-generated from the same (caption, seed) pairs can then be compared *paired*:
+generated from the same (caption, seed) pairs can then be compared *paired*.
+The scorer verifies that pairing signature and refuses mismatched seeds or
+prompt orderings:
 
 ```bash
 python experiments/images/clip.py --samples results/sd3/plain-target results/sd3/K2_L3/d-grs results/sd3/K2_L3/rmc --baseline results/sd3/plain-target --device cuda:4 --output results/sd3/clip_report.json
 ```
 
-The paired standard error is far smaller than the unpaired one — the report
-prints both — because it sees through the per-caption variation that dominates
-the marginal spread. That is what makes a real gap visible at sample counts
-where the two means overlap, and it is the payoff of generating every arm from
-identical (caption, noise) pairs in the first place.
+The report includes paired and unpaired standard errors. Pairing removes much of the
+per-caption variation and provides greater sensitivity when marginal means overlap.
 
 ## 4. What the results must show
 
@@ -134,10 +133,8 @@ so rows per forward stay roughly flat as `K` grows — around 104–128 after th
 CFG doubling, across the default grid. Start with `NUM_SAMPLES=32
 CONFIGS="2,2"` to confirm the launch works before committing.
 
-## What has never been tested
+## Compatibility note
 
-Everything above is exercised against `toy_sd3.py`, a closed-form stand-in
-pipeline. **No real SD3.5 weights have been through this code.** Untested:
-`StableDiffusion3Pipeline.from_pretrained`, the real `encode_prompt` signature,
-the transformer's actual call convention, and the real VAE's scaling factors.
-Treat step 1 as the genuine first test.
+Checkpoint interfaces can vary across Diffusers versions. Run the smoke test in step 1 to
+verify the installed pipeline, prompt encoding, transformer interface, and VAE scaling before
+starting a full experiment.

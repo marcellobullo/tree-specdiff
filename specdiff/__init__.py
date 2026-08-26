@@ -1,8 +1,8 @@
 """Speculative diffusion sampling over arbitrary draft trees.
 
-Algorithm 3 of *Accelerating Diffusion Sampling via Speculative Draft Trees*.
-The sampler knows nothing about the two things the paper varies -- the draft
-topology and the verification rule -- so you supply those and nothing else.
+Implements Algorithm 3 from *Accelerating Diffusion Sampling via Speculative
+Draft Trees*. Applications provide the draft topology and verification rule;
+the sampler remains independent of both implementations.
 
     from specdiff import DraftTree, DelayedDriftProposal, SpeculativeSampler
 

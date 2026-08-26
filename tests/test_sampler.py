@@ -276,8 +276,7 @@ def test_check_exactness_false_failure_rate_is_near_alpha():
 
 
 def test_sampler_rejects_a_non_floating_init():
-    """An integer state truncates every Gaussian draw to zero and the run would
-    complete, report a speedup, and return a silently wrong trajectory."""
+    """Reject integer states before Gaussian draws are truncated."""
     sampler = standard_sampler(LinearGaussianTarget(), ConstantSchedule(0.5), num_steps=6)
     try:
         sampler.sample(np.ones(4, dtype=np.int64))
@@ -342,3 +341,50 @@ if __name__ == "__main__":
         fn()
         print(f"ok  {fn.__name__}")
     print(f"\n{len(fns)} passed")
+
+
+def test_verified_rows_report_the_actual_target_batch():
+    """Leaf evaluation and exact-root reuse must be visible in each record."""
+    target = LinearGaussianTarget(0.9)
+    sampler = SpeculativeSampler(
+        target=target,
+        proposal=ExactProposal(0.9),
+        schedule=ConstantSchedule(0.1),
+        tree=DraftTree.uniform(2, 2),
+        verifier=AcceptFirstVerifier(),
+        num_steps=8,
+        prefetch="nearest",
+        evaluate_leaves=True,
+    )
+    result = sampler.sample(np.ones(3), rng=np.random.default_rng(0))
+    assert sum(round_.verified for round_ in result.rounds) == result.target_states_evaluated
+    assert result.rounds[0].verified == sampler.tree.size
+    assert result.rounds[1].verified == sampler.tree.size - 1
+
+
+def test_explicit_backend_reaches_builtin_verifiers():
+    """The sampler backend is authoritative, not re-resolved inside a rule."""
+    from specdiff import IdentityProposal, create_verifier
+    from specdiff.ops import NumpyBackend
+
+    class TrackingBackend(NumpyBackend):
+        def __init__(self):
+            super().__init__()
+            self.uniform_calls = 0
+
+        def uniform(self, rng=None):
+            self.uniform_calls += 1
+            return super().uniform(rng)
+
+    backend = TrackingBackend()
+    sampler = SpeculativeSampler(
+        target=LinearGaussianTarget(0.5),
+        proposal=IdentityProposal(),
+        schedule=ConstantSchedule(0.2),
+        tree=DraftTree.chain(1),
+        verifier=create_verifier("rmc"),
+        num_steps=3,
+        backend=backend,
+    )
+    sampler.sample(np.ones(4), rng=np.random.default_rng(0))
+    assert backend.uniform_calls > 0

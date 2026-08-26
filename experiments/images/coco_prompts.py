@@ -12,18 +12,16 @@ Writes, next to `--output`:
     coco30k.image_ids.txt   the COCO image_id per line, aligned to the captions
     coco30k.meta.json       the exact procedure, so the set can be re-derived
 
-Why the selection is fixed and prefix-stable
---------------------------------------------
+Prefix-stable selection
+-----------------------
 The published zero-shot number for text-to-image models is FID-30K on COCO 2014
-validation, so the full set is 30k. A sweep does not need 30k samples, and
-generating them at SD3 tree cost would be absurd -- but it must not use a
-*different* caption set either, or a later 30k run cannot be compared with what
-the sweep measured.
+validation, so the full set contains 30,000 captions. Smaller sweeps use the
+same ordered caption set to remain comparable with full runs.
 
-So the order depends only on `(--seed, --num-pool)`, never on `--num`:
-`--num 500` is exactly the first 500 lines of the 30k file. Take a prefix now,
-extend to the full set later, with nothing to re-derive and nothing to
-re-justify.
+The order depends only on `(--seed, --num-pool)`, never on `--num`:
+`--num 500` produces exactly the first 500 lines of the 30,000-caption file.
+Increasing `--num` therefore extends an existing sweep without changing its
+previous caption assignments.
 
 One caption per image (COCO has ~5), chosen as the lowest annotation id, which
 is the file's own first caption for that image -- deterministic, no RNG. Images

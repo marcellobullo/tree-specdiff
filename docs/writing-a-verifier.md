@@ -1,8 +1,7 @@
 # Writing a verification rule
 
-`Verify` is the one component Algorithm 3 leaves abstract. It is where RMC and D-GRS differ,
-where your own coupling goes, and the only place in the library where a bug is silent rather
-than loud. This is the guide to writing one.
+Algorithm 3 leaves `Verify` abstract. RMC, D-GRS, and custom couplings implement this
+component. This guide defines the interface, correctness requirements, and validation process.
 
 ## The interface
 
@@ -17,8 +16,7 @@ class MyRule(Verifier):
         ...
 ```
 
-That is the whole interface. A rule written this way also runs under the batched sampler
-unchanged.
+This interface supports both scalar and batched samplers without modification.
 
 You are given one parent node and its drafted children, and you return one state:
 
@@ -42,14 +40,14 @@ You are given one parent node and its drafted children, and you return one state
 
 **1. `state` is an exact sample from `N(target_mean, sigma^2 I)`.**
 
-This is the reason the whole approach is worth anything. It is also the one obligation the
-library cannot check per call — see [testing for exactness](#testing-for-exactness).
+This requirement preserves the target distribution. The library cannot validate it from one
+call; see [testing for exactness](#testing-for-exactness).
 
 **2. If `accepted`, `state` *is* `children[child_index]`.**
 
-Not a copy, not a corrected version. The sampler descends into that child's subtree, so a
-returned state that merely resembles the child sends the trajectory down the wrong branch and
-silently corrupts the chain. `check_contract=True` enforces this.
+The result must be the selected child, not a corrected copy. The sampler descends through that
+child's subtree, so returning a different state invalidates the trajectory. Set
+`check_contract=True` to enforce this condition.
 
 **3. Children are examined in the order given, if your rule is a sequence coupling.**
 
@@ -85,9 +83,8 @@ y = frame.reconstruct(s, z_perp)  # eq. (11):  (S, Z_perp) -> Y
 for RMC, eq. (15) for D-GRS. It is worth measuring on your own model before committing to a
 coupling; see [the delta probe](#measuring-your-headroom-first).
 
-This lives in the library rather than in any one rule because getting the reconstruction wrong
-is a silent-correctness bug: the sample still looks Gaussian, just not from the right
-distribution.
+The library centralizes this transformation because an incorrect reconstruction can return a
+Gaussian sample from the wrong distribution without raising an error.
 
 ### Degeneracy
 
@@ -108,26 +105,23 @@ property of float64, not of the array. That floor is `delta ~ 1e-15`, where
 `G_2 = Phi_bar(-delta/2) - Phi_bar(delta/2)` cancels to zero; `1e-10` clears it by five orders
 of magnitude while admitting only `~4e-11` of total variation.
 
-The shortcut is not free — it accepts unconditionally, which costs `TV = delta / sqrt(2 pi)`
-every time it fires — so a loose tolerance spends exactness silently, in exactly the
-small-`delta` regime a good proposal produces. This was previously `sqrt(eps)` of the state
-dtype, which is `3.1e-2` in float16: `check_exactness` detects that as non-exact.
+The shortcut accepts unconditionally and introduces `TV = delta / sqrt(2 pi)` whenever it is
+used. A loose tolerance therefore reduces exactness in the small-`delta` regime. The previous
+`sqrt(eps)` rule reached `3.1e-2` for float16, which `check_exactness` identifies as non-exact.
 
-Exact equality is the wrong predicate, and the reason is worth internalising: the regime that
-breaks a rule is small-and-nonzero `delta`, which is precisely what a *good* proposal produces.
-At `delta = 1e-16` an `== 0` test says "not degenerate", `tau = ln(lambda) / delta` comes out
-around `-7e15`, `Phi_bar` saturates to exactly `0`, and the D-GRS residual mass `G_k` becomes
-zero — a division by zero one step later, from a proposal that was doing its job well. Below
-`tol` the two kernels are indistinguishable at the state's own precision (their TV distance is
-`~delta / sqrt(2 pi)`), so accepting unconditionally is the correct limit, not an
-approximation.
+Do not test degeneracy with exact equality. A small nonzero `delta` can produce
+`tau = ln(lambda) / delta` with extreme magnitude, saturate `Phi_bar` to zero, and make the
+D-GRS residual mass `G_k` vanish. At `delta = 1e-16`, for example, `tau` is approximately
+`-7e15`. Below `tol`, the kernels are indistinguishable at the state's precision, with total
+variation approximately `delta / sqrt(2 pi)`, so unconditional acceptance implements the
+limiting case.
 
 `frame.tau(level)` raises `ZeroDivisionError` on a degenerate frame rather than handing back an
 infinity that would propagate quietly.
 
 ## Randomness
 
-Draw from `request.rng`, never a private generator:
+Draw all random values from `request.rng`:
 
 ```python
 ops = self.backend_for(request)                       # backend without importing ops
@@ -135,15 +129,14 @@ noise = ops.randn_stack(1, request.target_mean, request.rng)[0]
 u = ops.uniform(request.rng)                          # scalar in [0, 1)
 ```
 
-A rule that reaches for `np.random` directly breaks reproducibility from the seed the caller
-passed to `sample()`, and makes a failed exactness test impossible to reproduce. `backend_for`
-is a convenience on `Verifier` so subclasses need no framework import at all.
+Using a private generator such as `np.random` breaks reproducibility from the seed passed to
+`sample()`. `backend_for` lets verifier subclasses access random operations without importing
+a framework directly.
 
 ## Worked example: a diagnostic rule
 
-The simplest useful rule. It is exact by construction because it ignores the drafts entirely,
-which means it is safe to run against a production model, and it answers the question worth
-asking before you commit to a coupling.
+This diagnostic verifier is exact by construction because it ignores drafted states. It can
+therefore measure proposal mismatch on a model before a coupling is selected.
 
 ```python
 from specdiff import Verifier, VerifyRequest, VerifyResult
@@ -203,10 +196,10 @@ print(f"delta {delta:.3f}  acceptance {alpha:.3f}  chain ceiling {1/(1-alpha):.2
 The ceiling is `1 / (1 - alpha)`: a round accepts a `Geom(alpha)` prefix of mean
 `alpha / (1 - alpha)` and then commits one more state on the rejection.
 
-One caveat, and it matters: a probe that never accepts advances one step per round, so a
-delayed drift is never more than one step stale and the measured `delta` is a **lower bound**.
-Under a real coupling the drift ages across the accepted prefix and the mismatch grows — as it
-also does with dimension, roughly like `sqrt(d)`.
+Because the probe always rejects, it advances one step per round and its delayed drift is at
+most one step stale. The measured `delta` is therefore a **lower bound**. With an accepting
+coupling, drift can age across the committed prefix and increase the mismatch. Mismatch also
+typically grows with dimension at approximately `sqrt(d)`.
 
 `examples/gaussian_mixture.py` runs this end to end.
 
@@ -225,8 +218,7 @@ print(report)
 
 The test projects the returned state onto the displacement direction, where exactness implies
 `N(delta, 1)` **regardless of what the rule did internally**, and runs a one-sample KS test on
-that scalar. It catches the coupling bugs that produce plausible-looking but wrong samples,
-and needs no SciPy.
+that scalar. This detects distributional errors in the coupling and requires no SciPy.
 
 Sweep the regimes that actually differ, and **include `delta = 0`** — it is the case a good
 proposal approaches, the one Remark 2 forces every rule to special-case, and therefore the one
@@ -250,7 +242,7 @@ is something you can actually debug. Without it, an occasional red build is indi
 from a real coupling bug.
 
 `report.acceptance_rate` and `report.mean_examined` are the other half of the picture: a rule
-can be perfectly exact and still useless if it never accepts.
+may be exact while providing no acceleration if it always rejects.
 
 ## While developing: `check_contract=True`
 
@@ -285,10 +277,10 @@ draft tree has K=3. Use DraftTree.chain(L) for single-proposal rules.
 
 ## Vectorising for the batched sampler
 
-Rules get `verify_batch` for free — the default loops over rows calling your `verify`, so
-nothing needs rewriting. Override it when the per-node work is worth vectorising: for the
-paper's rules, the scalar sweep over levels `lambda_k` becomes a `(batch,)` vector operation
-while the `d`-dimensional projections and reconstructions become single batched ops.
+The default `verify_batch` implementation calls `verify` for each row, so a separate batched
+implementation is optional. Override it when per-node work benefits from vectorization. For
+the paper's rules, the scalar sweep over `lambda_k` becomes a `(batch,)` vector operation,
+while the `d`-dimensional projections and reconstructions become batched operations.
 
 ```python
 def verify_batch(self, request: BatchedVerifyRequest) -> BatchedVerifyResult:

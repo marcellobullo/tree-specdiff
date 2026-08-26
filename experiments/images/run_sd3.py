@@ -1,8 +1,7 @@
 """Generate images from Stable Diffusion 3.5 through specdiff.
 
-The latent-space counterpart of `run_edm.py`, kept as a separate file: the
-sharding and accounting are the same shape, but the conditioning, the memory
-profile and the scoring are not.
+This is the latent-space counterpart of ``run_edm.py``. Sharding and accounting
+follow the same structure, while conditioning, memory use, and scoring differ.
 
     accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 \\
         experiments/images/run_sd3.py \\
@@ -15,23 +14,21 @@ profile and the scoring are not.
 Prompts
 -------
 `--prompt` fixes one caption for the whole run; `--prompts FILE` gives one per
-line and **image i uses line i at seed (--seed + i)**. That second form is what
-makes a (K, L) comparison *paired*: every rule sees the identical
-(prompt, starting noise) pairs, so the arms differ only in the coupling rather
-than in what they were asked to draw. Both are reproducible independently of
-how many GPUs the run used.
+line, and image ``i`` uses line ``i`` with seed ``--seed + i``. This produces a
+paired comparison in which every rule receives the same prompt and starting
+noise. Results are reproducible independently of GPU count.
 
 Output (`--out`), identical in layout to `run_edm.py` so scoring is shared:
     samples.pt   uint8 (N, 3, H, W) -- decoded pixels, not latents
     meta.json    protocol + NFE accounting
-    grid.png     montage for eyeballing
+    grid.png     preview montage
 
 Memory
 ------
 Classifier-free guidance **doubles every forward**, so a round asking for
 `sample_batch x |I|` latents pushes twice that through the transformer. At
-512px `--forward-batch` is the knob that keeps that bounded, and unlike
-`--sample-batch` it changes nothing about the algorithm. Freeing the text
+512px, use ``--forward-batch`` to bound activation memory without changing the
+algorithm. Freeing the text
 encoders after pre-encoding (the default) is what leaves room for a deep tree:
 11.2 of the 16.3 GiB an SD3.5-medium pipeline holds is T5-XXL plus the CLIPs.
 
@@ -65,6 +62,10 @@ from specdiff import (  # noqa: E402
 )
 
 from images import sd3_models as sd3  # noqa: E402
+from images.run_common import (  # noqa: E402
+    add_metrics, file_identity, load_shards, merged_metrics, metric_totals,
+    run_signature, save_grid, summarise_metrics, validate_reusable_shard,
+)
 
 REPORT_EVERY_S = 60.0
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -132,10 +133,10 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def load_prompts(path: str, num_samples: int) -> list[str]:
-    """The first `num_samples` lines of a one-caption-per-line file.
+    """Load the first ``num_samples`` lines of a caption file.
 
-    A prefix, deliberately: a fixed prompt file means a 500-sample sweep and a
-    later 30k run share captions for the indices they have in common.
+    Prefix selection ensures that smaller sweeps and later full runs share
+    captions for their common indices.
     """
     lines = Path(path).read_text().splitlines()
     prompts = [ln.strip() for ln in lines if ln.strip()]
@@ -253,38 +254,47 @@ def decode(denoiser, latents: torch.Tensor, decode_batch: int) -> torch.Tensor:
     ])
 
 
+def experiment_signature(args, setting, tree, denoiser):
+    return run_signature(
+        "sd3", args, setting, tree,
+        extra={
+            "network": file_identity(args.network),
+            "prompts": file_identity(args.prompts),
+            "per_sample_prompts": denoiser.per_sample_prompts,
+        },
+    )
+
+
 def generate_shard(args, setting, sampler, denoiser, start, count, out, rank):
+    if count < 1:
+        raise SystemExit("each process must receive at least one sample")
     shard = out / f"shard_{rank:03d}.pt"
+    signature = experiment_signature(args, setting, sampler.tree, denoiser)
     if shard.exists() and not args.overwrite:
+        validate_reusable_shard(
+            shard, signature=signature, rank=rank, start=start, count=count
+        )
         print(f"rank {rank}: reusing {shard.name}")
         return shard
 
     batch = args.sample_batch or count
     generator = torch.Generator(device=args.device).manual_seed(args.seed + rank)
     n_endpoints = len(setting.deterministic_steps)
-    chunks, calls, rows = [], 0, 0
-    speedups, end_to_end, isolated, occupancies, accepts = [], [], [], [], []
+    chunks, metrics = [], {}
     t0, done, last_report = time.time(), 0, 0.0
 
     while done < count:
         n = min(batch, count - done)
         first = start + done
-        # Upload this batch's captions; indices_in_batch then selects within them.
         denoiser.set_prompt_batch(range(first, first + n))
         y0 = initial_latents(args, setting, denoiser, first, n, generator)
         latents, result = sd3.sample_trajectory(
             setting, sampler, y0, rng=generator, generator=generator
         )
         chunks.append(decode(denoiser, latents, args.decode_batch))
-        calls += result.target_calls
-        rows += result.target_states_evaluated
-        speedups.append(result.speedup)
-        end_to_end.append(
-            (setting.num_steps + n_endpoints) / (result.target_calls + n_endpoints)
-        )
-        isolated.append(result.mean_isolated_speedup)
-        occupancies.append(result.occupancy)
-        accepts.append(result.acceptance_rate)
+        add_metrics(metrics, metric_totals(
+            result, num_steps=setting.num_steps, deterministic_steps=n_endpoints
+        ))
         done += n
 
         now = time.time()
@@ -300,36 +310,33 @@ def generate_shard(args, setting, sampler, denoiser, start, count, out, rank):
                       flush=True)
             last_report = now
 
-    mean = lambda xs: sum(xs) / len(xs)  # noqa: E731
-    torch.save({"samples": torch.cat(chunks), "rank": rank,
-                "target_calls": calls, "target_states_evaluated": rows,
-                "speedup": mean(speedups), "end_to_end_speedup": mean(end_to_end),
-                "mean_isolated_speedup": mean(isolated),
-                "occupancy": mean(occupancies), "acceptance_rate": mean(accepts),
-                "seconds": round(time.time() - t0, 1)},
-               str(shard) + ".tmp")
+    summary = summarise_metrics(metrics)
+    torch.save(
+        {
+            "samples": torch.cat(chunks),
+            "rank": rank,
+            "start": start,
+            "count": count,
+            "run_signature": signature,
+            "metric_totals": metrics,
+            "target_calls": metrics["target_calls"],
+            "target_states_evaluated": metrics["target_states_evaluated"],
+            **summary,
+            "seconds": time.time() - t0,
+        },
+        str(shard) + ".tmp",
+    )
     os.replace(str(shard) + ".tmp", shard)
     return shard
 
 
-def save_grid(samples: torch.Tensor, path: Path) -> None:
-    import PIL.Image
-
-    n = min(64, samples.shape[0])
-    side = max(1, int(n**0.5))
-    h, w = samples.shape[2], samples.shape[3]
-    grid = PIL.Image.new("RGB", (side * w, side * h))
-    for i in range(side * side):
-        grid.paste(PIL.Image.fromarray(samples[i].permute(1, 2, 0).numpy()),
-                   ((i % side) * w, (i // side) * h))
-    grid.save(path)
-
-
-def merge_shards(args, setting, tree, denoiser, out):
-    shards = sorted(out.glob("shard_*.pt"))
-    parts = [torch.load(p, map_location="cpu", weights_only=False) for p in shards]
-    samples = torch.cat([p["samples"] for p in parts])
-    mean = lambda key: sum(p[key] for p in parts) / len(parts)  # noqa: E731
+def merge_shards(args, setting, tree, denoiser, out, world=None):
+    signature = experiment_signature(args, setting, tree, denoiser)
+    shards, parts = load_shards(
+        out, signature=signature, num_samples=args.num_samples, world=world
+    )
+    samples = torch.cat([part["samples"] for part in parts])
+    totals, summary = merged_metrics(parts)
 
     meta = {
         "rule": args.rule,
@@ -353,8 +360,6 @@ def merge_shards(args, setting, tree, denoiser, out):
         "decode_batch": args.decode_batch,
         "seed": args.seed,
         "num_processes": len(parts),
-        # The captions are reproducible from the file plus the seed rule, so a
-        # 30k prompt set does not go into every meta.json.
         "prompt": None if args.prompts else args.prompt,
         "prompts_file": args.prompts,
         "prompt_seed_rule": ("image i = line i of prompts_file, noise seed = seed + i"
@@ -363,37 +368,38 @@ def merge_shards(args, setting, tree, denoiser, out):
         "guidance_scale": args.guidance_scale,
         "resolution_px": args.toy_resolution if args.toy else args.resolution_px,
         "dtype": args.dtype,
-        "speedup": mean("speedup"),
-        "end_to_end_speedup": mean("end_to_end_speedup"),
-        "mean_isolated_speedup": mean("mean_isolated_speedup"),
-        "occupancy": mean("occupancy"),
-        "acceptance_rate": mean("acceptance_rate"),
-        "target_calls": sum(p["target_calls"] for p in parts),
-        "target_states_evaluated": sum(p["target_states_evaluated"] for p in parts),
-        "seconds": max(p["seconds"] for p in parts),
-        "seconds_per_rank": [p["seconds"] for p in sorted(parts, key=lambda q: q["rank"])],
+        **summary,
+        "target_calls": totals["target_calls"],
+        "target_states_evaluated": totals["target_states_evaluated"],
+        "metric_totals": totals,
+        "seconds": max(part["seconds"] for part in parts),
+        "seconds_per_rank": [part["seconds"] for part in parts],
+        "run_signature": signature,
     }
 
     torch.save(samples, out / "samples.pt.tmp")
     os.replace(out / "samples.pt.tmp", out / "samples.pt")
-    for p in shards:
-        p.unlink()
+    for path in shards:
+        path.unlink()
     with open(out / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
     save_grid(samples, out / "grid.png")
-    for f in out.glob("progress_rank*.json"):
-        f.unlink()
+    for path in out.glob("progress_rank*.json"):
+        path.unlink()
 
     secs = meta["seconds_per_rank"]
-    if len(secs) > 1 and max(secs) > 1.15 * min(secs):
+    if len(secs) > 1 and min(secs) > 0.0 and max(secs) > 1.15 * min(secs):
         print(f"per-rank seconds: {secs}")
         print(f"  note: slowest rank took {max(secs) / min(secs):.2f}x the fastest; "
               "wall clock is the slowest rank.")
     return meta
 
-
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.num_samples < 1:
+        raise SystemExit("--num-samples must be >= 1")
+    if args.sample_batch < 0 or args.forward_batch < 0 or args.decode_batch < 1:
+        raise SystemExit("batch sizes must be positive, or zero where documented")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     if args.device is None:
         args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -405,6 +411,11 @@ def main(argv=None) -> None:
         accelerator = Accelerator(cpu=args.cpu)
         rank, world = accelerator.process_index, accelerator.num_processes
         args.device = str(accelerator.device)
+
+    if args.num_samples < world:
+        raise SystemExit(
+            f"--num-samples ({args.num_samples}) must be >= process count ({world})"
+        )
 
     out = Path(args.out)
     if rank == 0:
@@ -444,7 +455,7 @@ def main(argv=None) -> None:
 
     barrier(accelerator)
     if rank == 0:
-        print(json.dumps(merge_shards(args, setting, tree, denoiser, out), indent=2))
+        print(json.dumps(merge_shards(args, setting, tree, denoiser, out, world=world), indent=2))
 
     if accelerator is not None:
         import torch.distributed as dist

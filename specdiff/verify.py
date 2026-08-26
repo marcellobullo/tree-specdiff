@@ -1,16 +1,15 @@
 """The pluggable verification rule.
 
-``Verify`` is the one component Algorithm 3 leaves abstract, and the paper is
-unusually precise about its contract, so the base class states it as an
-invariant rather than a docstring aspiration:
+Algorithm 3 leaves ``Verify`` abstract. The base class expresses the paper's
+contract as three invariants:
 
 1.  ``result.state`` is an **exact** sample from ``N(mu_q, sigma^2 I)``.
 2.  If ``result.accepted``, then ``result.state`` *is* one of the children.
 3.  Otherwise ``result.state`` came from the normalised residual.
 
-Point 1 is the reason the whole approach is worth anything, and it is not
-checkable per-call. Point 2 is checkable and :class:`CheckedVerifier` checks
-it; point 1 gets a statistical test in :mod:`specdiff.testing`.
+Distributional exactness cannot be checked per call. :class:`CheckedVerifier`
+enforces the structural invariants, while :mod:`specdiff.testing` provides a
+statistical exactness test.
 """
 
 from __future__ import annotations
@@ -28,8 +27,7 @@ class Verifier(ABC):
     Subclasses implement :meth:`verify` and, if they are restricted in the
     number of proposals they can couple, set :attr:`max_children`. RMC is a
     single-proposal maximal coupling, so it sets ``max_children = 1`` and the
-    sampler will refuse at construction time to run it on a branching tree
-    rather than silently ignoring siblings.
+    sampler rejects incompatible branching trees during construction.
     """
 
     name: str = "verifier"
@@ -43,8 +41,8 @@ class Verifier(ABC):
         """Verify one node per trajectory, for the batched sampler.
 
         The default splits the batch and calls :meth:`verify` row by row, so
-        every rule works under batching without being rewritten. Override it
-        when the per-node work is worth vectorising -- for the paper's rules
+        every rule supports batching without changes. Override it when the
+        per-node work benefits from vectorization. For the paper's rules,
         that means the scalar sweep over levels ``lambda_k`` runs on a
         ``(batch,)`` vector instead of in a Python loop, while the ``d``-dimensional
         projections and reconstructions become single batched ops.
@@ -53,7 +51,7 @@ class Verifier(ABC):
         ``request.row(j)``. Coupling rows to each other changes the joint law
         of the batch even if each marginal still looks right.
         """
-        ops = resolve_backend(request.children)
+        ops = request.backend or resolve_backend(request.children)
         rows = [self.verify(request.row(j)) for j in range(request.batch_size)]
         return BatchedVerifyResult.from_rows(rows, ops)
 
@@ -81,17 +79,15 @@ class Verifier(ABC):
     # Convenience for subclasses; they get a backend without importing ops.
     @staticmethod
     def backend_for(request: VerifyRequest) -> Backend:
-        return resolve_backend(request.children)
+        return request.backend or resolve_backend(request.children)
 
 
 class ResampleVerifier(Verifier):
-    """Always rejects and draws a fresh ``Y ~ N(mu_q, sigma^2 I)``.
+    """Reject every draft and draw ``Y ~ N(mu_q, sigma^2 I)``.
 
-    Trivially exact and trivially useless: it commits one state per target
-    call, so a run with it reproduces the standard sampler at ``1.00x``. That
-    makes it the reference point for the sampler -- if Algorithm 3 with this
-    rule does not match a plain Euler-Maruyama loop in distribution, the bug is
-    in the sampler, not in the coupling.
+    This exact reference verifier commits one state per target call and
+    reproduces the standard sampler at ``1.00x``. It is useful for validating
+    the sampler independently of a coupling.
     """
 
     name = "resample"
@@ -109,8 +105,8 @@ class ResampleVerifier(Verifier):
 class CheckedVerifier(Verifier):
     """Wrapper that enforces the checkable half of the contract.
 
-    Wrap a rule under development in this; the cost is a couple of comparisons
-    per node. ``SpeculativeSampler(..., check_contract=True)`` does it for you.
+    Enable this wrapper with ``SpeculativeSampler(..., check_contract=True)``
+    while developing a verifier. It adds a small number of comparisons per node.
     """
 
     def __init__(self, inner: Verifier) -> None:
@@ -164,7 +160,7 @@ class CheckedVerifier(Verifier):
 
     def verify_batch(self, request: BatchedVerifyRequest) -> BatchedVerifyResult:
         result = self.inner.verify_batch(request)
-        ops = resolve_backend(request.children)
+        ops = request.backend or resolve_backend(request.children)
         if not isinstance(result, BatchedVerifyResult):
             raise TypeError(
                 f"{self.inner.name}.verify_batch returned {type(result)!r}, "

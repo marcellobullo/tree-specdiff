@@ -1,1 +1,1 @@
-"""Image experiments: pretrained EDM (and later SD3) behind the specdiff contract."""
+"""Image experiments for pretrained EDM and SD3 models."""
