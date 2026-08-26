@@ -67,8 +67,8 @@ python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-uncond-vp.pkl
 ### 3. FFHQ — the "same command, one path changed" claim
 
 ```bash
-curl -L -o ~/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
-python experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 16 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-ffhq
+curl -L -o ~/specdiff/edm/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
+python experiments/images/run_edm.py --network ~/specdiff/edm/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/specdiff/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 16 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-ffhq
 ```
 
 Expect `(3, 64, 64)` in the banner with no other flag changed, and faces in
@@ -80,15 +80,15 @@ Only ever exercised against the toy network — the one-hot plumbing has never
 met a real `EDMPrecond`.
 
 ```bash
-curl -L -o ~/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
-python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-cond
+curl -L -o ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/specdiff/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-cond
 ```
 
 Expect `labels: uniform over 10 classes` and `"conditional": true`. Sanity
 check the guard too — this must be **refused**, not silently sampled:
 
 ```bash
-python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --no-accelerate --labels none --rule d-grs --num-samples 4 --num-steps 100 --out results/edm/should-fail
+python experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --no-accelerate --labels none --rule d-grs --num-samples 4 --num-steps 100 --out results/edm/should-fail
 ```
 
 A stronger check if you want one: generate with `--labels 3` and confirm the
@@ -100,7 +100,7 @@ Only ever run as two CPU processes. NCCL, `--multi_gpu`, and per-rank device
 placement are untested.
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.25 --sample-batch 64 --out results/edm/smoke-4gpu
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/specdiff/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.25 --sample-batch 64 --out results/edm/smoke-4gpu
 ```
 
 Expect four `rank N: images a..b` lines covering `0..255` with no gaps or
@@ -119,7 +119,7 @@ is wrong with the process group.
 untested. Start small:
 
 ```bash
-NETWORK=~/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,1,2,3 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
+NETWORK=~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,1,2,3 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
 ```
 
 Expect a per-cell `|I|` table, the plain-target baseline first, then each cell.
