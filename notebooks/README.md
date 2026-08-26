@@ -1,16 +1,16 @@
 # Tutorials
 
-One notebook per component of the library. They are independent — each defines its own toy model
-and imports only from `specdiff` — but the order below is the one that builds up.
+Each notebook focuses on one library component and defines its own toy model. The notebooks can
+be run independently, although the order below provides a progressive introduction.
 
 | # | notebook | component | what it covers |
 | --- | --- | --- | --- |
 | 1 | [`tree_tutorial.ipynb`](tree_tutorial.ipynb) | `trees.py` | building a `DraftTree` from a parent list, the uniform/chain families, `B` and `|I|` |
 | 2 | [`kernels_tutorial.ipynb`](kernels_tutorial.ipynb) | `kernels.py` | the model interface derived from the paper: reverse SDE → eq. (5) → `TargetTransition` + `NoiseSchedule`, the eq. (24) assumption, the delayed drift (7) and root-drift prefetching, a worked flow-matching conversion (28)–(38), the role of churn (Remark 3), and an index of every equation |
-| 3 | [`verifier_tutorial.ipynb`](verifier_tutorial.ipynb) | `verify.py`, `verifiers/rank1.py`, `testing.py` | the one contract, `VerifyRequest`/`VerifyResult`, rank-1 coordinates and degeneracy, `check_exactness` (including what a wrong rule looks like), `CheckedVerifier`, the registry |
+| 3 | [`verifier_tutorial.ipynb`](verifier_tutorial.ipynb) | `verify.py`, `verifiers/rank1.py`, `testing.py` | verifier contract, `VerifyRequest`/`VerifyResult`, rank-1 coordinates, degeneracy, `check_exactness`, `CheckedVerifier`, and the registry |
 | 4 | [`sampler_tutorial.ipynb`](sampler_tutorial.ipynb) | `sampler.py`, `types.py` | Algorithm 3 round by round, `standard_sampler`, `RoundRecord`/`SamplingResult`, truncation near the horizon, cost accounting, projecting speedup from `delta` |
 | 5 | [`batched_tutorial.ipynb`](batched_tutorial.ipynb) | `batched.py` | many trajectories per target call, `indices_in_batch`, per-row `sigma`, compaction, occupancy and straggler cost |
-| 6 | [`backends_tutorial.ipynb`](backends_tutorial.ipynb) | `ops.py` | the array shim, the stack conventions, dtype guards, running the whole sampler on torch |
+| 6 | [`backends_tutorial.ipynb`](backends_tutorial.ipynb) | `ops.py` | array abstraction, stack conventions, dtype guards, and running the sampler with PyTorch |
 | 7 | [`end_to_end_tutorial.ipynb`](end_to_end_tutorial.ipynb) | everything | the paper's Gaussian-mixture setting: build a model, measure `delta`, choose a topology under a budget, plan a batch |
 
 ## Running them
@@ -25,7 +25,7 @@ jupyter lab notebooks
 All outputs in the committed notebooks were produced by running them top to bottom; nothing needs
 a GPU and no notebook takes more than a few seconds.
 
-## A note on the verification rules
+## Verification rules used in the tutorials
 
 Both of the paper's rules are implemented: `rmc` (Algorithm 1, `K = 1`) in
 `specdiff/verifiers/rmc.py`, and `d-grs` (Algorithm 2, any `K`) in
