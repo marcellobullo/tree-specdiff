@@ -5,7 +5,7 @@ with NFE accounting. Scoring is a separate step, allowing one generation run to
 support multiple metrics.
 
     python experiments/images/run_edm.py \\
-        --network /path/edm-cifar10-32x32-uncond-vp.pkl --edm-repo /path/edm \\
+        --network /path/edm-cifar10-32x32-uncond-vp.pkl \\
         --rule d-grs --branching 2 --lookahead 3 \\
         --num-samples 64 --num-steps 100 --eps 0.25 \\
         --device cuda:0 --out results/edm/cifar10-dgrs
@@ -55,6 +55,7 @@ from specdiff import (  # noqa: E402
     ResampleVerifier,
     create_verifier,
 )
+from specdiff.edm_checkout import default_edm_checkout, is_edm_checkout  # noqa: E402
 
 from images import models  # noqa: E402
 from images.run_common import (  # noqa: E402
@@ -70,7 +71,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     p.add_argument("--network", help="pretrained EDM .pkl")
-    p.add_argument("--edm-repo", help="checkout of NVlabs/edm, required for a .pkl")
+    p.add_argument(
+        "--edm-repo",
+        help="NVlabs/edm checkout (default: <specdiff source>/edm)",
+    )
     p.add_argument("--toy", action="store_true",
                    help="closed-form stand-in denoiser; no checkpoint, runs on CPU")
     p.add_argument("--toy-resolution", type=int, default=16)
@@ -179,10 +183,18 @@ def build_denoiser(args) -> models.EDMDenoiser:
         )
     if not args.network:
         raise SystemExit("--network is required (or --toy)")
-    if not args.edm_repo:
-        raise SystemExit("--network needs --edm-repo (a NVlabs/edm checkout)")
+    edm_repo = (
+        Path(args.edm_repo).expanduser()
+        if args.edm_repo
+        else default_edm_checkout()
+    )
+    if not is_edm_checkout(edm_repo):
+        raise SystemExit(
+            f"EDM checkout not found at {edm_repo}. Run specdiff-download-edm "
+            "or pass --edm-repo."
+        )
     return models.EDMDenoiser.from_pickle(
-        args.network, args.edm_repo, device=args.device
+        args.network, str(edm_repo), device=args.device
     )
 
 

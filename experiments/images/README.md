@@ -3,6 +3,18 @@
 These experiments integrate Karras et al. (2022) CIFAR-10 and FFHQ checkpoints with
 `TargetTransition`, then extend the same workflow to multi-GPU sweeps and SD3.5.
 
+Install the image dependencies and download the tested NVlabs/edm revision into
+the repository's `edm/` directory:
+
+```bash
+pip install -e '.[edm]' && specdiff-download-edm
+# Or use .[all] to include every optional dependency:
+pip install -e '.[all]' && specdiff-download-edm
+```
+
+`run_edm.py` uses that checkout by default. Pass `--edm-repo` only to use a
+different location.
+
 **Pixel space (EDM)**
 
 | file | purpose |
@@ -51,14 +63,14 @@ python experiments/images/run_edm.py --toy --rule d-grs --branching 2 --lookahea
 The toy configuration requires no checkpoint or GPU. For a pretrained checkpoint:
 
 ```bash
-python experiments/images/run_edm.py --network /path/edm-cifar10-32x32-uncond-vp.pkl --edm-repo /path/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/cifar10-dgrs
+python experiments/images/run_edm.py --network /path/edm-cifar10-32x32-uncond-vp.pkl --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/cifar10-dgrs
 ```
 
 For FFHQ, change `--network`; resolution and channel count are read from the
 checkpoint:
 
 ```bash
-python experiments/images/run_edm.py --network /path/edm-ffhq-64x64-uncond-vp.pkl --edm-repo /path/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/ffhq-dgrs
+python experiments/images/run_edm.py --network /path/edm-ffhq-64x64-uncond-vp.pkl --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/ffhq-dgrs
 ```
 
 `--rule target` is the baseline: `speedup` 1.0, one target call per step, and
@@ -71,7 +83,7 @@ contiguous quarter of the images, writes its own `shard_XXX.pt`, and rank 0
 merges them into one `samples.pt`.
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network /path/edm-cifar10-32x32-cond-vp.pkl --edm-repo /path/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.25 --sample-batch 285 --out results/edm/dgrs
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network /path/edm-cifar10-32x32-cond-vp.pkl --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.25 --sample-batch 285 --out results/edm/dgrs
 ```
 
 The sharding workflow provides two guarantees. **Compatible shards are reused**, so a crashed run
@@ -89,7 +101,7 @@ has no MPS `c10d::barrier`).
 ## The sweep
 
 ```bash
-NETWORK=/path/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=/path/edm GPUS=0,1,2,3 bash experiments/images/sweep.sh
+NETWORK=/path/edm-cifar10-32x32-cond-vp.pkl GPUS=0,1,2,3 bash experiments/images/sweep.sh
 ```
 
 Every `(K, L, rule)` cell whose `samples.pt` and `meta.json` both exist is

@@ -5,6 +5,9 @@ description = "Speculative diffusion sampling over arbitrary draft trees"
 requires-python = ">=3.9"
 dependencies = []
 
+[project.scripts]
+specdiff-download-edm = "specdiff.edm_checkout:main"
+
 [project.optional-dependencies]
 # The library core imports nothing outside the standard library: you choose a
 # backend. These extras are the things built *on* it.

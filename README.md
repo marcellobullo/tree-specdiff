@@ -47,11 +47,25 @@ To install all optional dependencies, including tests, plotting, and image exper
 pip install -e '.[all]'
 ```
 
+The EDM image experiments also require the source modules from `NVlabs/edm`.
+After installing either the `edm` or `all` extra, download the tested revision
+into this checkout's `edm/` directory:
+
+```bash
+pip install -e '.[edm]' && specdiff-download-edm
+# Or install every optional dependency:
+pip install -e '.[all]' && specdiff-download-edm
+```
+
+The upstream repository is not an installable Python package, so pip cannot
+resolve it as an optional dependency. The downloader is idempotent and reuses
+an existing valid `edm/` checkout.
+
 | extra | |
 | --- | --- |
 | `dev` | tests, plus the plotting stack — enough for the whole GM experiment |
 | `plots` | `matplotlib`, `pandas`, `seaborn` — plotting only |
-| `edm` | pretrained EDM checkpoints and multi-GPU sharding, see [experiments/images/](experiments/images/README.md) |
+| `edm` | dependencies and checkout command for pretrained EDM experiments and multi-GPU sharding |
 | `all` | everything above |
 
 The core library depends only on the Python standard library. Select an array backend with

@@ -25,8 +25,8 @@ Fixed by the protocol:
 
 ```bash
 pip install -e '.[all]'
-git clone https://github.com/NVlabs/edm.git ~/edm
-curl -L -o ~/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+specdiff-download-edm
+curl -L -o edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
 ```
 
 Check GPU availability. Wall-clock time is limited by the slowest rank:
@@ -42,7 +42,7 @@ nvidia-smi --query-gpu=index,memory.free,memory.total --format=csv
 GPU idles between launches. Probe it:
 
 ```bash
-python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.5 --sample-batch 64 --device cuda:4 --out /tmp/probe
+python experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.5 --sample-batch 64 --device cuda:4 --out /tmp/probe
 ```
 
 Read the `memory:` line in the banner and the `img/s` in the progress line.
@@ -59,19 +59,19 @@ arm then conditions on **identical** classes and the FIDs are paired.
 **Baseline** — this is the reference FID the speculative arms must match:
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --rule target --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 256 --out results/cifar10-cond/plain-target
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --rule target --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 256 --out results/cifar10-cond/plain-target
 ```
 
 **D-GRS** (the tree):
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 64 --out results/cifar10-cond/K2_L3/d-grs
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 64 --out results/cifar10-cond/K2_L3/d-grs
 ```
 
 **RMC** (the chain, verification-matched to that tree):
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --rule rmc --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 64 --out results/cifar10-cond/K2_L3/rmc
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --rule rmc --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 64 --out results/cifar10-cond/K2_L3/rmc
 ```
 
 Note rmc takes the *same* `--branching 2 --lookahead 3`: it has no tree of its
@@ -114,7 +114,7 @@ numbers, is what that invalidates.
 To run the full grid:
 
 ```bash
-NETWORK=~/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,4,5,7 EPS=0.5 NUM_SAMPLES=50000 bash experiments/images/sweep.sh
+NETWORK=edm/edm-cifar10-32x32-cond-vp.pkl GPUS=0,4,5,7 EPS=0.5 NUM_SAMPLES=50000 bash experiments/images/sweep.sh
 ```
 
 It runs the baseline first, then every `(K, L)` cell for both rules, sizes

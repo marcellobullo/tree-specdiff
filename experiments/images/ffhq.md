@@ -26,8 +26,8 @@ the CIFAR-10 file. Read that one first.
 
 ```bash
 pip install -e '.[all]'
-git clone https://github.com/NVlabs/edm.git ~/edm
-curl -L -o ~/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
+specdiff-download-edm
+curl -L -o edm/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
 ```
 
 Plus the real set, as a directory or zip of 64×64 images — call it
@@ -40,7 +40,7 @@ costs roughly four times as much. Expect the batch that fits to be around a
 quarter of the CIFAR-10 batch size. Measure memory use with a short run:
 
 ```bash
-python experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 128 --num-steps 100 --eps 0.5 --sample-batch 16 --device cuda:4 --out /tmp/probe-ffhq
+python experiments/images/run_edm.py --network edm/edm-ffhq-64x64-uncond-vp.pkl --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 128 --num-steps 100 --eps 0.5 --sample-batch 16 --device cuda:4 --out /tmp/probe-ffhq
 ```
 
 Read the `memory:` line and the `img/s`, then adjust. `--forward-batch` caps
@@ -50,15 +50,15 @@ here than at 32×32.
 ## 2. Generate the three arms
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --rule target --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 64 --out results/ffhq/plain-target
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network edm/edm-ffhq-64x64-uncond-vp.pkl --rule target --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 64 --out results/ffhq/plain-target
 ```
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 16 --out results/ffhq/K2_L3/d-grs
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network edm/edm-ffhq-64x64-uncond-vp.pkl --rule d-grs --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 16 --out results/ffhq/K2_L3/d-grs
 ```
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network ~/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/edm --rule rmc --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 16 --out results/ffhq/K2_L3/rmc
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,4,5,7 experiments/images/run_edm.py --network edm/edm-ffhq-64x64-uncond-vp.pkl --rule rmc --branching 2 --lookahead 3 --num-samples 50000 --num-steps 100 --eps 0.5 --seed 0 --sample-batch 16 --out results/ffhq/K2_L3/rmc
 ```
 
 Use the same `eps` and `--seed` for all three arms.
@@ -88,7 +88,7 @@ texture at thumbnail size.
 ## Sweeping
 
 ```bash
-NETWORK=~/edm-ffhq-64x64-uncond-vp.pkl EDM_REPO=~/edm DATASET=ffhq DATA=~/ffhq-64x64.zip GPUS=0,4,5,7 EPS=0.5 NUM_SAMPLES=50000 NODE_BUDGET=500 bash experiments/images/sweep.sh
+NETWORK=edm/edm-ffhq-64x64-uncond-vp.pkl DATASET=ffhq DATA=~/ffhq-64x64.zip GPUS=0,4,5,7 EPS=0.5 NUM_SAMPLES=50000 NODE_BUDGET=500 bash experiments/images/sweep.sh
 ```
 
 `NODE_BUDGET` is the knob that keeps memory flat across the grid: each cell

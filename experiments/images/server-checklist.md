@@ -33,12 +33,12 @@ Unpickling requires EDM's `torch_utils` and `dnnlib` modules and executes code s
 pickle. Use checkpoints from a trusted source.
 
 ```bash
-git clone https://github.com/NVlabs/edm.git ~/specdiff/edm
-curl -L -o ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+specdiff-download-edm
+curl -L -o edm/edm-cifar10-32x32-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl
 ```
 
 ```bash
-python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule target --num-samples 8 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-target
+python experiments/images/run_edm.py --network edm/edm-cifar10-32x32-uncond-vp.pkl --no-accelerate --rule target --num-samples 8 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-target
 ```
 
 Expect, in order:
@@ -53,7 +53,7 @@ Expect, in order:
 ### 2. Speculation on real weights
 
 ```bash
-python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-dgrs
+python experiments/images/run_edm.py --network edm/edm-cifar10-32x32-uncond-vp.pkl --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-dgrs
 ```
 
 Expect `speedup > 1`, an `acceptance_rate` strictly between 0 and 1, and
@@ -65,14 +65,14 @@ Then the rmc arm, which should report `"match": "verification"` and
 `"chain_depth": 7` for these `(K, L)`:
 
 ```bash
-python experiments/images/run_edm.py --network ~/edm-cifar10-32x32-uncond-vp.pkl --edm-repo ~/edm --no-accelerate --rule rmc --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-rmc
+python experiments/images/run_edm.py --network edm/edm-cifar10-32x32-uncond-vp.pkl --no-accelerate --rule rmc --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-rmc
 ```
 
 ### 3. FFHQ checkpoint metadata
 
 ```bash
-curl -L -o ~/specdiff/edm/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
-python experiments/images/run_edm.py --network ~/specdiff/edm/edm-ffhq-64x64-uncond-vp.pkl --edm-repo ~/specdiff/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 16 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-ffhq
+curl -L -o edm/edm-ffhq-64x64-uncond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
+python experiments/images/run_edm.py --network edm/edm-ffhq-64x64-uncond-vp.pkl --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 16 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-ffhq
 ```
 
 Expect `(3, 64, 64)` in the banner with no other flag changed, and faces in
@@ -83,15 +83,15 @@ Expect `(3, 64, 64)` in the banner with no other flag changed, and faces in
 Use this check to validate one-hot conditioning with a pretrained `EDMPrecond`.
 
 ```bash
-curl -L -o ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
-python experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/specdiff/edm --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-cond
+curl -L -o edm/edm-cifar10-32x32-cond-vp.pkl https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+python experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --no-accelerate --rule d-grs --branching 2 --lookahead 3 --num-samples 64 --num-steps 100 --eps 0.25 --device cuda:0 --out results/edm/smoke-cond
 ```
 
 Expect `labels: uniform over 10 classes` and `"conditional": true`. Sanity
 check the guard too — this must be **refused**, not silently sampled:
 
 ```bash
-python experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/edm --no-accelerate --labels none --rule d-grs --num-samples 4 --num-steps 100 --out results/edm/should-fail
+python experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --no-accelerate --labels none --rule d-grs --num-samples 4 --num-steps 100 --out results/edm/should-fail
 ```
 
 For an additional conditioning check, generate with `--labels 3` and confirm
@@ -102,7 +102,7 @@ that the grid contains a single visible class.
 Use this check to validate NCCL, `--multi_gpu`, and per-rank CUDA placement.
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network ~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl --edm-repo ~/specdiff/edm --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.25 --sample-batch 64 --out results/edm/smoke-4gpu
+accelerate launch --multi_gpu --num_processes 4 --gpu_ids 0,1,2,3 experiments/images/run_edm.py --network edm/edm-cifar10-32x32-cond-vp.pkl --rule d-grs --branching 2 --lookahead 3 --num-samples 256 --num-steps 100 --eps 0.25 --sample-batch 64 --out results/edm/smoke-4gpu
 ```
 
 Expect four `rank N: images a..b` lines covering `0..255` with no gaps or
@@ -120,7 +120,7 @@ Start with a small sweep to validate GPU discovery and the nested
 `accelerate launch --multi_gpu` command:
 
 ```bash
-NETWORK=~/specdiff/edm/edm-cifar10-32x32-cond-vp.pkl EDM_REPO=~/edm GPUS=0,1,2,3 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
+NETWORK=edm/edm-cifar10-32x32-cond-vp.pkl GPUS=0,1,2,3 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
 ```
 
 Expect a per-cell `|I|` table, the plain-target baseline first, then each cell.

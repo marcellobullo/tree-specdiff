@@ -19,7 +19,7 @@ set -euo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 NETWORK="${NETWORK:?set NETWORK to a pretrained EDM .pkl}"
-EDM_REPO="${EDM_REPO:?set EDM_REPO to a NVlabs/edm checkout}"
+EDM_REPO="${EDM_REPO:-$REPO/edm}"
 DATASET="${DATASET:-cifar10}"          # cifar10 | ffhq  -- scoring only
 DATA="${DATA:-}"                       # ffhq: image dir or zip for the real set
 
