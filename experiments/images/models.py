@@ -399,6 +399,18 @@ def build(
     class_labels: Optional[torch.Tensor] = None,
 ) -> Setting:
     """Assemble the target, the schedule, and the deterministic-endpoint bookkeeping."""
+    if s_noise <= 0.0:
+        # Caught here rather than left to the bookkeeping below, which would
+        # mislead. At s_noise=0 every std is zero, `leading` walks the whole
+        # grid, and the run dies naming *eps* -- which was fine. Negative values
+        # are worse: nothing is exactly zero, so the endpoints look normal and a
+        # negative std reaches TabulatedSchedule, to be refused rounds later,
+        # after the checkpoint has loaded and generation has started.
+        raise ValueError(
+            f"s_noise must be > 0; got {s_noise}. It scales the transition std, "
+            "so s_noise=0 makes every step deterministic and a negative value "
+            "is not a std. To turn churn off, use eps=0."
+        )
     sigmas = sigma_grid(num_steps, shift)
     std = churn_std_grid(sigmas, eps, s_noise=s_noise)
     zero = tuple(int(n) for n in torch.nonzero(std == 0.0).flatten())

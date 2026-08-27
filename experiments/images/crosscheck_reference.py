@@ -81,6 +81,9 @@ def main(argv=None) -> int:
     # sigma or the two are not comparable.
     v_at = mine.velocity(x, grid[steps].float())
     m_ref, s_ref = ref_sched.kernel_params(x, v_at, steps, eps=eps)
+    # At s_noise = 1 throughout, deliberately: the reference's kernel_params
+    # takes eps alone, so a non-default s_noise would have nothing on the other
+    # side to compare with -- it would test the multiplication against itself.
     target = models.ChurnKernelTarget(mine, grid, eps)
     m_mine, s_mine = target.kernel(x, tuple(int(i) for i in steps))
     results["kernel mean"] = (m_ref - m_mine).abs().max().item()

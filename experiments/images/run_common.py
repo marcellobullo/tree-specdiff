@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import math
@@ -10,7 +11,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -171,16 +172,328 @@ def load_sampler_config(path: Optional[str]) -> dict:
     return config
 
 
+# ------------------------------------------------------------------ run config
+# The file is the run signature's input surface and nothing else. `run_signature`
+# below already draws that line with its `ignored` set -- which is exactly "two
+# runs differing only here produce identical samples" -- so a parameter's
+# `where` and its presence in the signature are the same fact, not two facts
+# kept in step by hand. A test pins them together.
+# Display and placement choices, not protocol: two runs that differ only here
+# produce identical samples, so a shard from one is reusable by the other.
+# "progress" belongs on this list for the same reason "device" does. The four
+# config-layer names are where settings came from and what to print, not what to
+# sample; `sampler_config` and `config` are paths, and what matters is the
+# resolved values they produced, which are in `vars(args)` already.
+#
+# This set and each driver's `where="cli"` parameters are the same fact stated
+# twice, and a test holds them together.
+IGNORED_IN_SIGNATURE = frozenset({
+    "out", "device", "cpu", "no_accelerate", "overwrite", "check_contract",
+    "progress", "config", "print_config", "config_provenance",
+    "sampler_config", "print_sampler_config",
+})
+
+CONFIG_VERSION = 1
+SECTIONS = ("model", "schedule", "method", "sampling", "conditioning",
+            "execution", "sampler")
+
+
+class Param(NamedTuple):
+    """One knob, described once, for every consumer that needs to know it.
+
+    Feeds argparse construction, help text, config validation, the
+    defaults/file/CLI merge, template generation, and `meta.json`. There is no
+    second copy of a default anywhere.
+
+    ``where`` is the whole schema. ``"config"`` means the value changes the
+    samples, so it belongs in the file *and* in the run signature. ``"cli"``
+    means it is placement -- where the run lands, what it prints, which device
+    it uses -- so it stays on the command line and out of both.
+    """
+
+    name: str                 # argparse dest and config key: "num_steps"
+    section: str              # one of SECTIONS; "" when where == "cli"
+    default: Any
+    kind: type                # bool | int | float | str
+    help: str = ""
+    choices: Tuple = ()
+    check: Optional[Callable[[str, Any], None]] = None
+    where: str = "config"
+    required: bool = False
+
+
+def positive(name: str, value: Any) -> None:
+    if not value > 0:
+        raise SystemExit(f"{name} must be > 0; got {value}")
+
+
+def non_negative(name: str, value: Any) -> None:
+    if value < 0:
+        raise SystemExit(f"{name} must be >= 0; got {value}")
+
+
+def at_least_one(name: str, value: Any) -> None:
+    if value < 1:
+        raise SystemExit(f"{name} must be >= 1; got {value}")
+
+
+def check_value(param: Param, value: Any, *, origin: str) -> Any:
+    """Type- and range-check one resolved value, whichever layer it came from.
+
+    Runs on the *resolved* record rather than only on the file, so a bad command
+    line and a bad config give the same message.
+    """
+    if value is None:
+        if param.default is None:
+            return None
+        raise SystemExit(f"{origin}: {param.name} may not be null")
+    if param.kind is bool:
+        # bool before int: `True` is an int in Python, but `1` is not a bool,
+        # and a config that accepted 1 would be accepting a typo.
+        if not isinstance(value, bool):
+            raise SystemExit(
+                f"{origin}: {param.name} must be true or false; got {value!r}")
+    elif param.kind is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SystemExit(
+                f"{origin}: {param.name} must be a whole number; got {value!r}")
+    elif param.kind is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise SystemExit(
+                f"{origin}: {param.name} must be a number; got {value!r}")
+        value = float(value)          # what `type=float` does for `--eps 1`
+    elif param.kind is str and not isinstance(value, str):
+        raise SystemExit(f"{origin}: {param.name} must be a string; got {value!r}")
+    if param.choices and value not in param.choices:
+        raise SystemExit(
+            f"{origin}: {param.name} must be one of {list(param.choices)}; "
+            f"got {value!r}")
+    if param.check is not None:
+        param.check(param.name, value)
+    return value
+
+
+def defaults(params: Sequence[Param]) -> dict:
+    return {p.name: p.default for p in params if p.where == "config"}
+
+
+def add_arguments(parser: argparse.ArgumentParser, params: Sequence[Param]) -> None:
+    """Register every parameter, with no default held by argparse.
+
+    Config parameters get ``argparse.SUPPRESS``, so the parsed namespace carries
+    only what the user actually typed -- which is the one thing argparse cannot
+    otherwise tell us, and the thing the merge depends on. ``--eps 0.25`` must
+    beat a config file even though 0.25 is also the default.
+    """
+    for p in params:
+        flag = "--" + p.name.replace("_", "-")
+        kw: dict = {}
+        if p.kind is bool:
+            if p.where == "config":
+                # SUPPRESS would make store_true one-way: a file setting it true
+                # could never be overridden back on the command line.
+                kw["action"] = argparse.BooleanOptionalAction
+            else:
+                kw["action"] = "store_true"
+        else:
+            kw["type"] = p.kind
+            if p.choices:
+                kw["choices"] = p.choices
+        if p.where == "config":
+            kw["default"] = argparse.SUPPRESS
+            shown = f"(default: {json.dumps(p.default)})"
+            kw["help"] = f"{p.help} {shown}" if p.help else shown
+        else:
+            if kw.get("action") != "store_true":
+                kw["default"] = p.default
+            if p.help:
+                kw["help"] = p.help
+        if p.required:
+            kw["required"] = True
+        parser.add_argument(flag, **kw)
+
+
+def _sampler_section(body: Any, *, origin: str) -> dict:
+    """Validate a `sampler` block against the options the sampler actually has."""
+    if not isinstance(body, dict):
+        raise SystemExit(
+            f'{origin}: section "sampler" must be a JSON object, '
+            f"got {type(body).__name__}")
+    unknown = sorted(set(body) - set(SAMPLER_OPTIONS))
+    if unknown:
+        raise SystemExit(
+            f"{origin}: unknown sampler option(s): {', '.join(unknown)}. "
+            f"Known options are {', '.join(SAMPLER_OPTIONS)}")
+    return {k: _check_option(k, v) for k, v in body.items()}
+
+
+def load_run_config(path: Optional[str], params: Sequence[Param], *,
+                    driver: str) -> Tuple[dict, dict]:
+    """Read a run config into ``(flat driver values, sampler values)``.
+
+    Both are the file's *subset* -- absent keys stay absent, so the merge can
+    tell "the file said so" from "nobody said so". :func:`resolve` is what fills
+    in the rest.
+    """
+    if path is None:
+        return {}, {}
+    file = Path(path)
+    if not file.is_file():
+        raise SystemExit(f"--config: no such file: {file}")
+    try:
+        raw = json.loads(file.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{file}: not valid JSON ({exc})") from None
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            f"{file}: expected a JSON object with sections "
+            f"{', '.join(SECTIONS)}; got {type(raw).__name__}")
+    raw = dict(raw)
+
+    version = raw.pop("version", None)
+    if version is None:
+        raise SystemExit(
+            f'{file}: no "version": a run config must declare the schema it was '
+            f"written against. The current schema is {CONFIG_VERSION}, and "
+            "--print-config emits a complete file")
+    if version != CONFIG_VERSION:
+        raise SystemExit(
+            f"{file}: config schema version {version}, this driver reads "
+            f"{CONFIG_VERSION}")
+    named = raw.pop("driver", None)
+    if named != driver:
+        raise SystemExit(
+            f'{file}: driver {named!r}, but this is the {driver!r} driver. The '
+            "drivers have different parameters and different defaults, so a "
+            "config file is written for one of them")
+
+    sampler = _sampler_section(raw.pop("sampler"), origin=str(file)) \
+        if "sampler" in raw else {}
+
+    unknown = [s for s in raw if s not in SECTIONS]
+    if unknown:
+        raise SystemExit(
+            f"{file}: unknown section(s): {', '.join(sorted(unknown))}. "
+            f"Known sections are {', '.join(SECTIONS)}")
+
+    spec = {p.name: p for p in params}
+    homes = {p.name: p.section for p in params if p.where == "config"}
+    cli_only = {p.name for p in params if p.where == "cli"}
+    values: dict = {}
+    for section, body in raw.items():
+        if not isinstance(body, dict):
+            raise SystemExit(
+                f'{file}: section "{section}" must be a JSON object, '
+                f"got {type(body).__name__}")
+        for key, value in body.items():
+            if key in homes and homes[key] != section:
+                raise SystemExit(
+                    f'{file}: "{key}" is in section "{section}", but it belongs '
+                    f'in "{homes[key]}"')
+            if key in cli_only:
+                raise SystemExit(
+                    f'{file}: "{key}" is not a run-configuration option: it is '
+                    "placement, not protocol. It does not change the samples, "
+                    "so it stays on the command line and out of the run "
+                    "signature")
+            if key not in homes:
+                here = sorted(n for n, sec in homes.items() if sec == section)
+                raise SystemExit(
+                    f'{file}: unknown option "{key}" in section "{section}". '
+                    f"Known options there are {', '.join(here)}. A key that is "
+                    "read and then ignored is worse than no config file at all, "
+                    "so this is an error and not a warning")
+            values[key] = check_value(spec[key], value, origin=str(file))
+    return values, sampler
+
+
+def resolve(params: Sequence[Param], *, file_values: Mapping[str, Any],
+            cli_values: Mapping[str, Any]) -> Tuple[dict, dict]:
+    """``defaults <- file <- explicit command line``, validated as one record."""
+    merged = defaults(params)
+    provenance = {name: "default" for name in merged}
+    for source, layer in (("file", file_values), ("cli", cli_values)):
+        for name, value in layer.items():
+            merged[name], provenance[name] = value, source
+    spec = {p.name: p for p in params}
+    origins = {"default": "default", "file": "config", "cli": "command line"}
+    resolved = {
+        name: check_value(spec[name], value, origin=origins[provenance[name]])
+        for name, value in merged.items()
+    }
+    return resolved, provenance
+
+
+def sectioned(flat: Mapping[str, Any], params: Sequence[Param], *, driver: str,
+              sampler: Optional[Mapping[str, Any]] = None) -> dict:
+    """The flat record, grouped back into the shape the file is written in."""
+    homes = {p.name: p.section for p in params if p.where == "config"}
+    out: dict = {"version": CONFIG_VERSION, "driver": driver}
+    for section in SECTIONS:
+        if section == "sampler":
+            body = dict(sampler) if sampler else {}
+        else:
+            body = {n: flat[n] for n in sorted(homes)
+                    if homes[n] == section and n in flat}
+        if body:
+            out[section] = body
+    return out
+
+
+def print_config_template(params: Sequence[Param], *, driver: str) -> None:
+    """Write a complete run config -- every option at its default.
+
+    Generated rather than checked in, for the same reason
+    :func:`print_sampler_template` is: a file produced this way lists every
+    option that exists now, not the ones that existed when a template was last
+    remembered.
+    """
+    print(json.dumps(
+        sectioned(defaults(params), params, driver=driver,
+                  sampler=sampler_defaults()),
+        indent=2, sort_keys=True))
+
+
+def apply_config(args: argparse.Namespace, params: Sequence[Param], *,
+                 driver: str) -> argparse.Namespace:
+    """Resolve every parameter onto ``args`` and record where each came from.
+
+    Called at the end of ``parse_args``, so nothing downstream ever sees a
+    half-resolved namespace: `run_signature` reads the settings actually in
+    force straight out of ``vars(args)``.
+    """
+    spec = {p.name: p for p in params}
+    typed = {k: v for k, v in vars(args).items()
+             if k in spec and spec[k].where == "config"}
+    file_values, sampler_subset = load_run_config(
+        getattr(args, "config", None), params, driver=driver)
+
+    resolved, provenance = resolve(
+        params, file_values=file_values, cli_values=typed)
+    for name, value in resolved.items():
+        setattr(args, name, value)
+    args.config_provenance = provenance
+
+    path = getattr(args, "sampler_config", None)
+    if path is not None:
+        args.sampler = load_sampler_config(path)
+    else:
+        sampler = sampler_defaults()
+        sampler.update(sampler_subset)
+        args.sampler = sampler
+
+    # An unresolved parameter would reach the run as whatever argparse left
+    # behind -- or as nothing at all -- and land in the signature either way.
+    missing = sorted({p.name for p in params} - set(vars(args)))
+    if missing:
+        raise SystemExit(f"internal: parameters never resolved: {missing}")
+    return args
+
+
 def run_signature(driver: str, args, setting, tree, *, extra: Mapping[str, Any]) -> dict:
     """Versioned signature for deciding whether a shard is safe to resume."""
-    # Display and placement choices, not protocol: two runs that differ only
-    # here produce identical samples, so a shard from one is reusable by the
-    # other. "progress" belongs on this list for the same reason "device" does.
-    # `sampler_config` is a path; what matters is the resolved `sampler` dict
-    # it produced, which is already in `vars(args)` and is what gets recorded.
-    ignored = {"out", "device", "cpu", "no_accelerate", "overwrite",
-               "check_contract", "progress", "sampler_config"}
-    config = {k: _plain(v) for k, v in vars(args).items() if k not in ignored}
+    config = {k: _plain(v) for k, v in vars(args).items()
+              if k not in IGNORED_IN_SIGNATURE}
     return {
         "version": SIGNATURE_VERSION,
         "driver": driver,
@@ -237,13 +550,43 @@ def summarise_metrics(total: Mapping[str, Any]) -> dict:
     }
 
 
+def signature_difference(theirs: Any, ours: Mapping[str, Any]) -> str:
+    """Which settings two run signatures disagree about, in words.
+
+    "incompatible (run_signature)" is true and unhelpful: the signature is a
+    record of twenty-odd settings and the answer is nearly always one of them.
+    Nested records -- the config, and the checkpoint and checkout identities --
+    are opened one level, because "extra differs" is the same non-answer.
+    """
+    if not isinstance(theirs, Mapping):
+        return "run_signature (the shard carries none)"
+    named = []
+    for key in sorted(set(theirs) | set(ours)):
+        mine, yours = theirs.get(key), ours.get(key)
+        if mine == yours:
+            continue
+        if isinstance(mine, Mapping) and isinstance(yours, Mapping):
+            named += [
+                f"{key}.{sub} (shard {mine.get(sub, '<absent>')!r}, "
+                f"this run {yours.get(sub, '<absent>')!r})"
+                for sub in sorted(set(mine) | set(yours))
+                if mine.get(sub) != yours.get(sub)
+            ]
+        else:
+            named.append(key)
+    return "run_signature: " + "; ".join(named) if named else "run_signature"
+
+
 def validate_reusable_shard(
     path: Path, *, signature: Mapping[str, Any], rank: int, start: int, count: int
 ):
     """Load a shard only if it is exactly the block this invocation expects."""
     part = torch.load(path, map_location="cpu", weights_only=True)
     expected = {"run_signature": signature, "rank": rank, "start": start, "count": count}
-    mismatches = [key for key, value in expected.items() if part.get(key) != value]
+    mismatches = [
+        signature_difference(part.get(key), value) if key == "run_signature" else key
+        for key, value in expected.items() if part.get(key) != value
+    ]
     samples = part.get("samples")
     if not isinstance(samples, torch.Tensor) or int(samples.shape[0]) != count:
         mismatches.append("samples")
@@ -279,7 +622,9 @@ def load_shards(
     cursor = 0
     for rank, part in enumerate(parts):
         if part.get("run_signature") != signature:
-            raise SystemExit(f"{shards[rank]}: run signature does not match this invocation")
+            raise SystemExit(
+                f"{shards[rank]}: does not match this invocation -- "
+                + signature_difference(part.get("run_signature"), signature))
         if part.get("rank") != rank or part.get("start") != cursor:
             raise SystemExit(f"{out}: shards are not contiguous and rank ordered")
         count = int(part.get("count", -1))

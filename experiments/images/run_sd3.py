@@ -63,87 +63,111 @@ from specdiff import (  # noqa: E402
 
 from images import sd3_models as sd3  # noqa: E402
 from images.run_common import (  # noqa: E402
-    add_metrics, file_identity, load_sampler_config, load_shards,
-    merged_metrics, metric_totals, run_signature, print_sampler_template, save_grid,
-    summarise_metrics, validate_reusable_shard,
+    Param, add_arguments, add_metrics, apply_config, at_least_one,
+    file_identity, load_shards, merged_metrics, metric_totals, non_negative,
+    positive, print_config_template, print_sampler_template, run_signature,
+    save_grid, summarise_metrics, validate_reusable_shard,
 )
 
 REPORT_EVERY_S = 60.0
 DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
 
+# The mirror of run_edm.py's PARAMS; a test pins the shared names to the same
+# section, kind and `where`, and the deliberate default differences to an
+# explicit list. `where="cli"` is placement and is exactly what run_signature
+# ignores.
+PARAMS = (
+    Param("network", "model", "stabilityai/stable-diffusion-3.5-medium", str,
+          help="hub id or a local diffusers directory"),
+    Param("toy", "model", False, bool,
+          help="closed-form stand-in pipeline; no download, runs on CPU"),
+    Param("toy_resolution", "model", 64, int, check=at_least_one),
+    Param("resolution_px", "model", 512, int, check=at_least_one),
+    Param("dtype", "model", "bfloat16", str, choices=tuple(sorted(DTYPES)),
+          help="transformer/VAE dtype; the coupling math stays float32"),
+
+    Param("num_steps", "schedule", 28, int, help="the horizon T",
+          check=at_least_one),
+    Param("eps", "schedule", 0.25, float, help="churn", check=non_negative),
+    Param("s_noise", "schedule", 1.0, float, check=positive,
+          help="EDM's S_noise: scales the transition std and not the churn "
+               "mean, so it is not a reparameterisation of --eps"),
+    Param("shift", "schedule", sd3.DEFAULT_SHIFT, float, check=positive,
+          help="timestep shift; SD3.5 ships 3.0"),
+
+    Param("rule", "method", "d-grs", str, choices=("d-grs", "rmc", "target")),
+    Param("branching", "method", 2, int, help="K", check=at_least_one),
+    Param("lookahead", "method", 3, int, help="L", check=at_least_one),
+    Param("match", "method", "verification", str,
+          choices=("verification", "budget"),
+          help="how an rmc chain is sized against the (K, L) tree"),
+
+    Param("seed", "sampling", 0, int),
+    Param("num_samples", "sampling", 256, int, check=at_least_one),
+    Param("sample_batch", "sampling", 0, int, check=non_negative,
+          help="0 = all at once"),
+
+    Param("prompt", "conditioning", "a photo of a cat", str,
+          help="one caption for the whole run"),
+    Param("prompts", "conditioning", None, str,
+          help="file of captions, one per line. Image i uses line i at "
+               "seed (--seed + i). Overrides --prompt"),
+    Param("negative_prompt", "conditioning", "", str,
+          help="used only when --guidance-scale > 1"),
+    Param("guidance_scale", "conditioning", 7.0, float,
+          help=">1 enables CFG, which doubles every forward"),
+
+    Param("forward_batch", "execution", 0, int, check=non_negative,
+          help="latents per transformer forward (0 = the whole tree in "
+               "one call). Exact -- same RNG, accept/reject and NFE -- "
+               "but not bit-reproducible across values, so keep it "
+               "fixed across a comparison set"),
+    Param("encode_batch", "execution", 16, int,
+          help="captions encoded per text-encoder call"),
+    Param("decode_batch", "execution", 8, int, check=at_least_one,
+          help="latents VAE-decoded per call; the decode peaks higher "
+               "than the transformer at 1024px"),
+    Param("keep_text_encoders", "execution", False, bool,
+          help="keep the text towers resident after pre-encoding. They "
+               "are 11.2 of 16.3 GiB and never called again"),
+
+    Param("out", "", None, str, where="cli", required=True),
+    Param("device", "", None, str, where="cli",
+          help="default: cuda:0 when one is visible, else cpu. Ignored "
+               "under `accelerate launch`, which assigns per rank"),
+    Param("cpu", "", False, bool, where="cli",
+          help="force CPU even when an accelerator is visible"),
+    Param("no_accelerate", "", False, bool, where="cli"),
+    Param("overwrite", "", False, bool, where="cli",
+          help="regenerate shards that already exist"),
+    Param("check_contract", "", False, bool, where="cli"),
+    Param("print_sampler_config", "", False, bool, where="cli",
+          help="write a complete sampler config (every option at its "
+               "default) to stdout and exit"),
+)
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--network", default="stabilityai/stable-diffusion-3.5-medium",
-                   help="hub id or a local diffusers directory")
-    p.add_argument("--toy", action="store_true",
-                   help="closed-form stand-in pipeline; no download, runs on CPU")
-    p.add_argument("--toy-resolution", type=int, default=64)
-    p.add_argument("--out", required=True)
-    p.add_argument("--device", default=None,
-                   help="default: cuda:0 when one is visible, else cpu. Ignored "
-                        "under `accelerate launch`, which assigns per rank")
-    p.add_argument("--cpu", action="store_true",
-                   help="force CPU even when an accelerator is visible")
-    p.add_argument("--no-accelerate", action="store_true")
-    p.add_argument("--overwrite", action="store_true",
-                   help="regenerate shards that already exist")
-    p.add_argument("--seed", type=int, default=0)
-    # what to sample
-    p.add_argument("--num-samples", type=int, default=256)
-    p.add_argument("--sample-batch", type=int, default=0, help="0 = all at once")
-    p.add_argument("--num-steps", type=int, default=28, help="the horizon T")
-    p.add_argument("--eps", type=float, default=0.25, help="churn")
-    p.add_argument("--rule", default="d-grs", choices=("d-grs", "rmc", "target"))
-    p.add_argument("--branching", type=int, default=2, help="K")
-    p.add_argument("--lookahead", type=int, default=3, help="L")
-    p.add_argument("--match", default="verification", choices=("verification", "budget"),
-                   help="how an rmc chain is sized against the (K, L) tree")
-    p.add_argument("--shift", type=float, default=sd3.DEFAULT_SHIFT,
-                   help="timestep shift; SD3.5 ships 3.0")
-    p.add_argument("--forward-batch", type=int, default=0,
-                   help="latents per transformer forward (0 = the whole tree in "
-                        "one call). Exact -- same RNG, accept/reject and NFE -- "
-                        "but not bit-reproducible across values, so keep it "
-                        "fixed across a comparison set")
-    # conditioning
-    p.add_argument("--prompt", default="a photo of a cat",
-                   help="one caption for the whole run")
-    p.add_argument("--prompts", default=None,
-                   help="file of captions, one per line. Image i uses line i at "
-                        "seed (--seed + i). Overrides --prompt")
-    p.add_argument("--negative-prompt", default="",
-                   help="used only when --guidance-scale > 1")
-    p.add_argument("--guidance-scale", type=float, default=7.0,
-                   help=">1 enables CFG, which doubles every forward")
-    p.add_argument("--resolution-px", type=int, default=512)
-    p.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES),
-                   help="transformer/VAE dtype; the coupling math stays float32")
-    p.add_argument("--encode-batch", type=int, default=16,
-                   help="captions encoded per text-encoder call")
-    p.add_argument("--keep-text-encoders", action="store_true",
-                   help="keep the text towers resident after pre-encoding. They "
-                        "are 11.2 of 16.3 GiB and never called again")
-    p.add_argument("--decode-batch", type=int, default=8,
-                   help="latents VAE-decoded per call; the decode peaks higher "
-                        "than the transformer at 1024px")
-    p.add_argument("--sampler-config",
-                   help="JSON file of sampler options (prefetch, "
-                        "evaluate_leaves). Omitted, the library defaults apply. "
-                        "The resolved options go into meta.json and into the run "
-                        "signature, so a shard cannot be reused by a run under a "
-                        "different policy")
-    p.add_argument("--print-sampler-config", action="store_true",
-                   help="write a complete sampler config (every option at its "
-                        "default) to stdout and exit")
-    p.add_argument("--check-contract", action="store_true")
+    add_arguments(p, PARAMS)
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--config",
+                        help="JSON run configuration; see --print-config. "
+                             "Explicit command-line flags override it")
+    source.add_argument("--sampler-config",
+                        help="JSON file of sampler options alone (prefetch, "
+                             "evaluate_leaves) -- the `sampler` section of "
+                             "--config, which supersedes this")
+    p.add_argument("--print-config", action="store_true",
+                   help="write a complete run configuration (every option at "
+                        "its default) to stdout and exit")
     args = p.parse_args(argv)
     # Resolved here, not in main(), so `args` carries the settings actually in
     # force: run_signature reads them straight out of vars(args).
-    args.sampler = load_sampler_config(args.sampler_config)
-    return args
+    return apply_config(args, PARAMS, driver="sd3")
 
 
 def load_prompts(path: str, num_samples: int) -> list[str]:
@@ -189,6 +213,17 @@ def matched_chain_depth(tree: DraftTree, num_steps: int, match: str) -> int:
     """Depth of the rmc chain matching `tree`; see `run_edm.matched_chain_depth`."""
     depth = tree.budget if match == "budget" else tree.verification_budget()
     return max(1, min(depth, num_steps))
+
+
+def build_setting(args, denoiser) -> sd3.Setting:
+    """The one place the schedule is assembled from the parsed arguments.
+
+    Extracted so a schedule parameter cannot be threaded here and silently
+    defaulted in the tests that rebuild the same object.
+    """
+    return sd3.build(denoiser, num_steps=args.num_steps, eps=args.eps,
+                     shift=args.shift, s_noise=args.s_noise,
+                     forward_batch=args.forward_batch)
 
 
 def build_tree(args, num_steps: int) -> DraftTree:
@@ -363,6 +398,7 @@ def merge_shards(args, setting, tree, denoiser, out, world=None):
         "speculative_steps": setting.num_steps,
         "deterministic_steps": list(setting.deterministic_steps),
         "eps": args.eps,
+        "s_noise": args.s_noise,
         "shift": args.shift,
         "branching": args.branching if args.rule != "target" else 1,
         "lookahead": args.lookahead if args.rule != "target" else 1,
@@ -415,10 +451,9 @@ def main(argv=None) -> None:
     if args.print_sampler_config:
         print_sampler_template()
         return
-    if args.num_samples < 1:
-        raise SystemExit("--num-samples must be >= 1")
-    if args.sample_batch < 0 or args.forward_batch < 0 or args.decode_batch < 1:
-        raise SystemExit("batch sizes must be positive, or zero where documented")
+    if args.print_config:
+        print_config_template(PARAMS, driver="sd3")
+        return
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     if args.device is None:
         args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -442,8 +477,7 @@ def main(argv=None) -> None:
     barrier(accelerator)
 
     denoiser = build_denoiser(args)
-    setting = sd3.build(denoiser, num_steps=args.num_steps, eps=args.eps,
-                        shift=args.shift, forward_batch=args.forward_batch)
+    setting = build_setting(args, denoiser)
     tree = build_tree(args, setting.num_steps)
     sampler = build_sampler(setting, tree, args)
     start, count = shard_bounds(args.num_samples, rank, world)
@@ -453,7 +487,8 @@ def main(argv=None) -> None:
         print(f"{args.rule}: {args.num_samples} samples over {world} process(es), "
               f"{px}px from {setting.state_shape} latents, T={setting.total_steps} "
               f"({setting.num_steps} speculative + "
-              f"{len(setting.deterministic_steps)} Euler), eps={args.eps}")
+              f"{len(setting.deterministic_steps)} Euler), eps={args.eps}"
+              + (f", s_noise={args.s_noise}" if args.s_noise != 1.0 else ""))
         print(f"tree {tree}: proposal budget B={tree.budget}, "
               f"verification budget |I|={tree.verification_budget()} rows per round")
         eff = args.sample_batch or args.num_samples
@@ -489,6 +524,9 @@ if __name__ == "__main__":
     # swallowed by the hard-exit guard below.
     if "--print-sampler-config" in sys.argv[1:]:
         print_sampler_template()
+        raise SystemExit(0)
+    if "--print-config" in sys.argv[1:]:
+        print_config_template(PARAMS, driver="sd3")
         raise SystemExit(0)
     try:
         main()

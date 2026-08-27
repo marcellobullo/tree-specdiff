@@ -20,6 +20,7 @@ Four things can be wrong in the port, and there is one test class for each:
 from __future__ import annotations
 
 import json
+import re
 import math
 import sys
 import time
@@ -199,12 +200,59 @@ class TestSchedule:
         assert torch.equal(a, b)
 
     def test_kernel_std_agrees_with_the_grid(self):
+        """The grid and the kernel compute the same std twice, so they must agree.
+
+        Swept over s_noise because that is where a half-threaded parameter
+        hides: `build` passes it to both, and a version that reached only one
+        would leave the schedule the sampler is handed disagreeing with the
+        kernel it verifies against -- silently, and only away from the default.
+        """
         sigmas = models.sigma_grid(STEPS)
-        grid = models.churn_std_grid(sigmas, EPS)
-        target = models.ChurnKernelTarget(make_denoiser(), sigmas, EPS)
         steps = tuple(range(STEPS))
-        got = target.kernel(torch.zeros((STEPS, 3, 8, 8)), steps)[1]
-        assert torch.allclose(got, grid.float(), atol=1e-7)
+        for s_noise in (0.5, 1.0, 2.0):
+            grid = models.churn_std_grid(sigmas, EPS, s_noise=s_noise)
+            target = models.ChurnKernelTarget(
+                make_denoiser(), sigmas, EPS, s_noise=s_noise)
+            got = target.kernel(torch.zeros((STEPS, 3, 8, 8)), steps)[1]
+            assert torch.allclose(got, grid.float(), atol=1e-7), s_noise
+
+    def test_s_noise_scales_the_std_and_leaves_the_mean_alone(self):
+        """The claim that makes s_noise worth having as its own parameter.
+
+        `eps` moves both halves of the kernel -- it appears squared in the drift
+        correction and linearly in the noise -- so scaling churn with it changes
+        where a step goes as well as how far it scatters. s_noise touches only
+        the second. If it moved the mean too it would be a reparameterisation of
+        `eps` and there would be no reason to expose it.
+        """
+        sigmas = models.sigma_grid(STEPS)
+        denoiser = make_denoiser()
+        x = torch.randn((4, 3, 8, 8), generator=torch.Generator().manual_seed(7))
+        steps = (2, 5, 7, 9)
+
+        one = models.ChurnKernelTarget(denoiser, sigmas, EPS, s_noise=1.0)
+        two = models.ChurnKernelTarget(denoiser, sigmas, EPS, s_noise=2.0)
+        mean_one, std_one = one.kernel(x, steps)
+        mean_two, std_two = two.kernel(x, steps)
+
+        assert torch.equal(mean_one, mean_two)
+        assert torch.allclose(std_two, 2.0 * std_one, atol=1e-7)
+        # ... whereas doubling eps moves both, which is the contrast.
+        loud = models.ChurnKernelTarget(denoiser, sigmas, 2.0 * EPS)
+        assert not torch.allclose(loud.kernel(x, steps)[0], mean_one)
+
+    def test_non_positive_s_noise_is_refused(self):
+        """And refused naming s_noise, not eps.
+
+        Zero leaves every std zero, which the endpoint bookkeeping reads as
+        "no stochastic steps at eps=..." -- true of the arithmetic, wrong about
+        the cause. Negative slips through that bookkeeping entirely and dies
+        rounds later inside the schedule.
+        """
+        for bad in (0.0, -1.0):
+            with pytest.raises(ValueError, match="s_noise must be > 0") as caught:
+                models.build(make_denoiser(), num_steps=STEPS, eps=EPS, s_noise=bad)
+            assert "nothing to speculate" not in str(caught.value)
 
     def test_build_strips_and_reports_the_endpoints(self):
         s = models.build(make_denoiser(), num_steps=STEPS, eps=EPS)
@@ -478,7 +526,7 @@ class TestSharding:
 
         args = self._args(tmp_path, num_samples=4)
         denoiser = run_edm.build_denoiser(args)
-        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        setting = run_edm.build_setting(args, denoiser)
         tree = run_edm.build_tree(args, setting.num_steps)
 
         signature = run_edm.experiment_signature(args, setting, tree, denoiser)
@@ -507,7 +555,7 @@ class TestSharding:
 
         args = self._args(tmp_path, num_samples=9, sample_batch=4)
         denoiser = run_edm.build_denoiser(args)
-        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        setting = run_edm.build_setting(args, denoiser)
         tree = run_edm.build_tree(args, setting.num_steps)
         sampler = run_edm.build_sampler(setting, tree, args)
         mode = run_edm.resolve_label_mode(args, denoiser)
@@ -619,7 +667,7 @@ class TestExperimentBookkeeping:
 
         args = TestSharding._args(tmp_path, num_samples=2, sample_batch=2)
         denoiser = run_edm.build_denoiser(args)
-        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        setting = run_edm.build_setting(args, denoiser)
         tree = run_edm.build_tree(args, setting.num_steps)
         sampler = run_edm.build_sampler(setting, tree, args)
         mode = run_edm.resolve_label_mode(args, denoiser)
@@ -672,7 +720,7 @@ class TestExperimentBookkeeping:
 
         args = TestSharding._args(tmp_path, num_samples=2, sample_batch=2)
         denoiser = run_edm.build_denoiser(args)
-        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        setting = run_edm.build_setting(args, denoiser)
         tree = run_edm.build_tree(args, setting.num_steps)
         sampler = run_edm.build_sampler(setting, tree, args)
         mode = run_edm.resolve_label_mode(args, denoiser)
@@ -744,12 +792,284 @@ class TestExperimentBookkeeping:
         path.write_text(json.dumps(emitted))
         assert load_sampler_config(str(path)) == emitted
 
+    # ------------------------------------------------------- run config
+    def test_the_recorded_signature_is_exactly_these_settings(self):
+        """Everything that decides what a run samples, and nothing else.
+
+        Pinned as a literal rather than derived, because deriving it from the
+        same spec the code uses would assert nothing. A key appearing here that
+        does not change the samples means shards get refused over a display
+        choice; a key going missing means two different runs look alike, which
+        is the failure the whole resume story is built to prevent. Either way
+        this test is the one that should have to be edited on purpose.
+        """
+        from images import run_edm
+        from images.run_common import IGNORED_IN_SIGNATURE
+
+        args = run_edm.parse_args(["--toy", "--out", "/tmp/unused"])
+        assert {k: v for k, v in vars(args).items()
+                if k not in IGNORED_IN_SIGNATURE} == {
+            "network": None, "edm_repo": None, "toy": True,
+            "toy_resolution": 16, "toy_classes": 0,
+            "num_steps": 100, "eps": 0.25, "s_noise": 1.0, "shift": 1.0,
+            "rule": "d-grs", "branching": 2, "lookahead": 3,
+            "match": "verification",
+            "seed": 0, "num_samples": 64, "sample_batch": 0,
+            "labels": "auto", "forward_batch": 0,
+            "sampler": {"prefetch": "nearest", "evaluate_leaves": False},
+        }
+
+    def test_the_spec_and_the_ignored_set_agree(self):
+        """`where="cli"` and "not in the signature" have to stay the same fact.
+
+        They live in two files -- each driver's spec, and `run_common` -- so a
+        parameter added to one and not the other would either leak placement
+        into the signature, invalidating shards over a display choice, or hide
+        something that changes the samples. The only names allowed to be ignored
+        without being in a spec are the config layer's own controls.
+        """
+        from images import run_edm, run_sd3
+        from images.run_common import IGNORED_IN_SIGNATURE
+
+        every_cli = set()
+        for params in (run_edm.PARAMS, run_sd3.PARAMS):
+            cli = {p.name for p in params if p.where == "cli"}
+            protocol = {p.name for p in params if p.where == "config"}
+            # no placement in the signature ...
+            assert cli - IGNORED_IN_SIGNATURE == set()
+            # ... and nothing that changes the samples kept out of it
+            assert protocol & IGNORED_IN_SIGNATURE == set()
+            every_cli |= cli
+
+        # The set is shared by both drivers, so it may name something only one
+        # of them has -- `progress` is EDM's alone. What it may not do is name
+        # something neither has: that is a parameter that was renamed or removed
+        # while its exemption stayed behind, silently exempting nothing.
+        layer = {"config", "print_config", "config_provenance", "sampler_config"}
+        assert IGNORED_IN_SIGNATURE - every_cli == layer
+
+    def test_a_command_line_flag_beats_the_config_file_even_at_its_default(self, tmp_path):
+        """The case that rules out comparing against a fresh parse.
+
+        `sweep.sh` passes `--match verification` and `--seed 0` on every cell,
+        and both equal the argparse defaults. A resolver that inferred "typed"
+        by diffing against the defaults would let a config file silently beat an
+        explicit flag -- a wrong-protocol run with a correct-looking meta.json.
+        """
+        from images import run_edm
+
+        path = tmp_path / "run.json"
+        path.write_text(json.dumps({"version": 1, "driver": "edm",
+                                    "schedule": {"eps": 0.9}}))
+        from_file = run_edm.parse_args(
+            ["--config", str(path), "--out", str(tmp_path)])
+        assert from_file.eps == 0.9
+        assert from_file.config_provenance["eps"] == "file"
+
+        overridden = run_edm.parse_args(
+            ["--config", str(path), "--eps", "0.25", "--out", str(tmp_path)])
+        assert overridden.eps == 0.25
+        assert overridden.config_provenance["eps"] == "cli"
+
+    def test_a_partial_config_resolves_to_a_complete_record(self, tmp_path):
+        """One key in the file must not mean one key in the signature.
+
+        The resolved record is what gets recorded, so a key the file omits has
+        to be present at its default. Were it absent instead, changing a default
+        later would make old shards look compatible.
+        """
+        from images import run_edm
+
+        path = tmp_path / "run.json"
+        path.write_text(json.dumps({"version": 1, "driver": "edm",
+                                    "method": {"lookahead": 5}}))
+        args = run_edm.parse_args(["--config", str(path), "--out", str(tmp_path)])
+        bare = run_edm.parse_args(["--out", str(tmp_path)])
+        assert args.lookahead == 5
+        assert set(vars(args)) == set(vars(bare))
+        assert {k: v for k, v in vars(args).items() if k != "lookahead"
+                and k != "config" and k != "config_provenance"} == \
+               {k: v for k, v in vars(bare).items() if k != "lookahead"
+                and k != "config" and k != "config_provenance"}
+
+    def test_the_config_refuses_what_it_cannot_honour(self, tmp_path):
+        """Every rejection here is a run that would otherwise have lied."""
+        from images import run_edm
+
+        path = tmp_path / "run.json"
+        base = {"version": 1, "driver": "edm"}
+        for body, message in (
+            ({**base, "nonsense": {}}, "unknown section"),
+            ({**base, "method": {"eps": 0.3}}, 'belongs in "schedule"'),
+            ({**base, "schedule": {"epss": 0.3}}, 'unknown option "epss"'),
+            ({**base, "execution": {"device": "cuda:0"}},
+             "placement, not protocol"),
+            ({**base, "schedule": {"eps": "0.3"}}, "must be a number"),
+            ({**base, "sampler": {"evaluate_leaves": 1}}, "must be true or false"),
+            ({**base, "sampler": {"prefetch": "closest"}}, "prefetch must be one of"),
+            ({**base, "sampling": {"num_samples": 0}}, "must be >= 1"),
+            ({**base, "model": {"toy": "yes"}}, "must be true or false"),
+            ({"version": 1, "driver": "sd3"}, "but this is the 'edm' driver"),
+            ({"driver": "edm"}, 'no "version"'),
+            ({"version": 99, "driver": "edm"}, "schema version 99"),
+            (["schedule"], "expected a JSON object"),
+        ):
+            path.write_text(json.dumps(body))
+            with pytest.raises(SystemExit, match=re.escape(message)):
+                run_edm.parse_args(["--config", str(path), "--out", str(tmp_path)])
+
+        path.write_text("{not json")
+        with pytest.raises(SystemExit, match="not valid JSON"):
+            run_edm.parse_args(["--config", str(path), "--out", str(tmp_path)])
+        with pytest.raises(SystemExit, match="no such file"):
+            run_edm.parse_args(["--config", str(tmp_path / "absent.json"),
+                                "--out", str(tmp_path)])
+
+    def test_the_generated_run_config_is_complete_and_accepted(self, tmp_path, capsys):
+        """`--print-config` must emit a file the loader takes whole.
+
+        Generated rather than checked in for the same reason the sampler
+        template is: it lists every option that exists now, not the ones that
+        existed when a template was last remembered.
+        """
+        from images import run_edm
+        from images.run_common import SECTIONS, print_config_template
+
+        print_config_template(run_edm.PARAMS, driver="edm")
+        emitted = json.loads(capsys.readouterr().out)
+        assert emitted["version"] == 1 and emitted["driver"] == "edm"
+
+        # every protocol parameter appears exactly once, in its own section
+        placed = [k for section in SECTIONS for k in emitted.get(section, {})]
+        assert sorted(placed) == sorted(
+            [p.name for p in run_edm.PARAMS if p.where == "config"]
+            + ["prefetch", "evaluate_leaves"])
+        assert len(placed) == len(set(placed))
+
+        path = tmp_path / "run.json"
+        path.write_text(json.dumps(emitted))
+        args = run_edm.parse_args(["--config", str(path), "--out", str(tmp_path)])
+        bare = run_edm.parse_args(["--out", str(tmp_path)])
+        for p in run_edm.PARAMS:
+            assert getattr(args, p.name) == getattr(bare, p.name), p.name
+
+    def test_the_config_path_does_not_enter_the_signature(self, tmp_path):
+        """What a run did, not where it read it from.
+
+        Two runs that resolve to the same settings are the same run, so a shard
+        from one is reusable by the other whether the values arrived on the
+        command line or in a file.
+        """
+        from images import run_edm
+
+        path = tmp_path / "run.json"
+        path.write_text(json.dumps({"version": 1, "driver": "edm",
+                                    "schedule": {"eps": 0.4},
+                                    "model": {"toy": True}}))
+        viafile = run_edm.parse_args(["--config", str(path), "--out", str(tmp_path)])
+        viaflags = run_edm.parse_args(["--toy", "--eps", "0.4", "--out", str(tmp_path)])
+        ignored = {"config", "config_provenance"}
+        assert {k: v for k, v in vars(viafile).items() if k not in ignored} == \
+               {k: v for k, v in vars(viaflags).items() if k not in ignored}
+
+    def test_the_sampler_alias_and_the_sampler_section_agree(self, tmp_path):
+        """`--sampler-config` keeps working, and says the same thing."""
+        from images import run_edm
+
+        alias = tmp_path / "sampler.json"
+        alias.write_text(json.dumps({"prefetch": "parent"}))
+        run = tmp_path / "run.json"
+        run.write_text(json.dumps({"version": 1, "driver": "edm",
+                                   "sampler": {"prefetch": "parent"}}))
+        by_alias = run_edm.parse_args(
+            ["--sampler-config", str(alias), "--out", str(tmp_path)])
+        by_section = run_edm.parse_args(
+            ["--config", str(run), "--out", str(tmp_path)])
+        assert by_alias.sampler == by_section.sampler
+        assert by_alias.sampler["prefetch"] == "parent"
+
+        with pytest.raises(SystemExit):      # argparse: mutually exclusive
+            run_edm.parse_args(["--config", str(run), "--sampler-config",
+                                str(alias), "--out", str(tmp_path)])
+
+    def test_s_noise_reaches_the_schedule_and_the_signature(self, tmp_path):
+        """The driver's own path, end to end, for the newest parameter.
+
+        `build_setting` is the single place the schedule is assembled from the
+        parsed arguments, so a parameter that reaches the sampler must reach it
+        through there -- and having reached it, must be recorded, because it
+        changes the samples.
+        """
+        from images import run_edm
+
+        args = TestSharding._args(tmp_path, num_samples=2, sample_batch=2)
+        assert args.s_noise == 1.0                       # the library default
+        denoiser = run_edm.build_denoiser(args)
+        loud = TestSharding._args(tmp_path, num_samples=2, sample_batch=2,
+                                  s_noise=2.0)
+
+        quiet_std = run_edm.build_setting(args, denoiser).schedule(0)
+        loud_std = run_edm.build_setting(loud, denoiser).schedule(0)
+        assert loud_std == pytest.approx(2.0 * quiet_std)
+
+        setting = run_edm.build_setting(args, denoiser)
+        tree = run_edm.build_tree(args, setting.num_steps)
+        sampler = run_edm.build_sampler(setting, tree, args)
+        mode = run_edm.resolve_label_mode(args, denoiser)
+        labels = run_edm.all_labels(mode, args.num_samples, denoiser, args.seed)
+        run_edm.generate_shard(args, setting, sampler, denoiser, labels,
+                               0, 2, tmp_path, 0, silent_reporter(tmp_path))
+
+        args.s_noise = 2.0
+        with pytest.raises(SystemExit, match="incompatible"):
+            run_edm.generate_shard(args, setting, sampler, denoiser, labels,
+                                   0, 2, tmp_path, 0, silent_reporter(tmp_path))
+
+    def test_the_spec_defaults_match_the_adapter_defaults(self):
+        """Two defaults for one setting is one too many.
+
+        The spec is the source for the driver's own parameters, but the
+        adapters' `build()` keywords carry defaults of their own for callers
+        that bypass the driver -- the tests, `crosscheck_reference.py`. When
+        those disagree, `--print-config` documents one value and a direct
+        `build()` call uses another, and only one of them is what the sweep
+        ran. This is the sampler section's `inspect.signature` argument applied
+        to the parameters the driver does own.
+        """
+        import inspect
+
+        from images import models, run_edm, run_sd3, sd3_models
+
+        for params, build in ((run_edm.PARAMS, models.build),
+                              (run_sd3.PARAMS, sd3_models.build)):
+            upstream = inspect.signature(build).parameters
+            shared = [p for p in params if p.name in upstream]
+            assert len(shared) >= 5, "the spec and build() have stopped overlapping"
+            for param in shared:
+                assert param.default == upstream[param.name].default, param.name
+
+    def test_s_noise_is_a_schedule_option_in_the_config(self, tmp_path):
+        """Adding a parameter is one spec entry; the file follows from it."""
+        from images import run_edm
+        from images.run_common import print_config_template
+
+        path = tmp_path / "run.json"
+        path.write_text(json.dumps({"version": 1, "driver": "edm",
+                                    "schedule": {"s_noise": 1.5}}))
+        assert run_edm.parse_args(
+            ["--config", str(path), "--out", str(tmp_path)]).s_noise == 1.5
+
+        path.write_text(json.dumps({"version": 1, "driver": "edm",
+                                    "schedule": {"s_noise": 0.0}}))
+        with pytest.raises(SystemExit, match="s_noise must be > 0"):
+            run_edm.parse_args(["--config", str(path), "--out", str(tmp_path)])
+
     def test_zero_work_shard_is_refused(self, tmp_path):
         from images import run_edm
 
         args = TestSharding._args(tmp_path, num_samples=1)
         denoiser = run_edm.build_denoiser(args)
-        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        setting = run_edm.build_setting(args, denoiser)
         tree = run_edm.build_tree(args, setting.num_steps)
         sampler = run_edm.build_sampler(setting, tree, args)
         with pytest.raises(SystemExit, match="at least one"):
@@ -853,7 +1173,7 @@ class TestProgress:
 
         args = TestSharding._args(tmp_path, num_samples=2)
         denoiser = run_edm.build_denoiser(args)
-        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        setting = run_edm.build_setting(args, denoiser)
         tree = run_edm.build_tree(args, setting.num_steps)
 
         signature = run_edm.experiment_signature(args, setting, tree, denoiser)

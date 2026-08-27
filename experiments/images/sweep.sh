@@ -62,6 +62,11 @@ NODE_BUDGET="${NODE_BUDGET:-100}"
 # each cell records those. Either way the resolved values land in meta.json.
 SAMPLER_CONFIG="${SAMPLER_CONFIG:-}"
 
+# EDM's S_noise: scales the transition std and not the churn mean, so it is not
+# a reparameterisation of EPS. A scalar like SEED, not a list like EPS -- one
+# value per grid, because two cells at different s_noise are not comparable.
+S_NOISE="${S_NOISE:-1.0}"
+
 # One output root per eps. Unset, each is the path this script always used for
 # a single eps, so cells generated before the sweep swept eps are still found
 # and skipped. Set, OUT_ROOT is taken literally for a one-value EPS and as the
@@ -154,18 +159,21 @@ else:
 PY
 }
 
-# Resolved once, through the same loader the drivers use, so the skip check in
-# run_cell compares like with like rather than re-deriving the defaults here.
-SAMPLER_RESOLVED="$(python - "$SAMPLER_CONFIG" <<'PY'
+# The protocol settings that are not part of a cell's identity -- they do not
+# appear in the output path, so nothing but this check stops two of them being
+# pooled into one grid. Resolved once, through the same loader the drivers use,
+# so the skip check in run_cell compares like with like.
+POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path.cwd() / "experiments"))
 from images.run_common import load_sampler_config          # noqa: E402
 
-print(json.dumps(load_sampler_config(sys.argv[1] or None), sort_keys=True))
+print(json.dumps({"sampler": load_sampler_config(sys.argv[1] or None),
+                  "s_noise": float(sys.argv[2])}, sort_keys=True))
 PY
 )" || fail "could not resolve the sampler config"
-log "sampler  : $SAMPLER_RESOLVED"
+log "policy   : $POLICY_RESOLVED"
 
 log "cost per cell (|I| = target rows per round, the quantity wall clock tracks):"
 for cfg in $CONFIGS; do
@@ -191,20 +199,24 @@ import json, sys
 meta = json.load(open(sys.argv[1]))
 # A cell with no `sampler` block predates the option, and the batched sampler
 # had exactly one behaviour then: carry the verified parent's drift, leaves not
-# evaluated. Naming that here is what lets an older grid be continued
-# deliberately -- by asking for those options -- rather than by accident.
-legacy = {"evaluate_leaves": False, "prefetch": "parent"}
-print(json.dumps(meta.get("sampler", legacy), sort_keys=True))
+# evaluated. s_noise was likewise fixed at 1.0 before it was exposed. Naming
+# both here is what lets an older grid be continued deliberately -- by asking
+# for those values -- rather than by accident.
+print(json.dumps({
+    "sampler": meta.get("sampler", {"evaluate_leaves": False,
+                                    "prefetch": "parent"}),
+    "s_noise": meta.get("s_noise", 1.0),
+}, sort_keys=True))
 PY
 )" || fail "cannot read $out/meta.json"
-    if [[ "$was" != "$SAMPLER_RESOLVED" ]]; then
-      fail "$out was generated under different sampler options:
+    if [[ "$was" != "$POLICY_RESOLVED" ]]; then
+      fail "$out was generated under a different protocol:
          it has  : $was
-         this run: $SAMPLER_RESOLVED
-       Two cells of one grid sampled under different options are not
+         this run: $POLICY_RESOLVED
+       Two cells of one grid sampled under different settings are not
        comparable, and neither the FID nor the speedup table would show it.
-       Either delete the cell to regenerate it under this run's options, or
-       set SAMPLER_CONFIG to the options it already has to continue that grid."
+       Either delete the cell to regenerate it under this run's settings, or
+       set SAMPLER_CONFIG / S_NOISE to the ones it already has."
     fi
     log "skip $rn K=$K L=$L eps=$eps (already done)"; return 0
   fi
@@ -223,6 +235,7 @@ PY
       --num-samples "$NUM_SAMPLES" --num-steps "$NUM_STEPS" --eps "$eps" \
       --seed "$SEED" --labels "$LABELS" \
       --sample-batch "$sb" --forward-batch "$FORWARD_BATCH" \
+      --s-noise "$S_NOISE" \
       "${sc[@]}" --out "$out" \
     > "$out/generate.log" 2>&1 \
     || fail "failed: $rn K=$K L=$L -- see $out/generate.log"

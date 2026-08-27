@@ -149,25 +149,72 @@ rmc numbers are not directly comparable with these.
 `--sample-batch` is derived per cell as `NODE_BUDGET / |I|`, so memory stays
 roughly flat across the grid instead of growing with `K`.
 
-## Sampler options
+## Configuration
 
-The sampler's own knobs are protocol, not placement: they change the samples,
-and a run has to be able to say which ones produced it. They live in a JSON
-file rather than on the command line.
+Everything that decides what a run samples can go in one JSON file. The line is
+the same one the run signature draws: **protocol goes in the file, placement
+stays on the command line**. `--out`, `--device`, `--progress` and the rest are
+placement — two runs differing only there produce identical samples — so the
+file refuses them, by name, with that reason.
 
-Start from a complete one rather than writing it by hand — it is generated from
-the sampler itself, so it lists every option that exists now:
+Start from a generated file rather than writing one by hand; it lists every
+option that exists now, at its default:
 
 ```bash
-python experiments/images/run_edm.py --print-sampler-config > my-sampler.json
+python experiments/images/run_edm.py --print-config > my-run.json
 ```
 
 ```json
 {
-  "evaluate_leaves": false,
-  "prefetch": "nearest"
+  "version": 1,
+  "driver": "edm",
+  "model":        { "network": null, "edm_repo": null, "toy": false,
+                    "toy_resolution": 16, "toy_classes": 0 },
+  "schedule":     { "num_steps": 100, "eps": 0.25, "s_noise": 1.0, "shift": 1.0 },
+  "method":       { "rule": "d-grs", "branching": 2, "lookahead": 3,
+                    "match": "verification" },
+  "sampling":     { "seed": 0, "num_samples": 64, "sample_batch": 0 },
+  "conditioning": { "labels": "auto" },
+  "execution":    { "forward_batch": 0 },
+  "sampler":      { "prefetch": "nearest", "evaluate_leaves": false }
 }
 ```
+
+```bash
+python experiments/images/run_edm.py --config my-run.json --out results/run
+```
+
+**Explicit command-line flags beat the file**, including when the flag repeats
+the default — `--eps 0.25` wins over a file saying `0.9`. The run banner prints
+which settings the file supplied and which the command line took back, so a
+`--config` handed to a script that passes flags explicitly does not look like a
+config that was ignored. `version` and `driver` are required: the two drivers
+have different defaults (`num_steps` 100 vs 28, `shift` 1.0 vs 3.0), so a file
+written for one and read by the other would resolve differently and silently.
+
+An unknown key is an error, not a warning — a key that is read and then ignored
+produces a `meta.json` describing a run that did not happen. So is a key in the
+wrong section, and the message names the right one.
+
+Whatever the source, the **resolved** settings are what gets recorded: complete,
+never the file's subset, in `meta.json` and in the run signature. Two runs that
+resolve to the same values have the same signature whether the values came from
+a file or from flags, so shards are reusable across the two.
+
+### Schedule options
+
+| option | default | what it does |
+| --- | --- | --- |
+| `num_steps` | 100 | the horizon `T`. The sampler sees `T` minus the two deterministic endpoints |
+| `eps` | 0.25 | churn. Appears squared in the drift correction *and* linearly in the noise, so it moves where a step goes as well as how far it scatters |
+| `s_noise` | 1.0 | EDM's `S_noise`. Scales the transition std and **not** the churn mean, so it is not a reparameterisation of `eps`. Must be > 0 |
+| `shift` | 1.0 | timestep shift of the sigma grid (SD3.5 ships 3.0) |
+
+### Sampler options
+
+The sampler's own knobs are the `sampler` section above. `--sampler-config` and
+`--print-sampler-config` still work on that section alone, and are mutually
+exclusive with `--config`:
 
 ```bash
 SAMPLER_CONFIG=my-sampler.json NETWORK=... bash experiments/images/sweep.sh
@@ -198,13 +245,15 @@ refusal instead. An unknown key is an error rather than a warning, because a
 key that is read and then ignored produces a `meta.json` describing a run that
 did not happen.
 
-The sweep checks *finished* cells too, not just shards: a cell is normally
-skipped on file existence alone, which says nothing about the policy that
-produced it, so `sweep.sh` compares each skipped cell's recorded options
-against the ones this run would use and stops if they differ. A cell with no
-`sampler` block predates the option and is read as `prefetch: parent`,
-`evaluate_leaves: false` — the only behaviour the batched sampler had then — so
-an older grid can be continued by asking for those options explicitly.
+The sweep checks *finished* cells too, not just shards. A cell is normally
+skipped on file existence alone, which says nothing about the settings that
+produced it, and neither `sampler` nor `s_noise` appears in a cell's output
+path — so both sweeps compare each skipped cell's recorded values against the
+ones this run would use, and stop if they differ. A cell with no `sampler` block
+predates the option and is read as `prefetch: parent`, `evaluate_leaves: false`
+— the only behaviour the batched sampler had then — and a missing `s_noise` is
+read as 1.0. An older grid can therefore be continued by asking for those values
+explicitly (`SAMPLER_CONFIG=`, `S_NOISE=`).
 
 `prefetch` is worth understanding before changing it. `parent` carries the
 verified parent's drift, which was evaluated one step behind the state the next

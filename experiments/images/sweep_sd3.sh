@@ -34,6 +34,11 @@ MIN_FREE_MIB="${MIN_FREE_MIB:-24000}"
 CONFIGS="${CONFIGS-2,2 3,2 2,3 3,3}"
 RULES="${RULES-d-grs rmc}"
 MATCH="${MATCH:-verification}"
+# Sampler options and S_noise: protocol that does not appear in a cell's output
+# path, so the guard in run_cell is the only thing stopping two settings being
+# pooled into one grid. Same treatment as sweep.sh.
+SAMPLER_CONFIG="${SAMPLER_CONFIG:-}"
+S_NOISE="${S_NOISE:-1.0}"
 INCLUDE_TARGET="${INCLUDE_TARGET:-1}"
 # Latents per batched target call, BEFORE the CFG doubling. Divided by each
 # cell's |I| to give that cell's --sample-batch, so memory stays flat as K grows.
@@ -72,6 +77,17 @@ log "sampling : $NUM_SAMPLES samples, T=$NUM_STEPS ($SPEC_STEPS speculative), ep
 log "sd3      : cfg=$GUIDANCE  ${RESOLUTION}px  $DTYPE"
 log "gpus     : $GPUS ($NUM_PROC processes)"
 log "configs  : $CONFIGS   rules: $RULES   match: $MATCH"
+POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / "experiments"))
+from images.run_common import load_sampler_config          # noqa: E402
+
+print(json.dumps({"sampler": load_sampler_config(sys.argv[1] or None),
+                  "s_noise": float(sys.argv[2])}, sort_keys=True))
+PY
+)" || fail "could not resolve the sampler config"
+log "policy   : $POLICY_RESOLVED"
 
 verified_nodes() {   # $1=rule $2=K $3=L
   python - "$1" "$2" "$3" "$SPEC_STEPS" "$MATCH" <<'PY'
@@ -103,6 +119,31 @@ done
 run_cell() {   # $1=rule  $2=out  $3=K  $4=L
   local rn="$1" out="$2" K="$3" L="$4"
   if [[ -f "$out/samples.pt" && -f "$out/meta.json" ]]; then
+    # Skipping on file existence says nothing about the settings that produced
+    # the cell, and two cells of one grid at different settings are not
+    # comparable -- nothing downstream would show it. So check.
+    local was
+    was="$(python - "$out/meta.json" <<'PY'
+import json, sys
+
+meta = json.load(open(sys.argv[1]))
+# A cell with no `sampler` block predates the option, and the batched sampler
+# had exactly one behaviour then; s_noise was likewise fixed at 1.0. Naming both
+# lets an older grid be continued deliberately rather than by accident.
+print(json.dumps({
+    "sampler": meta.get("sampler", {"evaluate_leaves": False,
+                                    "prefetch": "parent"}),
+    "s_noise": meta.get("s_noise", 1.0),
+}, sort_keys=True))
+PY
+)" || fail "cannot read $out/meta.json"
+    if [[ "$was" != "$POLICY_RESOLVED" ]]; then
+      fail "$out was generated under a different protocol:
+         it has  : $was
+         this run: $POLICY_RESOLVED
+       Either delete the cell to regenerate it under this run's settings, or
+       set SAMPLER_CONFIG / S_NOISE to the ones it already has."
+    fi
     log "skip $rn K=$K L=$L (already done)"; return 0
   fi
   local iv sb
@@ -112,6 +153,7 @@ run_cell() {   # $1=rule  $2=out  $3=K  $4=L
   mkdir -p "$out"
   log "generating $rn K=$K L=$L  (|I|=$iv, sample-batch $sb) -> $out"
   local mp=(); (( NUM_PROC > 1 )) && mp=(--multi_gpu)
+  local sc=(); [[ -n "$SAMPLER_CONFIG" ]] && sc=(--sampler-config "$SAMPLER_CONFIG")
   accelerate launch "${mp[@]}" --num_processes "$NUM_PROC" --gpu_ids "$GPUS" \
     experiments/images/run_sd3.py \
       --network "$NETWORK" --prompts "$PROMPTS" --negative-prompt "$NEGATIVE" \
@@ -119,7 +161,8 @@ run_cell() {   # $1=rule  $2=out  $3=K  $4=L
       --num-samples "$NUM_SAMPLES" --num-steps "$NUM_STEPS" --eps "$EPS" \
       --seed "$SEED" --guidance-scale "$GUIDANCE" --resolution-px "$RESOLUTION" \
       --dtype "$DTYPE" --sample-batch "$sb" --forward-batch "$FORWARD_BATCH" \
-      --decode-batch "$DECODE_BATCH" --out "$out" \
+      --decode-batch "$DECODE_BATCH" --s-noise "$S_NOISE" \
+      "${sc[@]}" --out "$out" \
     > "$out/generate.log" 2>&1 \
     || fail "failed: $rn K=$K L=$L -- see $out/generate.log"
   log "done $rn K=$K L=$L: $(python - "$out/meta.json" <<'PY'

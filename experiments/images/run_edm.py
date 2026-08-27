@@ -64,90 +64,115 @@ from specdiff.edm_checkout import default_edm_checkout, is_edm_checkout  # noqa:
 
 from images import models  # noqa: E402
 from images.run_common import (  # noqa: E402
-    ProgressReporter, add_metrics, file_identity, load_sampler_config,
-    load_shards, merged_metrics, metric_totals, run_signature,
-    print_sampler_template, save_grid,
-    summarise_metrics, validate_reusable_shard,
+    Param, ProgressReporter, add_arguments, add_metrics, apply_config,
+    at_least_one, file_identity, load_shards, merged_metrics, metric_totals,
+    non_negative, positive, print_config_template, print_sampler_template,
+    run_signature, save_grid, summarise_metrics, validate_reusable_shard,
 )
 
 REPORT_EVERY_S = 60.0     # progress-line cadence when there is no bar to redraw
+
+
+# Every knob this driver has, described once. `where="cli"` is placement --
+# where the run lands, what it prints -- and is the same set `run_signature`
+# ignores; everything else is protocol, goes in the config file, and is
+# recorded. A test pins those two sets together.
+PARAMS = (
+    Param("network", "model", None, str, help="pretrained EDM .pkl"),
+    Param("edm_repo", "model", None, str,
+          help="NVlabs/edm checkout (default: <specdiff source>/edm)"),
+    Param("toy", "model", False, bool,
+          help="closed-form stand-in denoiser; no checkpoint, runs on CPU"),
+    Param("toy_resolution", "model", 16, int, check=at_least_one),
+    Param("toy_classes", "model", 0, int, check=non_negative,
+          help="toy only: label_dim, so the conditional path is "
+               "exercisable without a real checkpoint"),
+
+    Param("num_steps", "schedule", 100, int, help="the horizon T",
+          check=at_least_one),
+    Param("eps", "schedule", 0.25, float, help="churn", check=non_negative),
+    Param("s_noise", "schedule", 1.0, float, check=positive,
+          help="EDM's S_noise: scales the transition std and not the churn "
+               "mean, so it is not a reparameterisation of --eps"),
+    Param("shift", "schedule", 1.0, float, check=positive,
+          help="timestep shift of the sigma grid (EDM's scheduler default)"),
+
+    Param("rule", "method", "d-grs", str, choices=("d-grs", "rmc", "target")),
+    Param("branching", "method", 2, int, help="K", check=at_least_one),
+    Param("lookahead", "method", 3, int, help="L", check=at_least_one),
+    Param("match", "method", "verification", str,
+          choices=("verification", "budget"),
+          help="how an rmc chain is sized against the (K, L) tree it "
+               "is compared with. 'verification' (default, and "
+               "gm_sweep.py's) gives both arms the same target batch "
+               "|I| -- the hardware-matched comparison. 'budget' gives "
+               "them the same proposal budget B, the paper's protocol"),
+
+    Param("seed", "sampling", 0, int),
+    Param("num_samples", "sampling", 64, int, check=at_least_one),
+    Param("sample_batch", "sampling", 0, int, check=non_negative,
+          help="trajectories per batched run; 0 = all at once"),
+
+    Param("labels", "conditioning", "auto", str,
+          help="class conditioning: 'auto' (one uniform label per image "
+               "on a conditional checkpoint, none on an unconditional "
+               "one), 'uniform', 'none', or a class index for a fixed "
+               "class. Swapping a *-cond-* and a *-uncond-* --network "
+               "needs no other change under 'auto'"),
+
+    Param("forward_batch", "execution", 0, int, check=non_negative,
+          help="rows per network forward (0 = the whole tree in one "
+               "call); caps activation memory, exact, does not change NFE"),
+
+    Param("out", "", None, str, where="cli", required=True),
+    Param("device", "", "cpu", str, where="cli"),
+    Param("cpu", "", False, bool, where="cli",
+          help="force CPU even when an accelerator is visible. Needed "
+               "to run a multi-process job on a Mac, where accelerate "
+               "would pick MPS and torch has no MPS c10d::barrier"),
+    Param("no_accelerate", "", False, bool, where="cli",
+          help="skip Accelerator() entirely and run one process on "
+               "--device; handy on a laptop with no accelerate config"),
+    Param("overwrite", "", False, bool, where="cli",
+          help="regenerate shards that already exist instead of "
+               "reusing them (the default makes a crashed run resumable)"),
+    Param("progress", "", "auto", str, where="cli",
+          choices=("auto", "bar", "plain", "none"),
+          help="rank 0's progress display: 'auto' draws a bar on a "
+               "terminal and prints a line every 60s in a log, 'bar' "
+               "and 'plain' force one, 'none' silences it. Every rank "
+               "writes progress_rankNNN.json either way"),
+    Param("check_contract", "", False, bool, where="cli"),
+    Param("print_sampler_config", "", False, bool, where="cli",
+          help="write a complete sampler config (every option at its "
+               "default) to stdout and exit"),
+)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--network", help="pretrained EDM .pkl")
-    p.add_argument(
-        "--edm-repo",
-        help="NVlabs/edm checkout (default: <specdiff source>/edm)",
-    )
-    p.add_argument("--toy", action="store_true",
-                   help="closed-form stand-in denoiser; no checkpoint, runs on CPU")
-    p.add_argument("--toy-resolution", type=int, default=16)
-    p.add_argument("--toy-classes", type=int, default=0,
-                   help="toy only: label_dim, so the conditional path is "
-                        "exercisable without a real checkpoint")
-    p.add_argument("--out", required=True)
-    p.add_argument("--device", default="cpu")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--num-samples", type=int, default=64)
-    p.add_argument("--sample-batch", type=int, default=0,
-                   help="trajectories per batched run; 0 = all at once")
-    p.add_argument("--num-steps", type=int, default=100, help="the horizon T")
-    p.add_argument("--eps", type=float, default=0.25, help="churn")
-    p.add_argument("--rule", default="d-grs", choices=("d-grs", "rmc", "target"))
-    p.add_argument("--branching", type=int, default=2, help="K")
-    p.add_argument("--lookahead", type=int, default=3, help="L")
-    p.add_argument("--match", default="verification",
-                   choices=("verification", "budget"),
-                   help="how an rmc chain is sized against the (K, L) tree it "
-                        "is compared with. 'verification' (default, and "
-                        "gm_sweep.py's) gives both arms the same target batch "
-                        "|I| -- the hardware-matched comparison. 'budget' gives "
-                        "them the same proposal budget B, the paper's protocol")
-    p.add_argument("--forward-batch", type=int, default=0,
-                   help="rows per network forward (0 = the whole tree in one "
-                        "call); caps activation memory, exact, does not change NFE")
-    p.add_argument("--shift", type=float, default=1.0,
-                   help="timestep shift of the sigma grid (EDM's scheduler default)")
-    p.add_argument("--labels", default="auto",
-                   help="class conditioning: 'auto' (one uniform label per image "
-                        "on a conditional checkpoint, none on an unconditional "
-                        "one), 'uniform', 'none', or a class index for a fixed "
-                        "class. Swapping a *-cond-* and a *-uncond-* --network "
-                        "needs no other change under 'auto'")
-    p.add_argument("--cpu", action="store_true",
-                   help="force CPU even when an accelerator is visible. Needed "
-                        "to run a multi-process job on a Mac, where accelerate "
-                        "would pick MPS and torch has no MPS c10d::barrier")
-    p.add_argument("--no-accelerate", action="store_true",
-                   help="skip Accelerator() entirely and run one process on "
-                        "--device; handy on a laptop with no accelerate config")
-    p.add_argument("--overwrite", action="store_true",
-                   help="regenerate shards that already exist instead of "
-                        "reusing them (the default makes a crashed run resumable)")
-    p.add_argument("--progress", default="auto",
-                   choices=("auto", "bar", "plain", "none"),
-                   help="rank 0's progress display: 'auto' draws a bar on a "
-                        "terminal and prints a line every 60s in a log, 'bar' "
-                        "and 'plain' force one, 'none' silences it. Every rank "
-                        "writes progress_rankNNN.json either way")
-    p.add_argument("--sampler-config",
-                   help="JSON file of sampler options (prefetch, "
-                        "evaluate_leaves). Omitted, the library defaults apply. "
-                        "The resolved options go into meta.json and into the run "
-                        "signature, so a shard cannot be reused by a run under a "
-                        "different policy")
-    p.add_argument("--print-sampler-config", action="store_true",
-                   help="write a complete sampler config (every option at its "
-                        "default) to stdout and exit")
-    p.add_argument("--check-contract", action="store_true")
+    add_arguments(p, PARAMS)
+    # The config layer's own controls. They say where settings come from and
+    # what to print, not what to sample, so they are neither protocol nor
+    # recorded. Mutually exclusive rather than layered: both are grid-level
+    # knobs, and no ambiguity beats a precedence rule nobody reads.
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--config",
+                        help="JSON run configuration; see --print-config. "
+                             "Explicit command-line flags override it")
+    source.add_argument("--sampler-config",
+                        help="JSON file of sampler options alone (prefetch, "
+                             "evaluate_leaves) -- the `sampler` section of "
+                             "--config, which supersedes this")
+    p.add_argument("--print-config", action="store_true",
+                   help="write a complete run configuration (every option at "
+                        "its default) to stdout and exit")
     args = p.parse_args(argv)
     # Resolved here, not in main(), so `args` carries the settings actually in
     # force: run_signature reads them straight out of vars(args).
-    args.sampler = load_sampler_config(args.sampler_config)
-    return args
+    return apply_config(args, PARAMS, driver="edm")
 
 
 def resolve_label_mode(args, denoiser) -> str:
@@ -243,6 +268,18 @@ def matched_chain_depth(tree: DraftTree, num_steps: int, match: str) -> int:
     """
     depth = tree.budget if match == "budget" else tree.verification_budget()
     return max(1, min(depth, num_steps))
+
+
+def build_setting(args, denoiser) -> models.Setting:
+    """The one place the schedule is assembled from the parsed arguments.
+
+    Extracted so a schedule parameter cannot be threaded here and silently
+    defaulted in the tests that rebuild the same object.
+    """
+    return models.build(
+        denoiser, num_steps=args.num_steps, eps=args.eps, shift=args.shift,
+        s_noise=args.s_noise, forward_batch=args.forward_batch,
+    )
 
 
 def build_tree(args, num_steps: int) -> DraftTree:
@@ -418,6 +455,7 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out, world=None):
         "speculative_steps": setting.num_steps,
         "deterministic_steps": list(setting.deterministic_steps),
         "eps": args.eps,
+        "s_noise": args.s_noise,
         "shift": args.shift,
         "branching": args.branching if args.rule != "target" else 1,
         "lookahead": args.lookahead if args.rule != "target" else 1,
@@ -467,10 +505,9 @@ def main(argv=None) -> None:
     if args.print_sampler_config:
         print_sampler_template()
         return
-    if args.num_samples < 1:
-        raise SystemExit("--num-samples must be >= 1")
-    if args.sample_batch < 0 or args.forward_batch < 0:
-        raise SystemExit("--sample-batch and --forward-batch must be >= 0")
+    if args.print_config:
+        print_config_template(PARAMS, driver="edm")
+        return
     # Long tree runs allocate and free many differently-sized activation blocks;
     # without this the allocator can fragment itself out of memory even when the
     # total is fine. Harmless when memory is plentiful. Set before any CUDA
@@ -497,10 +534,7 @@ def main(argv=None) -> None:
     barrier(accelerator)
 
     denoiser = build_denoiser(args)
-    setting = models.build(
-        denoiser, num_steps=args.num_steps, eps=args.eps, shift=args.shift,
-        forward_batch=args.forward_batch,
-    )
+    setting = build_setting(args, denoiser)
     tree = build_tree(args, setting.num_steps)
     sampler = build_sampler(setting, tree, args)
     label_mode = resolve_label_mode(args, denoiser)
@@ -511,7 +545,8 @@ def main(argv=None) -> None:
         print(f"{args.rule}: {args.num_samples} samples over {world} process(es), "
               f"{setting.state_shape} states, T={setting.total_steps} "
               f"({setting.num_steps} speculative + "
-              f"{len(setting.deterministic_steps)} Euler), eps={args.eps}")
+              f"{len(setting.deterministic_steps)} Euler), eps={args.eps}"
+              + (f", s_noise={args.s_noise}" if args.s_noise != 1.0 else ""))
         print(f"tree {tree}: proposal budget B={tree.budget}, "
               f"verification budget |I|={tree.verification_budget()} rows per round")
         # The number that actually sets peak memory, and the one to lower when a
@@ -530,6 +565,17 @@ def main(argv=None) -> None:
               + ", ".join(f"{k}={v}" for k, v in sorted(args.sampler.items()))
               + (f"  (from {args.sampler_config})" if args.sampler_config
                  else "  (defaults)"))
+        if args.config:
+            # Which settings the file actually supplied, and which the command
+            # line took back. Without this, a --config meeting a script that
+            # passes flags explicitly looks like a config that was ignored.
+            overridden = sorted(k for k, src in args.config_provenance.items()
+                                if src == "cli")
+            from_file = sum(1 for src in args.config_provenance.values()
+                            if src == "file")
+            print(f"config  : {args.config} ({from_file} keys)"
+                  + (", overridden on the command line: "
+                     + ", ".join(overridden) if overridden else ""))
     print(f"rank {rank}: images {start}..{start + count - 1}", flush=True)
 
     reporter = ProgressReporter(
@@ -563,6 +609,9 @@ if __name__ == "__main__":
     # swallowed by the hard-exit guard below.
     if "--print-sampler-config" in sys.argv[1:]:
         print_sampler_template()
+        raise SystemExit(0)
+    if "--print-config" in sys.argv[1:]:
+        print_config_template(PARAMS, driver="edm")
         raise SystemExit(0)
     try:
         main()

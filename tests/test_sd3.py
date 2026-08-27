@@ -58,7 +58,19 @@ class TestSchedule:
             a = pixel.sigma_grid(STEPS, shift)
             b = sd3.sigma_grid(STEPS, shift)
             assert torch.equal(a, b)
-            assert torch.equal(pixel.churn_std_grid(a, EPS), sd3.churn_std_grid(b, EPS))
+            # Swept over s_noise as well as shift: comparing only the defaults
+            # would let a one-sided edit to either copy's churn std through.
+            for s_noise in (0.5, 1.0, 2.0):
+                assert torch.equal(
+                    pixel.churn_std_grid(a, EPS, s_noise=s_noise),
+                    sd3.churn_std_grid(b, EPS, s_noise=s_noise)), (shift, s_noise)
+
+    def test_non_positive_s_noise_is_refused(self):
+        """The latent adapter refuses it the same way the pixel one does."""
+        den, _ = make()
+        for bad in (0.0, -1.0):
+            with pytest.raises(ValueError, match="s_noise must be > 0"):
+                sd3.build(den, num_steps=STEPS, eps=EPS, s_noise=bad)
 
     def test_sd3_defaults_to_shift_3(self):
         """SD3.5 ships shift=3.0 where EDM's flow-matching default is 1.0."""
@@ -250,6 +262,37 @@ class TestDriver:
                 assert (run_sd3.matched_chain_depth(tree, 98, match)
                         == run_edm.matched_chain_depth(tree, 98, match))
 
+    def test_the_two_specs_share_their_common_parameters(self):
+        """The other half of the duplication guard, for the parameter specs.
+
+        Everything the two drivers have in common must mean the same thing in
+        both -- same section, same type, same protocol-or-placement answer -- or
+        one config file's `schedule` is another's `method`. Defaults are allowed
+        to differ, but only the ones that differ for a reason: SD3 ships a
+        shorter horizon, a shifted sigma grid, a bigger latent and a bigger
+        default run.
+        """
+        from images import run_edm, run_sd3
+
+        edm = {p.name: p for p in run_edm.PARAMS}
+        sd3_ = {p.name: p for p in run_sd3.PARAMS}
+        shared = sorted(set(edm) & set(sd3_))
+        assert len(shared) > 15, "the specs have drifted apart entirely"
+
+        for name in shared:
+            a, b = edm[name], sd3_[name]
+            assert (a.section, a.kind, a.where, a.choices) == \
+                   (b.section, b.kind, b.where, b.choices), name
+
+        assert {n for n in shared if edm[n].default != sd3_[n].default} == {
+            "network",         # a .pkl path vs a hub id
+            "num_steps",       # 100 vs 28
+            "shift",           # 1.0 vs SD3.5's 3.0
+            "toy_resolution",  # 16 vs 64
+            "num_samples",     # 64 vs 256
+            "device",          # "cpu" vs resolved in main()
+        }
+
     def test_prompt_file_is_read_as_a_prefix(self, tmp_path):
         from images import run_sd3
 
@@ -277,7 +320,7 @@ class TestDriver:
         f.write_text("\n".join(PROMPTS * 2) + "\n")
         args = self._args(tmp_path, prompts=str(f), num_samples=6)
         den = run_sd3.build_denoiser(args)
-        s = sd3.build(den, num_steps=STEPS, eps=EPS)
+        s = run_sd3.build_setting(args, den)
 
         gen = torch.Generator().manual_seed(0)
         whole = run_sd3.initial_latents(args, s, den, 0, 6, gen)
@@ -296,7 +339,7 @@ class TestDriver:
         f.write_text("\n".join(PROMPTS * 2) + "\n")
         args = self._args(tmp_path, prompts=str(f), num_samples=6, sample_batch=3)
         den = run_sd3.build_denoiser(args)
-        s = sd3.build(den, num_steps=STEPS, eps=EPS)
+        s = run_sd3.build_setting(args, den)
         tree = run_sd3.build_tree(args, s.num_steps)
         sampler = run_sd3.build_sampler(s, tree, args)
 
@@ -345,7 +388,7 @@ class TestClipScoring:
         args = TestDriver._args(tmp_path, prompts=str(prompts_file),
                                 num_samples=num_samples, sample_batch=num_samples)
         den = run_sd3.build_denoiser(args)
-        s = sd3.build(den, num_steps=STEPS, eps=EPS)
+        s = run_sd3.build_setting(args, den)
         tree = run_sd3.build_tree(args, s.num_steps)
         sampler = run_sd3.build_sampler(s, tree, args)
         run_sd3.generate_shard(args, s, sampler, den, 0, num_samples, tmp_path, 0)
