@@ -120,7 +120,7 @@ Start with a small sweep to validate GPU discovery and the nested
 `accelerate launch --multi_gpu` command:
 
 ```bash
-NETWORK=edm/edm-cifar10-32x32-cond-vp.pkl GPUS=0,1,2,3 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
+NETWORK=edm/edm-cifar10-32x32-cond-vp.pkl GPUS=0,1,2,3 EPS=0.5 NUM_SAMPLES=256 CONFIGS="2,2 2,3" bash experiments/images/sweep.sh
 ```
 
 Expect a per-cell `|I|` table, the plain-target baseline first, then each cell.

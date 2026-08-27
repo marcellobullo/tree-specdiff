@@ -17,9 +17,12 @@ Fixed by the protocol:
 | labels | `--labels auto` → one uniform class per image, i.e. the class marginal |
 | matching | `--match verification`: the rmc chain gets the same target batch `\|I\|` as the tree |
 
-**Choose `eps` explicitly.** The reference implementation swept
-`0.1`, `0.3`, `0.5`, `0.6` in different scripts; its FID script defaulted to
-`0.5`. Keep the selected value fixed across all comparison arms.
+**`eps` is swept, not chosen once.** The paper reports CIFAR-10 at
+`0.1`, `0.3`, `0.6`, which is what `sweep.sh` runs by default; the reference
+implementation used those and `0.5` in different scripts, and its FID script
+defaulted to `0.5`. Whatever the value, it is fixed across the arms *within*
+one comparison: baseline, d-grs, and rmc at one `eps` are compared with each
+other and never with another `eps`.
 
 ## 0. Prerequisites
 
@@ -114,13 +117,17 @@ numbers, is what that invalidates.
 To run the full grid:
 
 ```bash
-NETWORK=edm/edm-cifar10-32x32-cond-vp.pkl GPUS=0,4,5,7 EPS=0.5 NUM_SAMPLES=50000 bash experiments/images/sweep.sh
+NETWORK=edm/edm-cifar10-32x32-cond-vp.pkl GPUS=0,4,5,7 NUM_SAMPLES=50000 bash experiments/images/sweep.sh
 ```
 
-It runs the baseline first, then every `(K, L)` cell for both rules, sizes
-`--sample-batch` per cell from `NODE_BUDGET / |I|` so memory stays flat as `K`
-grows, skips finished cells, and prints the `fid.py` command at the end. Start
-with `NUM_SAMPLES=256 CONFIGS="2,2 2,3"` to validate the launch before starting the full grid.
+For each `eps` in `EPS` (default `0.1 0.3 0.6`) it runs the baseline first,
+then every `(K, L)` cell for both rules, sizes `--sample-batch` per cell from
+`NODE_BUDGET / |I|` so memory stays flat as `K` grows, skips finished cells,
+and prints one `fid.py` command per `eps` at the end. Each `eps` gets its own
+output root, so a sweep stopped part way still has every completed `eps`
+intact and scorable. Set `EPS=0.5` for a single churn level — a third of the
+work. Start with `EPS=0.5 NUM_SAMPLES=256 CONFIGS="2,2 2,3"` to validate the
+launch before starting the full grid.
 
 ## Comparability
 
