@@ -63,8 +63,9 @@ from specdiff import (  # noqa: E402
 
 from images import sd3_models as sd3  # noqa: E402
 from images.run_common import (  # noqa: E402
-    add_metrics, file_identity, load_shards, merged_metrics, metric_totals,
-    run_signature, save_grid, summarise_metrics, validate_reusable_shard,
+    add_metrics, file_identity, load_sampler_config, load_shards,
+    merged_metrics, metric_totals, run_signature, print_sampler_template, save_grid,
+    summarise_metrics, validate_reusable_shard,
 )
 
 REPORT_EVERY_S = 60.0
@@ -128,8 +129,21 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--decode-batch", type=int, default=8,
                    help="latents VAE-decoded per call; the decode peaks higher "
                         "than the transformer at 1024px")
+    p.add_argument("--sampler-config",
+                   help="JSON file of sampler options (prefetch, "
+                        "evaluate_leaves). Omitted, the library defaults apply. "
+                        "The resolved options go into meta.json and into the run "
+                        "signature, so a shard cannot be reused by a run under a "
+                        "different policy")
+    p.add_argument("--print-sampler-config", action="store_true",
+                   help="write a complete sampler config (every option at its "
+                        "default) to stdout and exit")
     p.add_argument("--check-contract", action="store_true")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # Resolved here, not in main(), so `args` carries the settings actually in
+    # force: run_signature reads them straight out of vars(args).
+    args.sampler = load_sampler_config(args.sampler_config)
+    return args
 
 
 def load_prompts(path: str, num_samples: int) -> list[str]:
@@ -191,12 +205,13 @@ def build_sampler(setting, tree, args):
         return BatchedSpeculativeSampler(
             target=setting.target, proposal=IdentityProposal(),
             schedule=setting.schedule, tree=tree, verifier=ResampleVerifier(),
-            num_steps=setting.num_steps,
+            num_steps=setting.num_steps, **args.sampler,
         )
     return BatchedSpeculativeSampler(
         target=setting.target, proposal=DelayedDriftProposal(setting.target),
         schedule=setting.schedule, tree=tree, verifier=create_verifier(args.rule),
         num_steps=setting.num_steps, check_contract=args.check_contract,
+        **args.sampler,
     )
 
 
@@ -374,6 +389,7 @@ def merge_shards(args, setting, tree, denoiser, out, world=None):
         "metric_totals": totals,
         "seconds": max(part["seconds"] for part in parts),
         "seconds_per_rank": [part["seconds"] for part in parts],
+        "sampler": dict(args.sampler),
         "run_signature": signature,
     }
 
@@ -396,6 +412,9 @@ def merge_shards(args, setting, tree, denoiser, out, world=None):
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.print_sampler_config:
+        print_sampler_template()
+        return
     if args.num_samples < 1:
         raise SystemExit("--num-samples must be >= 1")
     if args.sample_batch < 0 or args.forward_batch < 0 or args.decode_batch < 1:
@@ -465,6 +484,12 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+    # Handled here rather than inside main(): asking what the options are is not
+    # asking to run anything, so it must not require --out, and it must not be
+    # swallowed by the hard-exit guard below.
+    if "--print-sampler-config" in sys.argv[1:]:
+        print_sampler_template()
+        raise SystemExit(0)
     try:
         main()
     except BaseException:                                     # noqa: BLE001

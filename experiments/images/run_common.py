@@ -78,13 +78,108 @@ def file_identity(value: Optional[str]) -> Optional[dict]:
             "manifest_sha256": digest.hexdigest()}
 
 
+# ---------------------------------------------------------------- sampler config
+# The sampler's own knobs live in a file rather than on the command line. They
+# are protocol, not placement: they change the samples, they are easy to get
+# wrong in a way nothing downstream would notice, and a finished run has to be
+# able to say which ones produced it. Adding one here is the whole change --
+# `load_sampler_config` resolves it, `run_signature` picks it up from `args`,
+# and `meta.json` records it.
+SAMPLER_OPTIONS = ("prefetch", "evaluate_leaves")
+
+
+def sampler_defaults() -> dict:
+    """The library's own defaults, read off the sampler rather than copied.
+
+    A second copy here could disagree with the code silently, which is the
+    exact failure this config exists to prevent.
+    """
+    import inspect
+
+    from specdiff import BatchedSpeculativeSampler
+
+    params = inspect.signature(BatchedSpeculativeSampler.__init__).parameters
+    return {name: params[name].default for name in SAMPLER_OPTIONS}
+
+
+def print_sampler_template() -> None:
+    """Write a complete sampler config -- every option, each at its default.
+
+    Generated rather than kept as a checked-in example, so a file produced this
+    way lists every option that exists *now* instead of the ones that existed
+    when someone last remembered to update a template.
+    """
+    print(json.dumps(sampler_defaults(), indent=2, sort_keys=True))
+
+
+def _check_option(name: str, value: Any) -> Any:
+    from specdiff.sampler import PREFETCH_MODES
+
+    if name == "prefetch":
+        if value not in PREFETCH_MODES:
+            raise SystemExit(
+                f"sampler config: prefetch must be one of {sorted(PREFETCH_MODES)}; "
+                f"got {value!r}"
+            )
+    elif name == "evaluate_leaves":
+        # bool before int: `True` is an int in Python, but `1` is not a bool,
+        # and a config that accepted 1 would be accepting a typo.
+        if not isinstance(value, bool):
+            raise SystemExit(
+                f"sampler config: evaluate_leaves must be true or false; got {value!r}"
+            )
+    return value
+
+
+def load_sampler_config(path: Optional[str]) -> dict:
+    """Resolve the sampler's protocol knobs from a JSON file, defaults filled in.
+
+    JSON because the library declares no dependencies and targets 3.9: PyYAML
+    would be a new one and ``tomllib`` arrived in 3.11. Every driver artefact
+    here is already JSON.
+
+    The result is always complete, never the file's subset. It goes into the run
+    signature, and a signature that omitted a key would let a shard generated
+    under one policy be reused by a run under another -- silently, because the
+    samples look the same either way.
+    """
+    config = sampler_defaults()
+    if path is None:
+        return config
+    file = Path(path)
+    if not file.is_file():
+        raise SystemExit(f"--sampler-config: no such file: {file}")
+    try:
+        raw = json.loads(file.read_text())
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{file}: not valid JSON ({exc})") from None
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            f"{file}: expected a JSON object of sampler options, "
+            f"got {type(raw).__name__}"
+        )
+    unknown = sorted(set(raw) - set(SAMPLER_OPTIONS))
+    if unknown:
+        raise SystemExit(
+            f"{file}: unknown sampler option(s): {', '.join(unknown)}. "
+            f"Known options are {', '.join(SAMPLER_OPTIONS)}. "
+            "A key that is read and then ignored is worse than no config file "
+            "at all, so this is an error and not a warning."
+        )
+    for key, value in raw.items():
+        config[key] = _check_option(key, value)
+    return config
+
+
 def run_signature(driver: str, args, setting, tree, *, extra: Mapping[str, Any]) -> dict:
     """Versioned signature for deciding whether a shard is safe to resume."""
     # Display and placement choices, not protocol: two runs that differ only
     # here produce identical samples, so a shard from one is reusable by the
     # other. "progress" belongs on this list for the same reason "device" does.
+    # `sampler_config` is a path; what matters is the resolved `sampler` dict
+    # it produced, which is already in `vars(args)` and is what gets recorded.
     ignored = {"out", "device", "cpu", "no_accelerate", "overwrite",
-               "check_contract", "progress"}
+               "check_contract", "progress", "sampler_config"}
     config = {k: _plain(v) for k, v in vars(args).items() if k not in ignored}
     return {
         "version": SIGNATURE_VERSION,

@@ -661,6 +661,89 @@ class TestExperimentBookkeeping:
         (repo / "generate.py").write_text("x = 222\n")
         assert file_identity(str(repo)) != before
 
+    def test_a_changed_sampler_policy_refuses_a_reused_shard(self, tmp_path):
+        """The carry policy changes the samples, so it must change the signature.
+
+        Nothing downstream could tell a `nearest` shard from a `parent` one by
+        looking at it -- same shape, same dtype, plausible values -- so the
+        signature is the only thing standing between the two.
+        """
+        from images import run_edm
+
+        args = TestSharding._args(tmp_path, num_samples=2, sample_batch=2)
+        denoiser = run_edm.build_denoiser(args)
+        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        tree = run_edm.build_tree(args, setting.num_steps)
+        sampler = run_edm.build_sampler(setting, tree, args)
+        mode = run_edm.resolve_label_mode(args, denoiser)
+        labels = run_edm.all_labels(mode, args.num_samples, denoiser, args.seed)
+        run_edm.generate_shard(args, setting, sampler, denoiser, labels,
+                               0, 2, tmp_path, 0, silent_reporter(tmp_path))
+
+        assert args.sampler["prefetch"] == "nearest"      # the library default
+        args.sampler = dict(args.sampler, prefetch="parent")
+        with pytest.raises(SystemExit, match="incompatible"):
+            run_edm.generate_shard(args, setting, sampler, denoiser, labels,
+                                   0, 2, tmp_path, 0, silent_reporter(tmp_path))
+
+    def test_sampler_config_refuses_what_it_cannot_honour(self, tmp_path):
+        """Every rejection here is a run that would otherwise have lied.
+
+        A key that is read and ignored, or a value quietly coerced, produces a
+        meta.json describing a run that did not happen.
+        """
+        from images.run_common import load_sampler_config
+
+        path = tmp_path / "sampler.json"
+        for text, message in (
+            ('{"prefech": "nearest"}', "unknown sampler option"),
+            ('{"prefetch": "closest"}', "prefetch must be one of"),
+            ('{"evaluate_leaves": 1}', "must be true or false"),
+            ('["prefetch"]', "expected a JSON object"),
+            ('{"prefetch": ', "not valid JSON"),
+        ):
+            path.write_text(text)
+            with pytest.raises(SystemExit, match=message):
+                load_sampler_config(str(path))
+
+        with pytest.raises(SystemExit, match="no such file"):
+            load_sampler_config(str(tmp_path / "absent.json"))
+
+    def test_sampler_config_fills_in_every_option(self, tmp_path):
+        """A partial file must resolve to a complete record.
+
+        The result is what the signature stores. If an unset key were recorded
+        as absent rather than as its value, changing a library default would
+        silently make old shards look compatible.
+        """
+        from images.run_common import SAMPLER_OPTIONS, load_sampler_config
+
+        path = tmp_path / "sampler.json"
+        path.write_text('{"prefetch": "parent"}')
+        config = load_sampler_config(str(path))
+        assert set(config) == set(SAMPLER_OPTIONS)
+        assert config["prefetch"] == "parent"
+        assert config["evaluate_leaves"] is False
+
+    def test_the_generated_template_is_a_complete_config(self, tmp_path, capsys):
+        """`--print-sampler-config` must emit a file the loader accepts whole.
+
+        The point of generating it is that it cannot go stale. A template that
+        drifted from the option list would hand you a file that is either
+        rejected for an unknown key or quietly missing an option -- which is
+        worse than no template, because it looks authoritative.
+        """
+        from images.run_common import (SAMPLER_OPTIONS, load_sampler_config,
+                                       print_sampler_template)
+
+        print_sampler_template()
+        emitted = json.loads(capsys.readouterr().out)
+        assert set(emitted) == set(SAMPLER_OPTIONS)
+
+        path = tmp_path / "sampler.json"
+        path.write_text(json.dumps(emitted))
+        assert load_sampler_config(str(path)) == emitted
+
     def test_zero_work_shard_is_refused(self, tmp_path):
         from images import run_edm
 

@@ -23,9 +23,9 @@ Leaves
 ------
 Only internal nodes are verified (eq. 26: ``|I| = B / K``), so the leaf level is
 not evaluated. Including leaves can improve NFE speedup by a few percent at a
-factor-of-``K`` increase in target rows. ``--carry`` selects
-what the delayed-drift proposal reuses between rounds; ``nearest`` matches the
-reference implementation and needs no extra evaluation.
+factor-of-``K`` increase in target rows. ``--prefetch`` selects
+what the delayed-drift proposal reuses between rounds; ``nearest`` is the
+default everywhere and needs no extra evaluation.
 
 Two budgets
 -----------

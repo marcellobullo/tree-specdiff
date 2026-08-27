@@ -212,6 +212,102 @@ def test_batch_of_one_matches_the_scalar_sampler_with_a_remembering_proposal():
     assert np.array_equal(rs.trajectory, rb.trajectories[0])
 
 
+def test_both_samplers_default_to_the_same_carry_policy():
+    """The two samplers must not disagree about what "no argument" means.
+
+    The image drivers run the batched sampler; the GM sweep and most tests run
+    the scalar one. A split default would make the two halves of the same paper
+    incomparable for a reason neither meta.json nor the figures would record.
+    """
+    import inspect
+
+    scalar = inspect.signature(SpeculativeSampler.__init__).parameters
+    batched = inspect.signature(BatchedSpeculativeSampler.__init__).parameters
+    for name in ("prefetch", "evaluate_leaves"):
+        assert scalar[name].default == batched[name].default, name
+    assert scalar["prefetch"].default == "nearest"
+    assert scalar["evaluate_leaves"].default is False
+
+
+def test_every_prefetch_policy_matches_the_scalar_sampler():
+    """Batched must resolve the carry cases exactly as the scalar sampler does.
+
+    The policies differ only in which already-computed drift the next round
+    reuses, so a divergence is invisible in shapes and counters and shows up
+    only as a different trajectory. Both samplers default to "nearest"; this
+    walks the whole grid, including the leaf evaluation that "nearest" alone
+    can make use of.
+    """
+    N, K, L = 21, 3, 4
+    for prefetch in ("none", "parent", "nearest"):
+        for leaves in (False, True):
+            t_s, t_b = LinearGaussianTarget(A), LinearGaussianTarget(A)
+            common = dict(
+                schedule=ConstantSchedule(SIGMA), tree=DraftTree.uniform(K, L),
+                verifier=DeterministicVerifier(), num_steps=N,
+                prefetch=prefetch, evaluate_leaves=leaves,
+            )
+            scalar = SpeculativeSampler(
+                target=t_s, proposal=DelayedDriftProposal(t_s), **common)
+            batched = BatchedSpeculativeSampler(
+                target=t_b, proposal=DelayedDriftProposal(t_b),
+                keep_trajectories=True, **common)
+            rs = scalar.sample(np.zeros(4), rng=np.random.default_rng(0))
+            rb = batched.sample(np.zeros((1, 4)), rng=np.random.default_rng(0))
+            why = f"prefetch={prefetch} evaluate_leaves={leaves}"
+            assert np.array_equal(rs.trajectory, rb.trajectories[0]), why
+            # The counters have to agree too: "none" buys its exact root drift
+            # with an extra call per round, and both the leaf rows and the
+            # reused root must land the same way in the row count.
+            assert rb.target_calls == rs.target_calls, why
+            assert rb.target_states_evaluated == rs.target_states_evaluated, why
+
+
+def test_rows_reuse_their_own_root_mean_independently():
+    """One row skipping its root must not skip anybody else's.
+
+    Under nearest + evaluate_leaves, a row that accepted every level already
+    knows its next root's target mean and drops it from the batch. Rows reject
+    at different depths, so within one round some qualify and some do not, and
+    the saving has to be accounted per row. ``check_contract`` re-evaluates
+    every reused mean and raises if one is wrong, so this fails loudly rather
+    than drifting.
+    """
+    N, batch = 30, 12
+    target = LinearGaussianTarget(A)
+    sampler = BatchedSpeculativeSampler(
+        target=target, proposal=DelayedDriftProposal(target),
+        schedule=ConstantSchedule(SIGMA), tree=DraftTree.uniform(2, 3),
+        verifier=CoinFlipVerifier(p=0.6, seed=1), num_steps=N,
+        prefetch="nearest", evaluate_leaves=True, check_contract=True,
+    )
+    r = sampler.sample(np.zeros((batch, 3)), rng=np.random.default_rng(0))
+    assert sum(sum(rec.committed) for rec in r.rounds) == batch * N
+
+    # What Phase 2 would have cost with no row ever reusing its root.
+    no_reuse = sum(
+        sampler.tree.truncate(min(sampler.tree.depth, N - start))
+               .verification_budget(evaluate_leaves=True)
+        for rec in r.rounds for start in rec.start_steps
+    )
+    assert sum(rec.verified for rec in r.rounds) < no_reuse
+
+
+def test_unknown_prefetch_is_refused():
+    """A typo must not silently fall back to a policy the caller did not pick."""
+    target = LinearGaussianTarget(A)
+    try:
+        BatchedSpeculativeSampler(
+            target=target, proposal=ExactProposal(A),
+            schedule=ConstantSchedule(SIGMA), tree=DraftTree.uniform(2, 2),
+            verifier=DeterministicVerifier(), num_steps=4, prefetch="closest",
+        )
+    except ValueError as exc:
+        assert "closest" in str(exc) and "nearest" in str(exc)
+    else:
+        raise AssertionError("an unknown prefetch mode was accepted")
+
+
 def test_one_target_call_serves_the_whole_batch():
     N, L, batch, K = 24, 4, 16, 3
     _, sampler = _sampler(AcceptFirstVerifier(), batch=batch, N=N, K=K, L=L)

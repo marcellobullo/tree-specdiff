@@ -421,9 +421,15 @@ def build(
         )
 
     target = ChurnKernelTarget(
-        denoiser, sigmas, eps, s_noise=s_noise, step_offset=leading,
-        forward_batch=forward_batch, class_labels=class_labels,
+        denoiser, 
+        sigmas, 
+        eps, 
+        s_noise=s_noise, 
+        step_offset=leading,
+        forward_batch=forward_batch, 
+        class_labels=class_labels,
     )
+    
     speculative = num_steps - leading - trailing
     if speculative < 1:
         raise ValueError(

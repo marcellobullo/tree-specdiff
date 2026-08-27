@@ -149,6 +149,73 @@ rmc numbers are not directly comparable with these.
 `--sample-batch` is derived per cell as `NODE_BUDGET / |I|`, so memory stays
 roughly flat across the grid instead of growing with `K`.
 
+## Sampler options
+
+The sampler's own knobs are protocol, not placement: they change the samples,
+and a run has to be able to say which ones produced it. They live in a JSON
+file rather than on the command line.
+
+Start from a complete one rather than writing it by hand — it is generated from
+the sampler itself, so it lists every option that exists now:
+
+```bash
+python experiments/images/run_edm.py --print-sampler-config > my-sampler.json
+```
+
+```json
+{
+  "evaluate_leaves": false,
+  "prefetch": "nearest"
+}
+```
+
+```bash
+SAMPLER_CONFIG=my-sampler.json NETWORK=... bash experiments/images/sweep.sh
+# or, for one cell:
+python experiments/images/run_edm.py --sampler-config my-sampler.json ...
+```
+
+| option | values | what it does |
+| --- | --- | --- |
+| `prefetch` | `nearest` (default), `parent`, `none` | which already-computed drift the next round's root reuses |
+| `evaluate_leaves` | `false` (default), `true` | evaluate the leaf level too, so a fully-accepted round can carry an *exact* drift. `K^L` extra rows per round, and only `prefetch: nearest` can use them |
+
+Those two are the whole list, and the reason is the line the run signature
+already draws: a sampler option belongs here when it changes the samples. The
+constructor takes three other optional arguments, and none of them qualify.
+`check_contract` wraps the verifier in a validating shim without changing what
+it returns — it is a debug switch, it stays on the command line as
+`--check-contract`, and the signature ignores it. `keep_trajectories` retains
+every intermediate state, which the drivers never read and which would cost
+`N + 1` states per image to keep. `backend` is an object, resolved from the
+array type; there is no JSON for it.
+
+Every key is optional and the file may be omitted entirely; what is *recorded*
+is always the complete resolved set, in `meta.json` under `sampler` and in the
+run signature. So a shard generated under one policy can never be silently
+reused by a run under another — you get the `incompatible (run_signature)`
+refusal instead. An unknown key is an error rather than a warning, because a
+key that is read and then ignored produces a `meta.json` describing a run that
+did not happen.
+
+The sweep checks *finished* cells too, not just shards: a cell is normally
+skipped on file existence alone, which says nothing about the policy that
+produced it, so `sweep.sh` compares each skipped cell's recorded options
+against the ones this run would use and stops if they differ. A cell with no
+`sampler` block predates the option and is read as `prefetch: parent`,
+`evaluate_leaves: false` — the only behaviour the batched sampler had then — so
+an older grid can be continued by asking for those options explicitly.
+
+`prefetch` is worth understanding before changing it. `parent` carries the
+verified parent's drift, which was evaluated one step behind the state the next
+round actually starts from; `nearest` carries a drift evaluated *at* the
+committed step, and costs nothing extra to do so. On the Gaussian mixture at
+`d=512, eps=0.06`, `nearest` is worth 35–50% of NFE speedup over `parent`
+across the whole `(K, L)` grid, and cuts target rows by about a quarter.
+`none` re-evaluates each round's root for an exact drift and pays a target call
+per round to do it, which makes it the most expensive of the three and the
+slowest.
+
 ## What the adapter does
 
 The adapter applies two exact changes of variables.

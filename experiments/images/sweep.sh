@@ -22,7 +22,7 @@ set -euo pipefail
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 NETWORK="${NETWORK:?set NETWORK to a pretrained EDM .pkl}"
 EDM_REPO="${EDM_REPO:-$REPO/edm}"
-DATASET="${DATASET:-cifar10}"          # cifar10 | ffhq  -- scoring only
+DATASET="${DATASET:-ffhq}"          # cifar10 | ffhq  -- scoring only
 DATA="${DATA:-}"                       # ffhq: image dir or zip for the real set
 
 GPUS="${GPUS:-0,1}"
@@ -55,7 +55,12 @@ INCLUDE_TARGET="${INCLUDE_TARGET:-1}"
 # Verified nodes per batched target call. Divided by each cell's |I| to get that
 # cell's --sample-batch, so memory stays roughly flat across the grid rather
 # than growing with K.
-NODE_BUDGET="${NODE_BUDGET:-500}"
+NODE_BUDGET="${NODE_BUDGET:-100}"
+
+# Optional JSON file of sampler options (prefetch, evaluate_leaves), passed to
+# every cell so one grid is one policy. Unset, the library defaults apply and
+# each cell records those. Either way the resolved values land in meta.json.
+SAMPLER_CONFIG="${SAMPLER_CONFIG:-}"
 
 # One output root per eps. Unset, each is the path this script always used for
 # a single eps, so cells generated before the sweep swept eps are still found
@@ -78,6 +83,8 @@ fail() { printf '[%s] ERROR: %s\n' "$(date +%H:%M:%S)" "$*" >&2; exit 1; }
 [[ -d "$REPO" ]]     || fail "repo not found: $REPO"
 [[ -f "$NETWORK" ]]  || fail "network not found: $NETWORK"
 [[ -d "$EDM_REPO" ]] || fail "edm checkout not found: $EDM_REPO"
+[[ -z "$SAMPLER_CONFIG" || -f "$SAMPLER_CONFIG" ]] \
+  || fail "sampler config not found: $SAMPLER_CONFIG"
 [[ -n "${EPS// /}" ]] || fail "EPS is empty: give one or more churn values, e.g. EPS=\"0.1 0.3 0.6\""
 for e in $EPS; do
   [[ "$e" =~ ^[0-9]*\.?[0-9]+$ ]] \
@@ -147,6 +154,19 @@ else:
 PY
 }
 
+# Resolved once, through the same loader the drivers use, so the skip check in
+# run_cell compares like with like rather than re-deriving the defaults here.
+SAMPLER_RESOLVED="$(python - "$SAMPLER_CONFIG" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / "experiments"))
+from images.run_common import load_sampler_config          # noqa: E402
+
+print(json.dumps(load_sampler_config(sys.argv[1] or None), sort_keys=True))
+PY
+)" || fail "could not resolve the sampler config"
+log "sampler  : $SAMPLER_RESOLVED"
+
 log "cost per cell (|I| = target rows per round, the quantity wall clock tracks):"
 for cfg in $CONFIGS; do
   K="${cfg%%,*}"; L="${cfg##*,}"
@@ -160,6 +180,32 @@ done
 run_cell() {   # $1=rule  $2=out  $3=K  $4=L  $5=eps
   local rn="$1" out="$2" K="$3" L="$4" eps="$5"
   if [[ -f "$out/samples.pt" && -f "$out/meta.json" ]]; then
+    # A finished cell is skipped on file existence, which says nothing about
+    # the policy that produced it. Two cells of one grid sampled under
+    # different sampler options are not comparable, and nothing downstream --
+    # not the FID, not the speedup table -- would show it. So check.
+    local was
+    was="$(python - "$out/meta.json" <<'PY'
+import json, sys
+
+meta = json.load(open(sys.argv[1]))
+# A cell with no `sampler` block predates the option, and the batched sampler
+# had exactly one behaviour then: carry the verified parent's drift, leaves not
+# evaluated. Naming that here is what lets an older grid be continued
+# deliberately -- by asking for those options -- rather than by accident.
+legacy = {"evaluate_leaves": False, "prefetch": "parent"}
+print(json.dumps(meta.get("sampler", legacy), sort_keys=True))
+PY
+)" || fail "cannot read $out/meta.json"
+    if [[ "$was" != "$SAMPLER_RESOLVED" ]]; then
+      fail "$out was generated under different sampler options:
+         it has  : $was
+         this run: $SAMPLER_RESOLVED
+       Two cells of one grid sampled under different options are not
+       comparable, and neither the FID nor the speedup table would show it.
+       Either delete the cell to regenerate it under this run's options, or
+       set SAMPLER_CONFIG to the options it already has to continue that grid."
+    fi
     log "skip $rn K=$K L=$L eps=$eps (already done)"; return 0
   fi
   local iv sb
@@ -169,6 +215,7 @@ run_cell() {   # $1=rule  $2=out  $3=K  $4=L  $5=eps
   mkdir -p "$out"
   log "generating $rn K=$K L=$L eps=$eps  (|I|=$iv, sample-batch $sb) -> $out"
   local mp=(); (( NUM_PROC > 1 )) && mp=(--multi_gpu)
+  local sc=(); [[ -n "$SAMPLER_CONFIG" ]] && sc=(--sampler-config "$SAMPLER_CONFIG")
   accelerate launch "${mp[@]}" --num_processes "$NUM_PROC" --gpu_ids "$GPUS" \
     experiments/images/run_edm.py \
       --network "$NETWORK" --edm-repo "$EDM_REPO" \
@@ -176,7 +223,7 @@ run_cell() {   # $1=rule  $2=out  $3=K  $4=L  $5=eps
       --num-samples "$NUM_SAMPLES" --num-steps "$NUM_STEPS" --eps "$eps" \
       --seed "$SEED" --labels "$LABELS" \
       --sample-batch "$sb" --forward-batch "$FORWARD_BATCH" \
-      --out "$out" \
+      "${sc[@]}" --out "$out" \
     > "$out/generate.log" 2>&1 \
     || fail "failed: $rn K=$K L=$L -- see $out/generate.log"
   log "done $rn K=$K L=$L eps=$eps: $(python - "$out/meta.json" <<'PY'

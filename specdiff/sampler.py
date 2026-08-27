@@ -81,7 +81,7 @@ class SpeculativeSampler:
         *,
         num_steps: int,
         check_contract: bool = False,
-        prefetch: str = "parent",
+        prefetch: str = "nearest",
         evaluate_leaves: bool = False,
         backend: Optional[Backend] = None,
     ) -> None:
@@ -260,9 +260,9 @@ class SpeculativeSampler:
             # drift the next round will have.
             #
             # This is the *parent's* drift, one step behind the state the next
-            # round will actually start from. `carry="nearest"` defers the hand-
-            # off to the end of the round so it can pick a drift evaluated at
-            # the committed step instead; see `_carry_nearest`.
+            # round will actually start from. `prefetch="nearest"` defers the
+            # hand-off to the end of the round so it can pick a drift evaluated
+            # at the committed step instead; see `_prefetch_nearest`.
             if self.prefetch == "parent":
                 self._hand_over(ops, step, states[u], target_means[u])
             elif self.prefetch == "nearest":

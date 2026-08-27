@@ -64,9 +64,10 @@ from specdiff.edm_checkout import default_edm_checkout, is_edm_checkout  # noqa:
 
 from images import models  # noqa: E402
 from images.run_common import (  # noqa: E402
-    ProgressReporter, add_metrics, file_identity, load_shards, merged_metrics,
-    metric_totals, run_signature, save_grid, summarise_metrics,
-    validate_reusable_shard,
+    ProgressReporter, add_metrics, file_identity, load_sampler_config,
+    load_shards, merged_metrics, metric_totals, run_signature,
+    print_sampler_template, save_grid,
+    summarise_metrics, validate_reusable_shard,
 )
 
 REPORT_EVERY_S = 60.0     # progress-line cadence when there is no bar to redraw
@@ -132,8 +133,21 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "terminal and prints a line every 60s in a log, 'bar' "
                         "and 'plain' force one, 'none' silences it. Every rank "
                         "writes progress_rankNNN.json either way")
+    p.add_argument("--sampler-config",
+                   help="JSON file of sampler options (prefetch, "
+                        "evaluate_leaves). Omitted, the library defaults apply. "
+                        "The resolved options go into meta.json and into the run "
+                        "signature, so a shard cannot be reused by a run under a "
+                        "different policy")
+    p.add_argument("--print-sampler-config", action="store_true",
+                   help="write a complete sampler config (every option at its "
+                        "default) to stdout and exit")
     p.add_argument("--check-contract", action="store_true")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # Resolved here, not in main(), so `args` carries the settings actually in
+    # force: run_signature reads them straight out of vars(args).
+    args.sampler = load_sampler_config(args.sampler_config)
+    return args
 
 
 def resolve_label_mode(args, denoiser) -> str:
@@ -253,14 +267,14 @@ def build_sampler(setting: models.Setting, tree: DraftTree, args):
             target=setting.target,
             proposal=IdentityProposal(),
             schedule=setting.schedule, tree=tree, verifier=ResampleVerifier(),
-            num_steps=setting.num_steps,
+            num_steps=setting.num_steps, **args.sampler,
         )
     return BatchedSpeculativeSampler(
         target=setting.target,
         proposal=DelayedDriftProposal(setting.target),
         schedule=setting.schedule, tree=tree,
         verifier=create_verifier(args.rule), num_steps=setting.num_steps,
-        check_contract=args.check_contract,
+        check_contract=args.check_contract, **args.sampler,
     )
 
 
@@ -424,6 +438,7 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out, world=None):
         "metric_totals": totals,
         "seconds": max(part["seconds"] for part in parts),
         "seconds_per_rank": [part["seconds"] for part in parts],
+        "sampler": dict(args.sampler),
         "run_signature": signature,
     }
 
@@ -449,6 +464,9 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out, world=None):
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    if args.print_sampler_config:
+        print_sampler_template()
+        return
     if args.num_samples < 1:
         raise SystemExit("--num-samples must be >= 1")
     if args.sample_batch < 0 or args.forward_batch < 0:
@@ -506,6 +524,12 @@ def main(argv=None) -> None:
                  if args.forward_batch > 0 else " (one forward)"))
         print(f"labels: {label_mode}"
               + (f" over {denoiser.num_classes} classes" if label_mode != "none" else ""))
+        # The knobs no other line would reveal, named in the log so a run is
+        # identifiable from its output and not only from its meta.json.
+        print("sampler : "
+              + ", ".join(f"{k}={v}" for k, v in sorted(args.sampler.items()))
+              + (f"  (from {args.sampler_config})" if args.sampler_config
+                 else "  (defaults)"))
     print(f"rank {rank}: images {start}..{start + count - 1}", flush=True)
 
     reporter = ProgressReporter(
@@ -534,6 +558,12 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+    # Handled here rather than inside main(): asking what the options are is not
+    # asking to run anything, so it must not require --out, and it must not be
+    # swallowed by the hard-exit guard below.
+    if "--print-sampler-config" in sys.argv[1:]:
+        print_sampler_template()
+        raise SystemExit(0)
     try:
         main()
     except BaseException:                                     # noqa: BLE001
