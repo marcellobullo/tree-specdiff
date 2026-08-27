@@ -23,10 +23,10 @@ EDM_REPO="${EDM_REPO:-$REPO/edm}"
 DATASET="${DATASET:-cifar10}"          # cifar10 | ffhq  -- scoring only
 DATA="${DATA:-}"                       # ffhq: image dir or zip for the real set
 
-GPUS="${GPUS:-0,1,2,3}"
-NUM_SAMPLES="${NUM_SAMPLES:-50000}"
+GPUS="${GPUS:-0,1}"
+NUM_SAMPLES="${NUM_SAMPLES:-100}"
 NUM_STEPS="${NUM_STEPS:-100}"
-EPS="${EPS:-0.25}"
+EPS="${EPS:-0.1}"
 SEED="${SEED:-0}"
 LABELS="${LABELS:-auto}"               # auto | uniform | none | <class index>
 FORWARD_BATCH="${FORWARD_BATCH:-0}"
@@ -36,7 +36,7 @@ NUM_REAL="${NUM_REAL:-50000}"   # real images the FID is measured against
 # "K,L" pairs, in the order they run. `-` not `:-`, so CONFIGS="" means NO
 # configs (INCLUDE_TARGET=1 CONFIGS="" generates the baseline alone); with `:-`
 # an empty value would silently restore the whole default sweep.
-CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 2,3 3,3 4,3 2,4 3,4}"
+CONFIGS="${CONFIGS-2,3 2,5 3,4 4,4}"
 RULES="${RULES-d-grs rmc}"
 # How the rmc chain is sized against each (K, L) tree. `verification` gives both
 # arms the same target batch |I| -- the hardware-matched comparison, and
