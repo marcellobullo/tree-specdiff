@@ -10,11 +10,12 @@ writes ``summary.csv`` and:
     signed difference panel. Drawn by `heatmap.py`.
 
 `figure1_frontier.{pdf,png}`
-    Speed-up against the **verification budget** `B_ver`, which is the quantity the two
+    Speed-up against the **verification budget**, which is the quantity the two
     arms are matched on under `--match verification`: `|I| = B / K` target rows
     per round, not the proposal budget `B`. Drafting is a vector add under the
     delayed drift; `|I|` is what the hardware has to hold, so it is the fair
-    x-axis for comparing compute budgets.
+    x-axis for comparing compute budgets. The figures label it plain `B`, since
+    the drafted-node count never appears in them.
 
     Each curve is an efficiency frontier -- the best speed-up reachable at a
     budget of at most `|I|` -- which removes the aliasing that makes a pooled
@@ -36,8 +37,12 @@ from pathlib import Path
 
 RULE_LABEL = {"rmc": "RMC (De Bortoli et al.)", "d-grs": "D-GRS (ours)"}
 RULE_SHORT = {"rmc": "RMC", "d-grs": "D-GRS"}
-RULE_COLOR = {"rmc": "#4C72B0", "d-grs": "#55A868"}
+RULE_COLOR = {"rmc": "seagreen", "d-grs": "#1D3557"}
 RULE_ORDER = ("rmc", "d-grs")
+# `plot_speedup_vs_k` only: its D-GRS lines are coloured by lookahead depth off
+# viridis, and RMC's own seagreen sits inside that ramp -- the marker would read
+# as one more depth. Orange is the one accent the ramp does not contain.
+RMC_ACCENT = "#ED6F55"
 
 
 def internal_nodes(K: int, L: int) -> int:
@@ -95,13 +100,18 @@ def _style():
     })
 
 
-def plot_heatmaps(summary, out_dir):
+def plot_heatmaps(summary, out_dir, cmap="viridis"):
     """The paper figures, via the notebook's `heatmap_grid` (see heatmap.py).
 
     Two grids, each two panels side by side: speed-up per cell, and the same
-    grid in raw target calls, both with the Monte-Carlo standard error. `drop_l1`
+    grid in raw target calls. `band=None` keeps the cells to the value and the
+    budget: the Monte-Carlo error is in `summary.csv` (`speedup_se`), and at
+    this sweep size it does not move a cell's reading. `drop_l1`
     removes the degenerate `L = 1` row -- no lookahead, so every rule pays one
     call per step and the row would otherwise eat the whole colour range.
+
+    `cmap` names the ramp for the speed-up grid; the calls grid gets its reverse,
+    so the two agree on which end of the ramp is the good one.
     """
     import pandas as pd
 
@@ -112,18 +122,18 @@ def plot_heatmaps(summary, out_dir):
 
     heatmap_grid(
         df, rules=("rmc", "d-grs"),
-        metric="speedup", band="se", band_fmt="{:.2f}",
+        metric="speedup", band=None, cmap=cmap,
         drop_l1=True,
-        show_budget=True,
+        show_budget=True, robust=False, cbar_extend="neither",
         titles=labels, panel_size=(3.1, 3.2), cbar="shared",
         highlight_best=False,
         save=out_dir / "figure3_grid_speedup", formats=("pdf", "png"), dpi=400,
     )
     heatmap_grid(
         df, rules=("rmc", "d-grs"),
-        metric="calls", band="se", band_fmt="{:.2f}",
+        metric="calls", band=None, cmap=f"{cmap}_r",
         drop_l1=True, titles=labels, highlight_best=False,
-        cbar_extend="neither", robust=True,
+        cbar_extend="neither", robust=False,
         save=out_dir / "figure3_grid_calls", formats=("pdf", "png"), dpi=400,
     )
 
@@ -173,7 +183,7 @@ def plot_frontier(summary, out_stem, band="std"):
         ax.xaxis.set_major_locator(LogLocator(base=10))
         ax.xaxis.set_minor_formatter(NullFormatter())
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}$\\times$"))
-        ax.set_xlabel(r"verification budget  $B_{\rm ver} = |\mathcal{I}| = B/K$")
+        ax.set_xlabel(r"verification budget  $B$")
         ax.set_ylabel("speed-up over standard sampler")
         ax.set_title("Exact target sampling at a fraction of the cost",
                      fontsize=12.5, fontweight="bold", pad=8)
@@ -272,7 +282,7 @@ def plot_calls_vs_budget(summary, out_stem, band="se"):
             ax.axhline(baseline, color="0.35", linestyle="--", linewidth=1.2,
                        label=f"standard sampler ({baseline:g} calls)")
         ax.set_xscale("log")
-        ax.set_xlabel(r"verification budget  $B_{\rm ver} = |\mathcal{I}| = B/K$")
+        ax.set_xlabel(r"verification budget  $B$")
         ax.set_ylabel("target calls per trajectory")
         ax.set_title(f"Target calls vs. verification budget (band = 95% CI on the mean)")
         ax.legend(frameon=False)
@@ -300,7 +310,7 @@ def plot_speedup_vs_budget(summary, out_stem, band="se"):
                             alpha=0.2, linewidth=0)
         ax.axhline(1.0, color="0.35", linestyle="--", linewidth=1.2)
         ax.set_xscale("log")
-        ax.set_xlabel(r"verification budget  $B_{\rm ver} = |\mathcal{I}| = B/K$")
+        ax.set_xlabel(r"verification budget  $B$")
         ax.set_ylabel("speed-up over standard sampler")
         ax.set_title("NFE speed-up vs. verification budget")
         ax.legend(frameon=False)
@@ -347,7 +357,7 @@ def plot_calls_by_depth(summary, out_stem, band="se"):
                                 alpha=0.2, linewidth=0)
             ax.axhline(baseline, color="0.35", linestyle="--", linewidth=1.0)
             ax.set_xscale("log")
-            ax.set_xlabel(r"$B_{\rm ver}$")
+            ax.set_xlabel(r"$B$")
             ax.set_title(RULE_SHORT.get(rule, rule))
         axes[0][0].set_ylabel("target calls per trajectory")
         axes[0][-1].legend(frameon=False, fontsize=8, ncol=2)
@@ -402,9 +412,9 @@ def plot_speedup_vs_k(summary, out_stem, band="se", drop_l1=True):
         fig, ax = plt.subplots(figsize=(6.4, 4.2), constrained_layout=True)
 
         # RMC: no tree, so every configuration collapses onto K = 1.
-        ax.scatter([1], [mid], color="#ED6F55", s=20, zorder=10, marker="^",
+        ax.scatter([1], [mid], color=RMC_ACCENT, s=20, zorder=10, marker="^",
                    linewidth=0.8)
-        ax.errorbar([1], [mid], yerr=[[mid - lo], [hi - mid]], color="#ED6F55",
+        ax.errorbar([1], [mid], yerr=[[mid - lo], [hi - mid]], color=RMC_ACCENT,
                     zorder=10, capsize=3, capthick=0.8, elinewidth=0.8)
 
         depths = sorted({s["L"] for s in tree})
@@ -424,8 +434,8 @@ def plot_speedup_vs_k(summary, out_stem, band="se", drop_l1=True):
         ax.annotate(
             rf"RMC saturates at $\approx {saturation:.1f}\times$",
             xy=(1, mid), xytext=(3.0, ceiling - 0.024), textcoords="data",
-            fontsize=8.5, color="#ED6F55",
-            arrowprops=dict(arrowstyle="->", color="#ED6F55", lw=0.5,
+            fontsize=8.5, color=RMC_ACCENT,
+            arrowprops=dict(arrowstyle="->", color=RMC_ACCENT, lw=0.5,
                             linestyle=":", shrinkA=0, shrinkB=0),
         )
 
@@ -457,6 +467,8 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--out", default="results/figure3")
     p.add_argument("--band", default="std", choices=["std", "se"])
+    p.add_argument("--cmap", default="viridis",
+                   help="colour ramp for the (K, L) grids (default: viridis)")
     args = p.parse_args()
     out = Path(args.out)
 
@@ -468,7 +480,7 @@ def main() -> None:
     print(f"wrote {out / 'summary.csv'}  ({len(summary)} cells)")
 
     try:
-        plot_heatmaps(summary, out)
+        plot_heatmaps(summary, out, cmap=args.cmap)
         plot_frontier(summary, out / "figure1_frontier", band=args.band)
         plot_calls_vs_budget(summary, out / "calls_vs_budget")
         plot_speedup_vs_budget(summary, out / "speedup_vs_budget")

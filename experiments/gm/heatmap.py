@@ -9,14 +9,15 @@ One panel per rule on a **shared** colour scale, so cells are comparable across
 panels: RMC builds no tree, so its `(L, K)` cell is a linear chain matched to
 the tree cell at the same coordinates.
 
-Cells are annotated with the **verification budget** `B_ver = |I| = B/K` -- the
-target rows a round evaluates, and the quantity the two arms are matched on --
-rather than the proposal budget `B`, which counts drafted states. Drafting is a
-vector add under the delayed drift, so `B` overstates what the hardware sees by
-a factor of `K`.
+Cells are annotated with the **verification budget** `|I| = B/K` -- the target
+rows a round evaluates, and the quantity the two arms are matched on -- rather
+than the proposal budget, which counts drafted states. Drafting is a vector add
+under the delayed drift, so the drafted count overstates what the hardware sees
+by a factor of `K`. It never appears in the figure, so the cells label the
+verification budget plain `B`.
 
-`B_ver` is the budget each cell is *allocated*. RMC cannot always spend it: its
-chain truncates to `min(B_ver, N)`, which is why its panel flattens. The amount
+That budget is what each cell is *allocated*. RMC cannot always spend it: its
+chain truncates to `min(|I|, N)`, which is why its panel flattens. The amount
 actually evaluated is the `verification_budget` column of the summary.
 """
 
@@ -37,6 +38,12 @@ import seaborn as sns  # noqa: E402
 
 RULE_LABELS = {"rmc": "RMC", "d-grs": "D-GRS (ours)"}
 
+# Tallest a line of cell text may be, as a fraction of the cell. Also the line
+# spacing, so `_draw_cells` and `_autofit_annotations` agree on what fits: with
+# two lines, an even split of the cell pushes the value and the budget to
+# opposite edges and they stop reading as one label.
+MAX_LINE_GAP = 0.32
+
 
 def _compact(b: float) -> str:
     """1092 -> 1.09k, 137256 -> 137k (keeps the annotation two lines high)."""
@@ -49,9 +56,70 @@ def _compact(b: float) -> str:
     return f"{int(b)}"
 
 
-def _strip_tex(s: str) -> str:
-    """Rough printable length of an annotation line ($...$ and \\pm are narrow)."""
-    return s.replace("$", "").replace("\\pm", "±").replace("\\times", "x")
+def _ink_color(rgba):
+    """Seaborn's rule for annotation colour: dark on light cells, white on dark."""
+    rgb = np.asarray(rgba[:3], float)
+    rgb = np.where(rgb <= 0.03928, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+    return ".15" if float(rgb @ (0.2126, 0.7152, 0.0722)) > 0.408 else "w"
+
+
+def _draw_cells(ax, mesh, arr, lines, base, fill_h, color=None, kws=None):
+    """Stack each cell's lines at their own size. Returns the tallest stack.
+
+    Seaborn's own ``annot`` is one ``Text`` per cell, so every line in it has to
+    share a size, and the widest line then decides how large the value is drawn.
+    Placing the lines separately costs a text object per line and buys the value
+    the size the cell can actually hold.
+
+    Offsets are in data units -- a cell is 1 x 1 -- so a later rescale changes
+    the type size without moving anything off its line.
+    """
+    kws = {"ha": "center", "va": "center", **(kws or {})}
+    n = max((len(cell) for cell in lines.ravel()), default=0)
+    if not n:
+        return 0
+    gap = min(fill_h / n, MAX_LINE_GAP)
+    for (r, c), cell in np.ndenumerate(lines):
+        if not cell:
+            continue
+        ink = color or _ink_color(mesh.cmap(mesh.norm(arr[r, c])))
+        for i, (text, rel) in enumerate(cell):
+            ax.text(c + 0.5, r + 0.5 + (i - (len(cell) - 1) / 2) * gap, text,
+                    fontsize=base * rel, color=ink, **kws)
+    return n
+
+
+def _autofit_annotations(fig, axes, fill, n_lines):
+    """Grow the cell annotations to the largest size that still fits every cell.
+
+    Sizing them up front cannot work: the axes width is only settled once
+    constrained_layout has run and the shared colorbar has taken its slice, and
+    a character-count estimate of a mathtext string ($\\times$, $\\pm$) is wrong
+    by enough that the text ends up at half the size the cell can hold. So draw
+    once, measure the real cell and the real ink, and scale by the tightest of
+    the two. One scale for every panel and every line -- it preserves the size
+    each line was given, and a grid whose numbers change size from cell to cell
+    reads as an accident rather than a design.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fill_w, fill_h = fill
+    scale = np.inf
+    for ax in axes:
+        box = ax.get_window_extent()
+        cell_w = box.width / max(len(ax.get_xticks()), 1)
+        line_h = (box.height / max(len(ax.get_yticks()), 1)
+                  * min(fill_h / n_lines, MAX_LINE_GAP))
+        for t in ax.texts:
+            ink = t.get_window_extent(renderer)
+            if ink.width > 0 and ink.height > 0:
+                scale = min(scale, cell_w * fill_w / ink.width,
+                            line_h / ink.height)
+    if not np.isfinite(scale):
+        return
+    for ax in axes:
+        for t in ax.texts:
+            t.set_fontsize(t.get_fontsize() * scale)
 
 
 def heatmap_grid(
@@ -68,13 +136,15 @@ def heatmap_grid(
     value_fmt=None,
     band=None,                       # None | "std" | "se"
     band_fmt="{:.1f}",
-    show_budget=True, budget_prefix="$B_{\\rm ver}$=",
+    show_budget=True, budget_prefix="$B$=",
     annot_size=None, annot_color=None, annot_kws=None,
+    annot_fill=(0.90, 0.86),        # fraction of a cell the text may fill
+    annot_sub_scale=0.72,           # band/budget size, relative to the value
     highlight_best=True, highlight_kw=None,
     cmap=None, diff_cmap="RdBu",
     shared_scale=True, vmin=None, vmax=None, robust=True,
     cbar="shared", cbar_extend=None, cbar_extendfrac=0.04,
-    cbar_extendrect=False, cbar_label=None, cbar_shrink=0.92,
+    cbar_extendrect=False, cbar_label=None, cbar_shrink=1.0,
     edge_lw=0.6, edge_color="white", square=False, frame=False,
     panel_size=(3.1, 3.2), figsize=None,
     titles=None, title_size=10.0, label_size=9.0, tick_size=8.0,
@@ -90,7 +160,7 @@ def heatmap_grid(
     if value_fmt is None:
         value_fmt = "{:.2f}$\\times$" if speed else "{:.1f}"
     if cmap is None:
-        cmap = "viridis" if speed else "viridis_r"   # yellow = fast either way
+        cmap = "viridis" if speed else "viridis_r"   # light = fast either way
     # axes.grid off here as well as per-axes: a stray grid is the one thing that
     # cannot be undone after seaborn has drawn the mesh.
     rc = {"font.family": "serif", "mathtext.fontset": "dejavuserif",
@@ -146,25 +216,35 @@ def heatmap_grid(
             return f"{a} $-$ {b}" if speed else f"{b} $-$ {a}"
         return names.get(key, key)
 
-    def cell_text(arr, band_arr):
+    def cell_lines(arr, band_arr):
+        """Per cell, the lines to stack in it as `(text, size relative to base)`.
+
+        The band and the budget get their own line and a smaller size. Both are
+        context for the value, and on one line with it they would set the width
+        of the widest line in the grid -- which is exactly what caps how large
+        the value itself can be drawn.
+        """
         bud = budgets.to_numpy(float)
-        out = np.full(arr.shape, "", dtype=object)
+        out = np.full(arr.shape, None, dtype=object)
         for r in range(arr.shape[0]):
             for c in range(arr.shape[1]):
                 if not np.isfinite(arr[r, c]):
+                    out[r, c] = []
                     continue
-                s = value_fmt.format(arr[r, c])
+                lines = [(value_fmt.format(arr[r, c]), 1.0)]
                 if band_arr is not None and np.isfinite(band_arr[r, c]):
-                    s += "$\\pm$" + band_fmt.format(band_arr[r, c])
+                    lines.append(("$\\pm$" + band_fmt.format(band_arr[r, c]),
+                                  annot_sub_scale))
                 if show_budget:
-                    s += "\n" + budget_prefix + _compact(bud[r, c])
-                out[r, c] = s
+                    lines.append((budget_prefix + _compact(bud[r, c]),
+                                  annot_sub_scale))
+                out[r, c] = lines
         return out
 
     with mpl.rc_context(rc):
         fig, axes = plt.subplots(1, len(panels), figsize=figsize, squeeze=False,
                                  constrained_layout=True)
-        axes, meshes = axes[0], []
+        axes, meshes, lines_per_cell = axes[0], [], 1
         for i, (ax, key) in enumerate(zip(axes, panels)):
             if key == "__diff__":
                 # signed so that POSITIVE always means "rules[-1] is better"
@@ -185,22 +265,19 @@ def heatmap_grid(
                     kw.update(vmin=p[0], vmax=p[1])
                 band_arr = None if bands[key] is None else bands[key].to_numpy(float)
 
-            texts = cell_text(arr, band_arr) if annotate else None
-            size = annot_size
-            if annotate and size is None:      # auto: widest line must fit one cell
-                widest = max((max((len(_strip_tex(ln)) for ln in s.split("\n")), default=0)
-                              for s in texts.ravel()), default=1)
-                cell_pt = 72.0 * panel_size[0] * 0.78 / max(arr.shape[1], 1)
-                size = float(np.clip(cell_pt / (0.63 * max(widest, 1)), 3.5, 9.0))
-            akws = {"fontsize": size, "linespacing": 1.2, **(annot_kws or {})}
-            if annot_color is not None:
-                akws["color"] = annot_color
-
-            sns.heatmap(t, ax=ax, annot=texts if annotate else None, fmt="",
-                        annot_kws=akws, mask=~np.isfinite(arr),
+            sns.heatmap(t, ax=ax, annot=False, mask=~np.isfinite(arr),
                         linewidths=edge_lw, linecolor=edge_color, square=square,
                         cbar=False, **kw)
             meshes.append(ax.collections[0])
+            if annotate:
+                # Placeholder when auto-sizing: `_autofit_annotations` rescales
+                # every line below, once the layout is settled and the text can
+                # be measured.
+                base = 8.0 if annot_size is None else annot_size
+                n_lines = _draw_cells(ax, meshes[-1], arr,
+                                      cell_lines(arr, band_arr), base,
+                                      annot_fill[1], annot_color, annot_kws)
+                lines_per_cell = max(lines_per_cell, n_lines)
 
             # Cell edges are the mesh's own; no grid of any kind on top.
             ax.grid(False, which="both")
@@ -242,6 +319,9 @@ def heatmap_grid(
                 cb.outline.set_linewidth(0.6)
         if suptitle:
             fig.suptitle(suptitle, fontsize=title_size + 1.5, fontweight="bold")
+
+        if annotate and annot_size is None and "fontsize" not in (annot_kws or {}):
+            _autofit_annotations(fig, axes, annot_fill, lines_per_cell)
 
         if save is not None:
             for ext in formats:
