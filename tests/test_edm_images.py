@@ -632,6 +632,35 @@ class TestExperimentBookkeeping:
             run_edm.generate_shard(args, setting, sampler, denoiser, labels,
                                    0, 2, tmp_path, 0, silent_reporter(tmp_path))
 
+    def test_checkout_identity_ignores_git_and_pycache_churn(self, tmp_path):
+        """A `git fetch` in the EDM checkout must not expire a resumable shard.
+
+        The identity is there to catch a change to the *source* between the run
+        that wrote a shard and the run that reuses it. .git/ and __pycache__
+        move on their own: one fetch mid-sweep rewrote .git/FETCH_HEAD and
+        every shard on disk was refused, with the code the run executes
+        untouched.
+        """
+        from images.run_common import file_identity
+
+        repo = tmp_path / "edm"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "torch_utils" / "__pycache__").mkdir(parents=True)
+        (repo / "generate.py").write_text("x = 1\n")
+        (repo / ".git" / "FETCH_HEAD").write_text("abc\tnot-for-merge\n")
+        (repo / "torch_utils" / "__pycache__" / "misc.cpython-310.pyc").write_bytes(b"\0")
+
+        before = file_identity(str(repo))
+        assert before["files"] == 1                   # the source file, and nothing else
+
+        (repo / ".git" / "FETCH_HEAD").write_text("def\tnot-for-merge\tlonger\n")
+        (repo / "torch_utils" / "__pycache__" / "misc.cpython-310.pyc").write_bytes(b"\0\1")
+        assert file_identity(str(repo)) == before
+
+        # Sizes differ, so this holds whatever the filesystem's mtime resolution.
+        (repo / "generate.py").write_text("x = 222\n")
+        assert file_identity(str(repo)) != before
+
     def test_zero_work_shard_is_refused(self, tmp_path):
         from images import run_edm
 

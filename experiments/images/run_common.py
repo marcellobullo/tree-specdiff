@@ -42,6 +42,20 @@ def _plain(value: Any) -> Any:
     return str(value)
 
 
+# A directory argument is a checkout, and a checkout holds two populations:
+# the source, which decides what a run computes, and metadata that churns on
+# its own -- `git fetch` rewrites .git/FETCH_HEAD, importing a module writes
+# __pycache__. Folding the second kind into the identity expires every
+# resumable shard on disk for a reason with no bearing on the samples, so it is
+# left out.
+_IGNORED_PARTS = frozenset({".git", "__pycache__"})
+
+
+def _decides_the_run(relative: Path) -> bool:
+    return (not _IGNORED_PARTS.intersection(relative.parts)
+            and relative.suffix != ".pyc")
+
+
 def file_identity(value: Optional[str]) -> Optional[dict]:
     """Cheap local-path identity suitable for detecting accidental reuse."""
     if value is None:
@@ -54,7 +68,8 @@ def file_identity(value: Optional[str]) -> Optional[dict]:
         return {"path": str(path.resolve()), "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns}
     digest = hashlib.sha256()
-    files = sorted(item for item in path.rglob("*") if item.is_file())
+    files = sorted(item for item in path.rglob("*")
+                   if item.is_file() and _decides_the_run(item.relative_to(path)))
     for item in files:
         stat = item.stat()
         digest.update(str(item.relative_to(path)).encode())
