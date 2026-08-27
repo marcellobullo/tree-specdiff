@@ -19,7 +19,6 @@ different location.
 
 | file | purpose |
 | --- | --- |
-
 | `models.py` | the adapter: denoiser → velocity → churn transition, plus the schedule |
 | `toy.py` | a closed-form stand-in denoiser, so the wiring is testable with no checkpoint and no GPU |
 | `run_edm.py` | generation driver — writes `samples.pt`, `meta.json`, `grid.png` |
