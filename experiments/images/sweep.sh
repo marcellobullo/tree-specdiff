@@ -55,7 +55,7 @@ INCLUDE_TARGET="${INCLUDE_TARGET:-1}"
 # Verified nodes per batched target call. Divided by each cell's |I| to get that
 # cell's --sample-batch, so memory stays roughly flat across the grid rather
 # than growing with K.
-NODE_BUDGET="${NODE_BUDGET:-2000}"
+NODE_BUDGET="${NODE_BUDGET:-500}"
 
 # One output root per eps. Unset, each is the path this script always used for
 # a single eps, so cells generated before the sweep swept eps are still found
