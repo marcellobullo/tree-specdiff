@@ -127,6 +127,14 @@ NETWORK=/path/edm-cifar10-32x32-cond-vp.pkl GPUS=0,1,2,3 bash experiments/images
 Every `(K, L, rule)` cell whose `samples.pt` and `meta.json` both exist is
 skipped, so re-running continues where it stopped.
 
+**`EPS` is a list.** The default, `EPS="0.1 0.3 0.6"`, is the churn grid the
+paper reports for CIFAR-10, and the whole `(K, L) x rule` grid — baseline
+included — is run once per value, into one output root per value. That is three
+times the work of one churn level: pass a single value (`EPS=0.5`) for one
+pass. Values are never pooled, because an FID only means anything against the
+plain-target arm at the *same* `eps`; the script prints one `fid.py` command
+per value, all sharing one real-set cache.
+
 **How the rmc arm is sized.** RMC is a single-proposal coupling and has no tree,
 so the sweep hands both rules the same `(K, L)` and `--match` decides the chain
 length. The default, `verification`, gives both arms the same **target batch**
