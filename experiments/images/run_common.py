@@ -5,6 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import shutil
+import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -61,7 +65,11 @@ def file_identity(value: Optional[str]) -> Optional[dict]:
 
 def run_signature(driver: str, args, setting, tree, *, extra: Mapping[str, Any]) -> dict:
     """Versioned signature for deciding whether a shard is safe to resume."""
-    ignored = {"out", "device", "cpu", "no_accelerate", "overwrite", "check_contract"}
+    # Display and placement choices, not protocol: two runs that differ only
+    # here produce identical samples, so a shard from one is reusable by the
+    # other. "progress" belongs on this list for the same reason "device" does.
+    ignored = {"out", "device", "cpu", "no_accelerate", "overwrite",
+               "check_contract", "progress"}
     config = {k: _plain(v) for k, v in vars(args).items() if k not in ignored}
     return {
         "version": SIGNATURE_VERSION,
@@ -200,3 +208,182 @@ def save_grid(samples: torch.Tensor, path: Path) -> None:
         array = samples[i].permute(1, 2, 0).numpy()
         grid.paste(PIL.Image.fromarray(array), ((i % cols) * w, (i // cols) * h))
     grid.save(path)
+
+
+# --------------------------------------------------------------------- progress
+_BAR_WIDTH = 22
+
+
+def _clock(seconds: float) -> str:
+    """``h:mm:ss`` past an hour, ``m:ss`` below it."""
+    seconds = int(max(seconds, 0.0))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+class ProgressReporter:
+    """One live progress line for a whole sharded run.
+
+    Every rank writes its own ``progress_rankNNN.json``; rank 0 adds the peers'
+    files to its own counters and draws a single bar for the *global* run, so a
+    multi-GPU job reports one line rather than one interleaved line per GPU.
+    Throughput is summed over the ranks still working, which is what makes the
+    ETA the job's ETA rather than one process's -- ranks rarely run at the same
+    speed, and the run ends with the slowest.
+
+    Progress is counted in images. Within a batch the sampler's per-round hook
+    contributes a fractional image count (``in_flight``), so a bar with only a
+    handful of batches to report still moves: a round is one target call, which
+    is the finest granularity that exists here.
+
+    Off a TTY -- a redirected log, ``nohup``, a scheduler -- the bar degrades to
+    one plain line every ``plain_every_s`` seconds instead of a redrawn bar.
+    """
+
+    def __init__(
+        self,
+        out: Path,
+        *,
+        rank: int,
+        world: int,
+        total: int,
+        label: str = "",
+        mode: str = "auto",
+        stream=None,
+        plain_every_s: float = 60.0,
+        write_every_s: float = 2.0,
+        redraw_every_s: float = 0.25,
+    ) -> None:
+        self.out = Path(out)
+        self.rank, self.world, self.total = int(rank), int(world), int(total)
+        self.label = label
+        self.stream = stream if stream is not None else sys.stderr
+        self.plain_every_s = float(plain_every_s)
+        self.write_every_s = float(write_every_s)
+        self.redraw_every_s = float(redraw_every_s)
+        self.display = self._resolve_display(mode)
+        self.path = self.out / f"progress_rank{self.rank:03d}.json"
+
+        self.started = time.time()
+        self.done = 0.0          # this rank, images; fractional while a batch runs
+        self.of = 0              # this rank's share, set on the first update
+        self.fields: dict = {}
+        self._last_write = 0.0
+        self._last_draw = 0.0
+        self._drawn = False
+
+    def _resolve_display(self, mode: str) -> str:
+        """Only rank 0 draws; every rank still writes its progress file."""
+        if mode == "none" or self.rank != 0:
+            return "none"
+        if mode in ("bar", "plain"):
+            return mode
+        try:
+            return "bar" if self.stream.isatty() else "plain"
+        except Exception:                                     # noqa: BLE001
+            return "plain"
+
+    # ---------------------------------------------------------------- reporting
+    def update(self, done, of=None, *, in_flight: float = 0.0, force: bool = False,
+               **fields) -> None:
+        """Record ``done`` images finished by this rank and redraw if it is time."""
+        self.done = float(done) + float(in_flight)
+        if of is not None:
+            self.of = int(of)
+        self.fields.update(fields)
+        now = time.time()
+        if force or now - self._last_write >= self.write_every_s:
+            self._write(now)
+        if self.display == "none":
+            return
+        every = self.redraw_every_s if self.display == "bar" else self.plain_every_s
+        if force or now - self._last_draw >= every:
+            self._draw(now)
+            self._last_draw = now
+
+    def close(self) -> None:
+        """End the bar's line so later output starts on a fresh one."""
+        if self.display == "bar" and self._drawn:
+            self.stream.write("\n")
+            self.stream.flush()
+        self._drawn = False
+
+    # ------------------------------------------------------------------ private
+    def _write(self, now: float) -> None:
+        elapsed = now - self.started
+        payload = {
+            "rule": self.label, "rank": self.rank,
+            "done": round(self.done, 3), "of": self.of,
+            "img_per_s": round(self.done / max(elapsed, 1e-9), 4),
+            "elapsed_s": round(elapsed, 1),
+            "finished": self.of > 0 and self.done >= self.of,
+        }
+        payload.update({k: v for k, v in self.fields.items()})
+        # Atomic, and per-process: rank 0 reads these files while their owners
+        # are writing them, and the pid keeps two processes that believe they
+        # are the same rank -- a misconfigured launcher -- off one temp file.
+        temporary = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        self._last_write = now
+        try:
+            with open(temporary, "w") as handle:
+                json.dump(payload, handle)
+            os.replace(temporary, self.path)
+        except OSError:
+            # Progress is bookkeeping. A full or racing filesystem must not take
+            # down a generation run that has hours of samples behind it.
+            pass
+
+    def _global(self) -> tuple[float, float]:
+        """``(images done, images per second)`` summed over the run's ranks."""
+        done = self.done
+        rate = 0.0 if self.of and self.done >= self.of else self.done / max(
+            time.time() - self.started, 1e-9
+        )
+        for path in self.out.glob("progress_rank*.json"):
+            if path == self.path:
+                continue
+            try:
+                with open(path) as handle:
+                    peer = json.load(handle)
+                peer_done = float(peer.get("done", 0.0))
+            except (OSError, ValueError, TypeError):
+                continue                       # mid-write or truncated; skip a frame
+            done += peer_done
+            if not peer.get("finished"):       # a finished rank adds no throughput
+                rate += float(peer.get("img_per_s", 0.0) or 0.0)
+        if rate <= 0.0 and done > 0.0:         # every rank done: report the average
+            rate = done / max(time.time() - self.started, 1e-9)
+        return done, rate
+
+    def _line(self, now: float) -> str:
+        done, rate = self._global()
+        fraction = min(done / self.total, 1.0) if self.total > 0 else 0.0
+        parts = [self.label] if self.label else []
+        if self.display == "bar":
+            filled = int(round(fraction * _BAR_WIDTH))
+            parts.append("[" + "#" * filled + "." * (_BAR_WIDTH - filled) + "]")
+        parts.append(f"{fraction * 100:3.0f}%")
+        parts.append(f"{done:.0f}/{self.total} img")
+        parts.append(f"{rate:.2f} img/s")
+        remaining = self.total - done
+        parts.append(
+            f"eta {_clock(remaining / rate)}" if rate > 0.0 and remaining > 0 else "eta --"
+        )
+        parts.append(f"[{_clock(now - self.started)}]")
+        if self.world > 1:
+            parts.append(f"{self.world} ranks")
+        for key, value in self.fields.items():
+            parts.append(f"{key} {value:.3g}" if isinstance(value, float) else f"{key} {value}")
+        return "  ".join(parts)
+
+    def _draw(self, now: float) -> None:
+        line = self._line(now)
+        if self.display != "bar":
+            print(line, file=self.stream, flush=True)
+            return
+        width = shutil.get_terminal_size((100, 20)).columns
+        # Pad to the previous width so a shrinking line leaves no debris behind.
+        self.stream.write("\r" + line[: max(width - 1, 20)].ljust(width - 1))
+        self.stream.flush()
+        self._drawn = True

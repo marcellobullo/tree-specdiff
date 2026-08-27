@@ -473,6 +473,7 @@ def sample_trajectory(
     *,
     rng,
     generator: torch.Generator,
+    on_round=None,
 ):
     """Full ``T``-step trajectory: Euler prologue, speculative middle, Euler epilogue.
 
@@ -486,6 +487,10 @@ def sample_trajectory(
     ``(batch, *state_shape)`` for :class:`~specdiff.BatchedSpeculativeSampler`;
     the rank decides, so the two samplers need no flag to tell apart.
 
+    ``on_round``, when given, is forwarded to the batched sampler as its
+    per-round progress hook. The Euler endpoints are not reported: they are two
+    steps out of ``T``, and they run outside the sampler.
+
     Returns ``(final_state, result)`` with ``final_state`` the same rank as
     ``y0`` and ``result`` whatever the sampler returned.
     """
@@ -495,7 +500,10 @@ def sample_trajectory(
     single = y0.dim() == len(setting.state_shape)
 
     y = euler_steps(target, y0[None] if single else y0, range(0, lo), generator)
-    result = sampler.sample(y[0] if single else y, rng=rng)
+    # Only the batched sampler takes the hook; keep the call signature the one
+    # SpeculativeSampler accepts when no reporting was asked for.
+    hook = {} if on_round is None else {"on_round": on_round}
+    result = sampler.sample(y[0] if single else y, rng=rng, **hook)
     out = result.sample[None] if single else result.samples
     out = euler_steps(target, out, range(hi, T), generator)
     return (out[0] if single else out), result

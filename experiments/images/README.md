@@ -98,6 +98,26 @@ Use `--no-accelerate` for a plain single process, and `--cpu` to force CPU
 (needed to run multi-process on a Mac, where accelerate selects MPS and torch
 has no MPS `c10d::barrier`).
 
+## Progress
+
+Either form -- one process or many -- reports one bar for the **whole job**:
+every rank writes `progress_rankNNN.json` and rank 0 sums them, so a 2-GPU run
+shows one line rather than two interleaved ones. Throughput is added over the
+ranks still working, which makes the ETA the job's and not one process's.
+
+```
+d-grs  [########..............]   37%  18560/50000 img  4.21 img/s  eta 2:04:31  [1:13:29]  2 ranks  spd 1.83  acc 0.712
+```
+
+The bar advances *within* a batch as well as between them -- the sampler reports
+every round, which is one target call -- so a run of a few large batches still
+moves. `spd` and `acc` are the last batch's speedup and acceptance rate.
+
+Redirected to a log, the bar degrades to one line a minute instead of a redrawn
+line. `--progress plain` forces that, `--progress bar` forces the bar, and
+`--progress none` silences the display; the per-rank JSON files are written
+either way, and are deleted by the merge.
+
 ## The sweep
 
 ```bash

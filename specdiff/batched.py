@@ -24,7 +24,7 @@ the backend needs no gather beyond the row indexing it already had.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from .kernels import NoiseSchedule, ProposalTransition, TargetTransition
 from .ops import Backend, resolve_backend
@@ -93,8 +93,21 @@ class BatchedSpeculativeSampler:
         self._backend = backend
 
     # ------------------------------------------------------------------ public
-    def sample(self, init: Array, *, rng: Any = None, record: bool = True) -> BatchedSamplingResult:
-        """Run from ``init`` of shape ``(batch, *state_shape)``."""
+    def sample(
+        self,
+        init: Array,
+        *,
+        rng: Any = None,
+        record: bool = True,
+        on_round: Optional[Callable[[int, int], None]] = None,
+    ) -> BatchedSamplingResult:
+        """Run from ``init`` of shape ``(batch, *state_shape)``.
+
+        ``on_round`` is called after every round with ``(steps_taken, steps_total)``
+        -- committed steps summed over the batch, against ``batch * num_steps``.
+        It is a progress hook only: rounds commit different numbers of steps per
+        trajectory, so the ratio advances unevenly but monotonically.
+        """
         ops = self._backend or resolve_backend(init)
         ops.check_state_dtype(init, "init")
         batch = int(init.shape[0])
@@ -163,6 +176,8 @@ class BatchedSpeculativeSampler:
             if record:
                 records.append(record_)
             iteration += 1
+            if on_round is not None:
+                on_round(sum(steps_done), batch * N)
 
         grouped = None
         if trajectories is not None:

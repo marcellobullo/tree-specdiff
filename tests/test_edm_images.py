@@ -19,8 +19,10 @@ Four things can be wrong in the port, and there is one test class for each:
 
 from __future__ import annotations
 
+import json
 import math
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -516,7 +518,8 @@ class TestSharding:
             start, count = run_edm.shard_bounds(args.num_samples, rank, 2)
             paths.append(run_edm.generate_shard(
                 args, setting, sampler, denoiser, labels, start, count,
-                tmp_path, rank,
+                tmp_path, rank, silent_reporter(tmp_path, rank=rank, world=2,
+                                                total=args.num_samples),
             ))
         assert [p.name for p in paths] == ["shard_000.pt", "shard_001.pt"]
 
@@ -525,7 +528,8 @@ class TestSharding:
         before = paths[0].stat().st_mtime_ns
         run_edm.generate_shard(args, setting, sampler, denoiser, labels,
                                *run_edm.shard_bounds(args.num_samples, 0, 2),
-                               tmp_path, 0)
+                               tmp_path, 0, silent_reporter(tmp_path, world=2,
+                                                            total=args.num_samples))
         assert paths[0].stat().st_mtime_ns == before
 
         meta = run_edm.merge_shards(args, setting, tree, denoiser, mode, tmp_path)
@@ -535,7 +539,7 @@ class TestSharding:
         # a straggler has to stay diagnosable after the run.
         assert len(meta["seconds_per_rank"]) == 2
         assert meta["seconds"] == max(meta["seconds_per_rank"])
-        assert not list(tmp_path.glob("progress_rank*.json"))
+        assert not list(tmp_path.glob("progress_rank*"))
         samples = torch.load(tmp_path / "samples.pt", weights_only=True)
         assert samples.shape == (9, *setting.state_shape)
         assert samples.dtype == torch.uint8
@@ -621,12 +625,12 @@ class TestExperimentBookkeeping:
         mode = run_edm.resolve_label_mode(args, denoiser)
         labels = run_edm.all_labels(mode, args.num_samples, denoiser, args.seed)
         run_edm.generate_shard(args, setting, sampler, denoiser, labels,
-                               0, 2, tmp_path, 0)
+                               0, 2, tmp_path, 0, silent_reporter(tmp_path))
 
         args.seed += 1
         with pytest.raises(SystemExit, match="incompatible"):
             run_edm.generate_shard(args, setting, sampler, denoiser, labels,
-                                   0, 2, tmp_path, 0)
+                                   0, 2, tmp_path, 0, silent_reporter(tmp_path))
 
     def test_zero_work_shard_is_refused(self, tmp_path):
         from images import run_edm
@@ -638,7 +642,7 @@ class TestExperimentBookkeeping:
         sampler = run_edm.build_sampler(setting, tree, args)
         with pytest.raises(SystemExit, match="at least one"):
             run_edm.generate_shard(args, setting, sampler, denoiser, None,
-                                   1, 0, tmp_path, 1)
+                                   1, 0, tmp_path, 1, silent_reporter(tmp_path))
 
     def test_grid_keeps_a_non_square_tail(self, tmp_path):
         import PIL.Image
@@ -660,6 +664,114 @@ class TestExperimentBookkeeping:
         first = real_cache_signature(args, 64)
         args.data = str(b)
         assert real_cache_signature(args, 64) != first
+
+
+def silent_reporter(out, **over):
+    """A reporter that writes its file but draws nothing, for driver tests."""
+    from images.run_common import ProgressReporter
+
+    kwargs = dict(rank=0, world=1, total=2, mode="none")
+    kwargs.update(over)
+    return ProgressReporter(out, **kwargs)
+
+
+class TestProgress:
+    """The progress line is bookkeeping: it must aggregate, and never raise."""
+
+    def _reporter(self, out, **over):
+        from images.run_common import ProgressReporter
+
+        kwargs = dict(rank=0, world=2, total=10, label="d-grs", mode="plain",
+                      write_every_s=0.0, plain_every_s=0.0)
+        kwargs.update(over)
+        return ProgressReporter(out, **kwargs)
+
+    def test_rank_zero_counts_its_peers(self, tmp_path):
+        """The bar is the job's, not one process's: peers' files are summed in."""
+        peer = self._reporter(tmp_path, rank=1, mode="none")
+        peer.update(4, 5, force=True)
+
+        reporter = self._reporter(tmp_path)
+        reporter.update(3, 5, force=True)
+        done, rate = reporter._global()
+        assert done == pytest.approx(7.0)                  # 3 of its own + 4 of rank 1
+        assert rate > 0.0
+
+    def test_a_finished_peer_adds_no_throughput(self, tmp_path):
+        """Otherwise the ETA assumes an idle rank is still producing images."""
+        def peer(finished):
+            (tmp_path / "progress_rank001.json").write_text(json.dumps(
+                {"rank": 1, "done": 4, "of": 5, "img_per_s": 7.0,
+                 "finished": finished}
+            ))
+
+        reporter = self._reporter(tmp_path)
+        reporter.started = time.time() - 10.0        # a stable own rate to compare
+        reporter.update(1, 5, force=True)
+
+        peer(False)
+        _, working = reporter._global()
+        peer(True)
+        _, idle = reporter._global()
+        assert working - idle == pytest.approx(7.0, rel=1e-3)
+
+    def test_a_partly_written_peer_file_is_skipped(self, tmp_path):
+        """Peers write while rank 0 reads; a torn frame must not end the run."""
+        (tmp_path / "progress_rank001.json").write_text('{"done": 4, "of"')
+
+        reporter = self._reporter(tmp_path)
+        reporter.update(2, 5, force=True)
+        done, _ = reporter._global()
+        assert done == pytest.approx(2.0)
+
+    def test_an_unwritable_directory_does_not_raise(self, tmp_path):
+        """Hours of samples must not be lost to a full or read-only filesystem."""
+        reporter = self._reporter(tmp_path / "missing", mode="none")
+        reporter.update(1, 5, force=True)                  # no exception
+
+    def test_in_flight_work_moves_the_line(self, tmp_path, capsys):
+        """A run of a few large batches would otherwise sit still for minutes."""
+        reporter = self._reporter(tmp_path, world=1, stream=sys.stdout)
+        reporter.update(0, 10, in_flight=2.5, force=True)
+        assert "2/10 img" in capsys.readouterr().out
+
+    def test_progress_choice_does_not_invalidate_a_shard(self, tmp_path):
+        """--progress is display; a shard made under one is reusable under any."""
+        from images import run_edm
+
+        args = TestSharding._args(tmp_path, num_samples=2)
+        denoiser = run_edm.build_denoiser(args)
+        setting = models.build(denoiser, num_steps=args.num_steps, eps=args.eps)
+        tree = run_edm.build_tree(args, setting.num_steps)
+
+        signature = run_edm.experiment_signature(args, setting, tree, denoiser)
+        args.progress = "none"
+        assert run_edm.experiment_signature(args, setting, tree, denoiser) == signature
+
+    def test_the_sampler_reports_every_round_monotonically(self):
+        """The hook's ratio must rise to exactly 1: it is what fills the bar."""
+        from specdiff import BatchedSpeculativeSampler, DelayedDriftProposal
+
+        denoiser = models.EDMDenoiser(GaussianEDMPrecond(img_resolution=8))
+        setting = models.build(denoiser, num_steps=STEPS, eps=EPS)
+        sampler = BatchedSpeculativeSampler(
+            target=setting.target, proposal=DelayedDriftProposal(setting.target),
+            schedule=setting.schedule,
+            tree=DraftTree.uniform(branching=2, lookahead=2),
+            verifier=create_verifier("d-grs"), num_steps=setting.num_steps,
+        )
+        seen = []
+        generator = torch.Generator().manual_seed(0)
+        y0 = torch.randn((3, *setting.state_shape), generator=generator)
+        models.sample_trajectory(
+            setting, sampler, y0, rng=generator, generator=generator,
+            on_round=lambda taken, total: seen.append((taken, total)),
+        )
+
+        assert seen, "no round was reported"
+        assert [t for t, _ in seen] == sorted(t for t, _ in seen)
+        assert {total for _, total in seen} == {3 * setting.num_steps}
+        assert seen[-1][0] == seen[-1][1]                   # ends exactly full
 
 
 def test_merge_refuses_unexpected_extra_rank(tmp_path):

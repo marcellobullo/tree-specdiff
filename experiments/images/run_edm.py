@@ -23,6 +23,11 @@ Output (``--out``):
     meta.json    protocol + NFE accounting
     grid.png     8x8 preview montage
 
+Progress is one bar for the whole job, sharded or not: every rank writes
+``progress_rankNNN.json`` while it works and rank 0 sums them, so a multi-GPU
+run reports a single line. ``--progress`` chooses the display; off a terminal it
+is one line a minute.
+
 Conditional and unconditional checkpoints are interchangeable: ``--labels auto``
 (the default) reads the checkpoint and either samples unconditionally or draws
 one class per image, so swapping ``--network`` between a ``-cond-`` and a
@@ -59,11 +64,12 @@ from specdiff.edm_checkout import default_edm_checkout, is_edm_checkout  # noqa:
 
 from images import models  # noqa: E402
 from images.run_common import (  # noqa: E402
-    add_metrics, file_identity, load_shards, merged_metrics, metric_totals,
-    run_signature, save_grid, summarise_metrics, validate_reusable_shard,
+    ProgressReporter, add_metrics, file_identity, load_shards, merged_metrics,
+    metric_totals, run_signature, save_grid, summarise_metrics,
+    validate_reusable_shard,
 )
 
-REPORT_EVERY_S = 60.0     # progress line / progress.json cadence
+REPORT_EVERY_S = 60.0     # progress-line cadence when there is no bar to redraw
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -120,6 +126,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true",
                    help="regenerate shards that already exist instead of "
                         "reusing them (the default makes a crashed run resumable)")
+    p.add_argument("--progress", default="auto",
+                   choices=("auto", "bar", "plain", "none"),
+                   help="rank 0's progress display: 'auto' draws a bar on a "
+                        "terminal and prints a line every 60s in a log, 'bar' "
+                        "and 'plain' force one, 'none' silences it. Every rank "
+                        "writes progress_rankNNN.json either way")
     p.add_argument("--check-contract", action="store_true")
     return p.parse_args(argv)
 
@@ -300,7 +312,8 @@ def experiment_signature(args, setting, tree, denoiser):
     )
 
 
-def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, rank):
+def generate_shard(args, setting, sampler, denoiser, labels, start, count, out,
+                   rank, reporter):
     """Generate this process's block and write it atomically."""
     if count < 1:
         raise SystemExit("each process must receive at least one sample")
@@ -310,6 +323,9 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
         validate_reusable_shard(
             shard, signature=signature, rank=rank, start=start, count=count
         )
+        # Report the reused block as finished, so the global bar counts it and
+        # this rank contributes no throughput to the ETA -- it has no work left.
+        reporter.update(count, count, force=True)
         print(f"rank {rank}: reusing {shard.name}")
         return shard
 
@@ -317,7 +333,8 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
     generator = torch.Generator(device=args.device).manual_seed(args.seed + rank)
     n_endpoints = len(setting.deterministic_steps)
     chunks, metrics = [], {}
-    t0, done, last_report = time.time(), 0, 0.0
+    t0, done = time.time(), 0
+    reporter.update(0, count)
 
     while done < count:
         n = min(batch, count - done)
@@ -329,27 +346,25 @@ def generate_shard(args, setting, sampler, denoiser, labels, start, count, out, 
             (n, *setting.state_shape), generator=generator,
             device=args.device, dtype=torch.float32,
         )
+
+        def on_round(steps_taken, steps_total, _done=done, _n=n):
+            # Partial credit for the batch in flight: a run with few batches
+            # would otherwise sit still for minutes between updates.
+            reporter.update(_done, count, in_flight=_n * steps_taken / max(steps_total, 1))
+
         y, result = models.sample_trajectory(
-            setting, sampler, y0, rng=generator, generator=generator
+            setting, sampler, y0, rng=generator, generator=generator,
+            on_round=on_round,
         )
         chunks.append(models.to_uint8(y).cpu())
         add_metrics(metrics, metric_totals(
             result, num_steps=setting.num_steps, deterministic_steps=n_endpoints
         ))
         done += n
-
-        now = time.time()
-        if now - last_report > REPORT_EVERY_S or done == count:
-            rate = done / max(now - t0, 1e-9)
-            with open(out / f"progress_rank{rank:03d}.json", "w") as f:
-                json.dump({"rule": args.rule, "rank": rank, "done": done,
-                           "of": count, "img_per_s": round(rate, 4),
-                           "elapsed_s": round(now - t0, 1)}, f)
-            if rank == 0:
-                print(f"  rank 0: {done}/{count}  {rate:.2f} img/s  "
-                      f"speedup {result.speedup:.2f}x  acc {result.acceptance_rate:.3f}",
-                      flush=True)
-            last_report = now
+        reporter.update(
+            done, count, force=(done == count),
+            spd=round(result.speedup, 2), acc=round(result.acceptance_rate, 3),
+        )
 
     summary = summarise_metrics(metrics)
     torch.save(
@@ -419,7 +434,7 @@ def merge_shards(args, setting, tree, denoiser, label_mode, out, world=None):
     with open(out / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
     save_grid(samples, out / "grid.png")
-    for path in out.glob("progress_rank*.json"):
+    for path in out.glob("progress_rank*"):        # including any stale .tmp
         path.unlink()
 
     secs = meta["seconds_per_rank"]
@@ -493,7 +508,15 @@ def main(argv=None) -> None:
               + (f" over {denoiser.num_classes} classes" if label_mode != "none" else ""))
     print(f"rank {rank}: images {start}..{start + count - 1}", flush=True)
 
-    generate_shard(args, setting, sampler, denoiser, labels, start, count, out, rank)
+    reporter = ProgressReporter(
+        out, rank=rank, world=world, total=args.num_samples, label=args.rule,
+        mode=args.progress, plain_every_s=REPORT_EVERY_S,
+    )
+    try:
+        generate_shard(args, setting, sampler, denoiser, labels, start, count,
+                       out, rank, reporter)
+    finally:
+        reporter.close()
 
     barrier(accelerator)
     if rank == 0:
