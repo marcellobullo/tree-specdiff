@@ -1,0 +1,38 @@
+{
+  "conditioning": {
+    "labels": "uniform"
+  },
+  "driver": "edm",
+  "execution": {
+    "forward_batch": 0
+  },
+  "method": {
+    "branching": 3,
+    "lookahead": 4,
+    "match": "verification",
+    "rule": "d-grs"
+  },
+  "model": {
+    "edm_repo": "edm/",
+    "network": "edm/edm-cifar10-32x32-cond-vp.pkl",
+    "toy": false,
+    "toy_classes": 0,
+    "toy_resolution": 16
+  },
+  "sampler": {
+    "evaluate_leaves": false,
+    "prefetch": "nearest"
+  },
+  "sampling": {
+    "num_samples": 100,
+    "sample_batch": 8,
+    "seed": 0
+  },
+  "schedule": {
+    "eps": 0.2,
+    "num_steps": 100,
+    "s_noise": 1.0,
+    "shift": 1.0
+  },
+  "version": 1
+}

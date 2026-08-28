@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import math
+import statistics as st
 import sys
 import time
 from pathlib import Path
@@ -531,12 +532,14 @@ class TestSharding:
 
         signature = run_edm.experiment_signature(args, setting, tree, denoiser)
         totals = {
+            "batches": 1,
             "baseline_calls": 1, "target_calls": 1,
             "end_to_end_baseline_calls": 1, "end_to_end_target_calls": 1,
             "isolated_speedup_sum": 2.0, "sample_count": 2,
             "occupancy_active": 2, "occupancy_slots": 2,
             "accepted_levels": 1, "verified_levels": 2,
             "target_states_evaluated": 1,
+            "rounds_per_trajectory": [1, 1],
         }
         for rank, secs in ((0, 10.0), (1, 40.0)):        # rank 1 four times slower
             torch.save({"samples": torch.zeros((2, *setting.state_shape), dtype=torch.uint8),
@@ -591,6 +594,17 @@ class TestSharding:
         samples = torch.load(tmp_path / "samples.pt", weights_only=True)
         assert samples.shape == (9, *setting.state_shape)
         assert samples.dtype == torch.uint8
+        # One NFE count per image, surviving both the chunking inside a rank
+        # and the merge across ranks -- entry i belongs to row i of samples.pt.
+        rounds = meta["metric_totals"]["rounds_per_trajectory"]
+        assert len(rounds) == 9
+        assert all(1 <= r <= setting.num_steps for r in rounds)
+        isolated = [setting.num_steps / r for r in rounds]
+        assert meta["mean_isolated_speedup"] == pytest.approx(st.mean(isolated))
+        assert meta["std_isolated_speedup"] == pytest.approx(st.stdev(isolated))
+        assert meta["sem_isolated_speedup"] == pytest.approx(
+            st.stdev(isolated) / 3            # sqrt(9)
+        )
         # Shards are consumed by the merge, so a resumed run does not re-merge
         # stale pieces alongside the finished file.
         assert not list(tmp_path.glob("shard_*.pt"))
@@ -644,23 +658,40 @@ class TestExperimentBookkeeping:
         from images.run_common import add_metrics, summarise_metrics
 
         def counters(calls):
+            # One image per chunk, so that image's isolated cost is the chunk's
+            # own: r_i = C_b, and the fake agrees with its own rounds.
             return {
+                "batches": 1,
                 "baseline_calls": 10, "target_calls": calls,
                 "end_to_end_baseline_calls": 12,
                 "end_to_end_target_calls": calls + 2,
-                "isolated_speedup_sum": 2.0, "sample_count": 1,
+                "isolated_speedup_sum": 10.0 / calls, "sample_count": 1,
                 "occupancy_active": 1, "occupancy_slots": 2,
                 "accepted_levels": 1, "verified_levels": 2,
                 "target_states_evaluated": 3,
+                "rounds_per_trajectory": [calls],
             }
 
+        isolated = [10.0 / 1, 10.0 / 9]
         total = {}
         add_metrics(total, counters(1))
         add_metrics(total, counters(9))
         summary = summarise_metrics(total)
         assert summary["speedup"] == pytest.approx(2.0)  # 20 baseline / 10 actual
-        assert summary["speedup"] != pytest.approx((10.0 + 10.0 / 9.0) / 2)
+        # A ratio of sums, not a mean of ratios: the fast chunk cannot pay for
+        # the slow one, which is exactly the mean the isolated metric reports.
+        assert summary["speedup"] != pytest.approx(st.mean(isolated))
+        assert summary["mean_isolated_speedup"] == pytest.approx(st.mean(isolated))
+        assert (summary["end_to_end_speedup"] < summary["speedup"]
+                < summary["mean_isolated_speedup"])
         assert summary["acceptance_rate"] == 0.5
+        # Per-image records concatenate instead of summing, and the spread is
+        # over those images -- the only per-image terms a run keeps.
+        assert total["rounds_per_trajectory"] == [1, 9]
+        assert summary["std_isolated_speedup"] == pytest.approx(st.stdev(isolated))
+        assert summary["sem_isolated_speedup"] == pytest.approx(
+            st.stdev(isolated) / len(isolated) ** 0.5
+        )
 
     def test_changed_configuration_refuses_a_reused_shard(self, tmp_path):
         from images import run_edm

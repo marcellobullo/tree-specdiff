@@ -8,6 +8,7 @@ import json
 import math
 import os
 import shutil
+import statistics as st
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ import torch
 
 SIGNATURE_VERSION = 1
 _METRIC_KEYS = (
+    "batches",
     "baseline_calls",
     "target_calls",
     "end_to_end_baseline_calls",
@@ -29,6 +31,10 @@ _METRIC_KEYS = (
     "verified_levels",
     "target_states_evaluated",
 )
+# Per-image records: concatenated, never summed. Chunks run in image order and
+# shards merge rank by rank, so entry `i` belongs to image `i` -- row `i` of
+# `samples.pt`, the same mapping the labels use.
+_SEQUENCE_KEYS = ("rounds_per_trajectory",)
 
 
 def _plain(value: Any) -> Any:
@@ -507,13 +513,27 @@ def run_signature(driver: str, args, setting, tree, *, extra: Mapping[str, Any])
 
 
 def metric_totals(result, *, num_steps: int, deterministic_steps: int) -> dict:
-    """Raw additive counters from one batched sampling call."""
+    """Raw counters from one batched sampling call.
+
+    The terms of the ratios :func:`summarise_metrics` reports, which is where
+    the speed-ups are defined. A rank sums these over the chunks it runs and
+    the merge sums them over the ranks, so every counter here has to be
+    additive -- including `batches`, which counts the calls that contributed
+    and is what makes `N` and `D` recoverable from the sums afterwards.
+
+    `rounds_per_trajectory` is the exception, concatenated rather than summed:
+    `r_i`, the target calls image `i` would have spent on its own. It is the
+    only per-image quantity the run records. The two batch ratios reduce a
+    batch through a `max` and keep no per-image term at all, so this is what a
+    spread across images has to be computed from.
+    """
     accepted = sum(sum(r.accepted_depth) for r in result.rounds)
     verified = sum(sum(r.committed) for r in result.rounds)
     active = sum(len(r.active) for r in result.rounds)
     slots = len(result.rounds) * result.batch_size
     isolated = sum(num_steps / max(rounds, 1) for rounds in result.rounds_per_trajectory)
     return {
+        "batches": 1,
         "baseline_calls": num_steps,
         "target_calls": result.target_calls,
         "end_to_end_baseline_calls": num_steps + deterministic_steps,
@@ -525,19 +545,94 @@ def metric_totals(result, *, num_steps: int, deterministic_steps: int) -> dict:
         "accepted_levels": accepted,
         "verified_levels": verified,
         "target_states_evaluated": result.target_states_evaluated,
+        "rounds_per_trajectory": [int(r) for r in result.rounds_per_trajectory],
     }
 
 
 def add_metrics(total: dict, part: Mapping[str, Any]) -> None:
     for key in _METRIC_KEYS:
         total[key] = total.get(key, 0) + part[key]
+    for key in _SEQUENCE_KEYS:
+        total.setdefault(key, []).extend(part[key])
 
 
 def summarise_metrics(total: Mapping[str, Any]) -> dict:
+    r"""The reported speed-ups: ratios of the counters :func:`metric_totals` sums.
+
+    Notation, all of it:
+
+    :math:`T`
+        total sampler steps (``--num-steps``).
+    :math:`D`
+        deterministic endpoint steps: the Euler steps `build` strips, the only
+        ones no rule speculates through (``len(deterministic_steps)``).
+    :math:`N = T - D`
+        speculative steps -- the stretch the rules are compared over, and what
+        `num_steps` means everywhere in this module.
+    :math:`M`
+        images in the run (``--num-samples``), indexed :math:`i = 1 \dots M`.
+    :math:`\mathcal{B}`, :math:`|\mathcal{B}|`, :math:`M_b`
+        the batches the run splits into and how many there are (the `batches`
+        counter): chunks of ``--sample-batch`` rows within a rank, the last one
+        short, then over the ranks. Batch :math:`b` holds :math:`M_b` images,
+        :math:`\sum_{b \in \mathcal{B}} M_b = M`.
+    :math:`r_i`
+        rounds trajectory :math:`i` needed, one round being one batched target
+        call. Kept per image as `rounds_per_trajectory`.
+    :math:`C_b`
+        target calls batch :math:`b` spent. One call serves every live row and
+        the loop runs until the batch's last trajectory finishes, so
+
+        .. math:: C_b \;=\; \max_{i \in b} r_i .
+
+    The draft tree's own budgets -- :math:`B = K + \dots + K^L` drafted states,
+    :math:`|I|` verification rows -- set what a round *costs* and how large a
+    batch fits, but they appear nowhere below: a speed-up counts calls, not
+    what rides inside one. :math:`B` here is never the batch count.
+
+    The baseline sampler spends one NFE per step: :math:`N` over the
+    speculative stretch, :math:`T = N + D` end to end. Hence
+
+    .. math::
+
+        \mathrm{speedup}
+            &= \frac{\sum_{b \in \mathcal{B}} N}{\sum_{b \in \mathcal{B}} C_b}
+             = \frac{|\mathcal{B}|\,N}
+                    {\sum_{b \in \mathcal{B}} \max_{i \in b} r_i} \\[4pt]
+        \mathrm{end\_to\_end\_speedup}
+            &= \frac{\sum_{b \in \mathcal{B}} (N + D)}
+                    {\sum_{b \in \mathcal{B}} (C_b + D)}
+             = \frac{|\mathcal{B}|\,(N + D)}
+                    {\sum_{b \in \mathcal{B}} C_b \;+\; |\mathcal{B}|\,D} \\[4pt]
+        \mathrm{mean\_isolated\_speedup}
+            &= \frac{1}{M} \sum_{i=1}^{M} \frac{N}{r_i} .
+
+    Both batch ratios are ratios of sums, not means of ratios: a batch is one
+    number, and pooling them pools the terms. Two consequences worth keeping
+    straight when reading a table of these:
+
+    .. math::
+
+        \frac{N + D}{C_b + D} \;\le\; \frac{N}{C_b}
+            \qquad (C_b \le N: \text{a round commits at least one step}),
+        \\[4pt]
+        \frac{N}{C_b} \;=\; \frac{N}{\max_{i \in b} r_i}
+            \;\le\; \frac{1}{M_b} \sum_{i \in b} \frac{N}{r_i} ,
+
+    so ``end_to_end_speedup`` :math:`\le` ``speedup`` :math:`\le`
+    ``mean_isolated_speedup``. The first gap is the two Euler steps nobody
+    speculates through; the second is the straggler cost of sharing a batch --
+    one call serves every live row, so the batch moves at the pace of its
+    slowest member.
+
+    ``occupancy`` and ``acceptance_rate`` are the same shape: pooled ratios of
+    the live rows to the slots, and of the accepted levels to the verified
+    ones.
+    """
     def ratio(numerator, denominator):
         return float(numerator) / max(float(denominator), 1.0)
 
-    return {
+    summary = {
         "speedup": ratio(total["baseline_calls"], total["target_calls"]),
         "end_to_end_speedup": ratio(
             total["end_to_end_baseline_calls"], total["end_to_end_target_calls"]
@@ -547,6 +642,46 @@ def summarise_metrics(total: Mapping[str, Any]) -> dict:
         ),
         "occupancy": ratio(total["occupancy_active"], total["occupancy_slots"]),
         "acceptance_rate": ratio(total["accepted_levels"], total["verified_levels"]),
+    }
+    summary.update(isolated_dispersion(total))
+    return summary
+
+
+def isolated_dispersion(total: Mapping[str, Any]) -> dict:
+    r"""Spread of the per-image speed-ups :math:`N / r_i` behind their mean.
+
+    The sample standard deviation and the standard error it implies:
+
+    .. math::
+
+        s = \sqrt{\frac{1}{M - 1} \sum_{i=1}^{M}
+                  \Big(\frac{N}{r_i} - \mathrm{mean\_isolated\_speedup}\Big)^2},
+        \qquad
+        \mathrm{SEM} = \frac{s}{\sqrt{M}} .
+
+    Root-mean-square deviation with Bessel's correction, not the mean absolute
+    deviation :math:`\frac{1}{M} \sum_i |N/r_i - \mu|`. Both are honest
+    measures of spread; this is the one that divides by :math:`\sqrt{M}` into
+    an error bar on the mean, and the one a Gaussian interval assumes.
+
+    Only ``mean_isolated_speedup`` gets a spread here, because it is the only
+    reported metric that is a mean over images: ``speedup`` and
+    ``end_to_end_speedup`` are one number per run. An error bar on those has to
+    come from repeating the run.
+
+    :math:`N` is recovered as ``baseline_calls / batches``, which is why
+    `batches` is counted at all.
+    """
+    rounds = total.get("rounds_per_trajectory")
+    batches = int(total.get("batches", 0))
+    if not rounds or batches < 1:
+        return {}
+    num_steps = float(total["baseline_calls"]) / batches
+    isolated = [num_steps / max(int(r), 1) for r in rounds]
+    std = st.stdev(isolated) if len(isolated) > 1 else 0.0
+    return {
+        "std_isolated_speedup": std,
+        "sem_isolated_speedup": std / len(isolated) ** 0.5,
     }
 
 
@@ -642,9 +777,19 @@ def merged_metrics(parts) -> tuple[dict, dict]:
     total = {}
     for part in parts:
         metrics = part.get("metric_totals")
-        if not isinstance(metrics, dict) or any(key not in metrics for key in _METRIC_KEYS):
+        if not isinstance(metrics, dict) or any(
+            key not in metrics for key in _METRIC_KEYS + _SEQUENCE_KEYS
+        ):
             raise SystemExit("shard lacks additive metric counters; regenerate with --overwrite")
         add_metrics(total, metrics)
+    # A short list would be a per-image record that no longer indexes images,
+    # which is worse than none: every spread computed from it would be wrong.
+    kept = len(total["rounds_per_trajectory"])
+    if kept != total["sample_count"]:
+        raise SystemExit(
+            f"merged metrics carry {kept} per-image NFE counts for "
+            f"{total['sample_count']} samples; regenerate with --overwrite"
+        )
     return total, summarise_metrics(total)
 
 
