@@ -204,7 +204,8 @@ def summarise(rows: list[dict], metric: str, x: str, over: str = "runs") -> list
             "n": len(values),
             "mean": st.mean(values),
             "std": std,
-            "sem": std / len(values) ** 0.5,
+            "sem": std / (len(values) ** 0.5),
+            "ci": (1.96 * std) / (len(values) ** 0.5),
             "cells": "|".join(sorted({m["cell"] for m in members})),
             "runs": "|".join(sorted({m["run"] for m in members})),
         })
@@ -309,11 +310,11 @@ def main() -> None:
                    help="glob selecting run directories under --root (default: *)")
     p.add_argument("--out", default="results/edm/figures/speedup_vs_budget", type=Path,
                    help="output stem; .pdf, .png and .csv are written")
-    p.add_argument("--metric", default="end_to_end_speedup", choices=METRICS)
+    p.add_argument("--metric", default="mean_isolated_speedup", choices=METRICS)
     p.add_argument("--x", default="verification", choices=("verification", "budget"),
                    help="verification budget |I| (default) or drafted budget B")
     p.add_argument("--xlabel", default=None, help="override the x-axis label")
-    p.add_argument("--band", default="sem", choices=("sem", "std", "none"),
+    p.add_argument("--band", default="sem", choices=("sem", "std", "ci", "none"),
                    help="shaded band: standard error, standard deviation, or none")
     p.add_argument("--over", default="runs", choices=("runs", "images"),
                    help="population the band is taken over (default: runs)")
