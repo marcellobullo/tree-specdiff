@@ -28,7 +28,11 @@ provided by specdiff, so prompt routing requires no sampler changes.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -84,6 +88,64 @@ def churn_std_grid(
     return torch.where(active, std, torch.zeros_like(std))
 
 
+def prompt_cache_key(
+    *, model_id, prompts, negative_prompt, do_cfg, dtype, encode_device,
+    encode_batch,
+) -> str:
+    """Identity of one encoded caption table.
+
+    Everything that can change the numbers is in the key, so a hit is the same
+    computation and never merely the same captions. ``encode_device`` and
+    ``encode_batch`` are in it for the reason ``--forward-batch`` is held fixed
+    across a comparison set: the text encoders are not bit-reproducible across
+    devices or batch shapes.
+    """
+    captions = hashlib.sha256("\n".join(prompts).encode()).hexdigest()
+    identity = json.dumps(
+        {"v": 1, "model": str(model_id), "captions": captions,
+         "count": len(prompts), "negative": negative_prompt,
+         "cfg": bool(do_cfg), "dtype": str(dtype),
+         "encode_device": str(encode_device), "encode_batch": int(encode_batch)},
+        sort_keys=True,
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()[:32]
+
+
+def read_prompt_cache(directory, key: str):
+    """The cached tables, or ``None`` on any miss.
+
+    Absent, stale and unreadable all read as a miss, because the answer to each
+    is the same -- encode it again. A half-written file from a killed run must
+    not be an error a whole sweep dies on.
+    """
+    path = Path(directory) / f"sd3-prompts-{key}.pt"
+    if not path.exists():
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:                                          # noqa: BLE001
+        return None
+    if not isinstance(payload, dict) or payload.get("key") != key:
+        return None
+    return (payload["pos"], payload["pool"], payload["neg"], payload["neg_pool"])
+
+
+def write_prompt_cache(directory, key: str, tables) -> None:
+    """Write the tables atomically, so a reader never sees a partial file.
+
+    Ranks of one job encode the same captions and race to write them. The
+    rename is what makes that harmless: the loser overwrites identical bytes.
+    """
+    out = Path(directory)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"sd3-prompts-{key}.pt"
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    pos, pool, neg, neg_pool = tables
+    torch.save({"key": key, "pos": pos, "pool": pool,
+                "neg": neg, "neg_pool": neg_pool}, tmp)
+    os.replace(tmp, path)
+
+
 class SD3Denoiser:
     """An SD3.5 pipeline exposed as a guided velocity field over latents.
 
@@ -104,11 +166,25 @@ class SD3Denoiser:
         resolution_px: int = 512,
         encode_batch: int = 16,
         free_text_encoders: bool = True,
+        device: "str | torch.device | None" = None,
+        encode_device: "str | torch.device | None" = None,
+        prompt_cache: "str | Path | None" = None,
+        cache_id: str = "",
     ) -> None:
         self.pipe = pipe
         self.transformer = pipe.transformer
-        self.device = pipe.device
-        self.dtype = pipe.dtype
+        # `device` is where sampling happens. It must be given whenever the
+        # transformer has not been moved there yet -- the low-memory path below
+        # moves it only after the text encoders are gone, and `pipe.device`
+        # would report the CPU until then.
+        self.device = torch.device(device) if device is not None else pipe.device
+        # Off the transformer, not the pipeline: `pipe.dtype` is the *first*
+        # module's, so a float32 text encoder would redefine what latents are
+        # cast to. The toy pipeline has no transformer dtype, so it falls back.
+        self.dtype = getattr(pipe.transformer, "dtype", pipe.dtype)
+        # Where the text encoders run, which need not be where sampling does.
+        self.encode_device = (torch.device(encode_device)
+                              if encode_device is not None else self.device)
         self.guidance_scale = float(guidance_scale)
         self.do_cfg = self.guidance_scale > 1.0
         self.resolution_px = int(resolution_px)
@@ -133,28 +209,25 @@ class SD3Denoiser:
         self.prompts = prompts
         self.per_sample_prompts = len(prompts) > 1
 
-        pos, pool = [], []
-        with torch.no_grad():
-            for i in range(0, len(prompts), encode_batch):
-                p, n, pp, np_ = pipe.encode_prompt(
-                    prompt=prompts[i : i + encode_batch],
-                    prompt_2=None,
-                    prompt_3=None,
-                    negative_prompt=negative_prompt,
-                    do_classifier_free_guidance=self.do_cfg,
-                    device=self.device,
-                    num_images_per_prompt=1,
-                )
-                if not pos:
-                    # One negative for the whole run: encode_prompt hands it back
-                    # duplicated per row, so keep one and expand at call time.
-                    self.neg = None if n is None else n[:1].clone()
-                    self.neg_pool = None if np_ is None else np_[:1].clone()
-                pos.append(p.to("cpu"))
-                pool.append(pp.to("cpu"))
+        key = prompt_cache_key(
+            model_id=cache_id, prompts=prompts, negative_prompt=negative_prompt,
+            do_cfg=self.do_cfg, dtype=self.dtype,
+            encode_device=self.encode_device.type, encode_batch=encode_batch,
+        )
+        tables = read_prompt_cache(prompt_cache, key) if prompt_cache else None
+        self.prompt_cache_hit = tables is not None
+        if tables is None:
+            tables = self._encode(pipe, prompts, negative_prompt, encode_batch)
+            if prompt_cache:
+                write_prompt_cache(prompt_cache, key, tables)
 
-        self._pos_table = torch.cat(pos)      # (P, seq, dim), on the CPU
-        self._pool_table = torch.cat(pool)    # (P, pooled_dim), on the CPU
+        # (P, seq, dim) and (P, pooled_dim), both on the CPU: see the module
+        # docstring on why the caption table never goes to the GPU whole.
+        self._pos_table, self._pool_table, neg, neg_pool = tables
+        # The negative is a single row, expanded per call, so it does go there.
+        # It is already in `dtype`, which a float32 CPU encode makes necessary.
+        self.neg = None if neg is None else neg.to(self.device)
+        self.neg_pool = None if neg_pool is None else neg_pool.to(self.device)
         if self.per_sample_prompts:
             self.pos = self.pos_pool = None   # uploaded per batch
         else:
@@ -164,6 +237,14 @@ class SD3Denoiser:
         if free_text_encoders:
             self.free_text_encoders()
 
+        # The sampling modules move last, so the peak on `device` never holds a
+        # text encoder that has already been dropped. A no-op when the caller
+        # placed the whole pipeline itself.
+        for name in ("transformer", "vae"):
+            module = getattr(pipe, name, None)
+            if isinstance(module, torch.nn.Module) and module.device != self.device:
+                module.to(self.device)
+
     @classmethod
     def from_pretrained(
         cls,
@@ -171,17 +252,44 @@ class SD3Denoiser:
         *,
         device: str = "cuda:0",
         dtype: torch.dtype = torch.bfloat16,
+        encode_device: Optional[str] = None,
         **kwargs,
     ) -> "SD3Denoiser":
-        """Build from a hub id or a local diffusers directory."""
+        """Build from a hub id or a local diffusers directory.
+
+        ``encode_device`` is where the text encoders run. ``None`` puts the
+        whole pipeline on ``device``, which needs all 16.3 GiB at once.
+
+        Naming another device -- in practice ``"cpu"`` -- loads the text
+        encoders there and leaves only the transformer and the VAE on
+        ``device``. The peak drops from ~16.3 GiB to ~4.8 GiB, which is what
+        makes a 10 GiB card usable. Nothing about the sampling changes: the
+        text encoders run once, before the first latent exists, and are freed
+        immediately afterwards.
+
+        A CPU text encoder is loaded in float32. bfloat16 has no CPU kernels
+        worth the name -- T5-XXL measures ~3x slower in it -- and the
+        embeddings are cast back to ``dtype`` before the transformer sees them.
+        """
         from diffusers import StableDiffusion3Pipeline
 
         pipe = StableDiffusion3Pipeline.from_pretrained(model_id, torch_dtype=dtype)
-        pipe.to(device)
-        return cls(pipe, **kwargs)
+        if encode_device is None:
+            pipe.to(device)
+            return cls(pipe, device=device, cache_id=model_id, **kwargs)
+
+        where = torch.device(encode_device)
+        for name in ("text_encoder", "text_encoder_2", "text_encoder_3"):
+            encoder = getattr(pipe, name, None)
+            if encoder is not None:
+                encoder.to(where, torch.float32 if where.type == "cpu" else dtype)
+        # The transformer and the VAE stay put; __init__ moves them once the
+        # text encoders are gone.
+        return cls(pipe, device=device, encode_device=where,
+                   cache_id=model_id, **kwargs)
 
     def free_text_encoders(self) -> None:
-        """Drop the text towers once every prompt is encoded.
+        """Drop the text encoders once every prompt is encoded.
 
         11.2 of the 16.3 GiB an SD3.5-medium pipeline holds is T5-XXL plus the
         two CLIPs; the transformer that does the sampling is 4.5 GiB. After
@@ -194,6 +302,49 @@ class SD3Denoiser:
                 setattr(self.pipe, name, None)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _encode(self, pipe, prompts, negative_prompt, encode_batch):
+        """Encode every caption plus one negative; CPU tensors in ``self.dtype``.
+
+        The negative is encoded **once**, on its own. Asking ``encode_prompt``
+        for it alongside the captions makes diffusers repeat it for every row of
+        every batch -- 100 captions cost 200 sequences -- and every row but the
+        first is then discarded. Encoding it separately is the same function on
+        the same text, and halves the work.
+
+        It is the same computation, not the same bits: a batch of one sums in a
+        different order from a batch of sixteen. Measured on SD3.5-medium the
+        gap is ~6e-5 against embeddings of magnitude ~850, which is 46 of
+        1,363,968 elements landing one ulp apart once cast to bfloat16. Rows of
+        a single batch already differ by ~3e-6 among themselves for the same
+        reason. This is the sense in which ``--forward-batch`` is exact too.
+        """
+        pos, pool = [], []
+        with torch.no_grad():
+            for i in range(0, len(prompts), encode_batch):
+                p, _, pp, _ = pipe.encode_prompt(
+                    prompt=prompts[i : i + encode_batch],
+                    prompt_2=None,
+                    prompt_3=None,
+                    do_classifier_free_guidance=False,
+                    device=self.encode_device,
+                    num_images_per_prompt=1,
+                )
+                pos.append(p.to("cpu", self.dtype))
+                pool.append(pp.to("cpu", self.dtype))
+            neg = neg_pool = None
+            if self.do_cfg:
+                n, _, np_, _ = pipe.encode_prompt(
+                    prompt=[negative_prompt],
+                    prompt_2=None,
+                    prompt_3=None,
+                    do_classifier_free_guidance=False,
+                    device=self.encode_device,
+                    num_images_per_prompt=1,
+                )
+                neg = n.to("cpu", self.dtype)
+                neg_pool = np_.to("cpu", self.dtype)
+        return torch.cat(pos), torch.cat(pool), neg, neg_pool
 
     def set_prompt_batch(self, global_indices: Sequence[int]) -> None:
         """Upload this batch's prompt rows, in image order.

@@ -85,7 +85,14 @@ Y_LABEL = "NFE Speedup"
 # `|I|` goes out as plain `B`: the paper's figures name the budget they plot,
 # and the drafted count is not in them. Plotting both at once is what needs the
 # two symbols kept apart.
-X_LABEL = {"verification": r"Budget $B$", "budget": r"Draft Budget $B$"}
+X_LABEL = {"verification": r"Budget $B$", "budget": r"Draft Budget $B$",
+           "k": r"Branching $K$"}
+
+# `--x k` colours by lookahead instead of by rule, because the rule is already
+# carried by the marker and the dash. Qualitative, not a ramp: `L` is a handful
+# of small integers to tell apart, not a quantity to read off a gradient.
+LOOKAHEAD_COLORS = ("#1D3557", "seagreen", "#C1666B", "#7D5BA6", "#B5651D",
+                    "#2A9D8F", "#6C757D")
 
 # `cifar10_n100_eps0.3_verification` -> dataset, sample count, churn, match.
 RUN_DIR = re.compile(
@@ -141,6 +148,9 @@ def load(root: Path, pattern: str = "*") -> list[dict]:
             "method": RULE_LABEL[rule],
             "K": K,
             "L": L,
+            # Lower-case duplicate of `K`: the `--x` choice, the row key and the
+            # summary key are one name throughout, and the CLI choice is `k`.
+            "k": K,
             "budget": budget,
             "verification": verification_budget(K, L),
             "seed": meta.get("seed"),
@@ -160,8 +170,14 @@ def load(root: Path, pattern: str = "*") -> list[dict]:
     return rows
 
 
-def summarise(rows: list[dict], metric: str, x: str, over: str = "runs") -> list[dict]:
+def summarise(rows: list[dict], metric: str, x: str, over: str = "runs",
+              split_lookahead: bool = False) -> list[dict]:
     """Pool runs into one point per `(dataset, eps, method, budget)`.
+
+    `split_lookahead` adds `L` to that key, which is what `--x k` needs: two
+    cells at one `K` and different `L` are the very thing that mode separates,
+    so averaging them would erase the curve being asked for. On the budget axes
+    the same collision is a deliberate pooling instead -- see below.
 
     Two things pool here. Repeats of a cell -- the same `(K, L)` under another
     seed -- are the case `--over runs` bands. Distinct cells landing on one
@@ -177,11 +193,12 @@ def summarise(rows: list[dict], metric: str, x: str, over: str = "runs") -> list
     """
     groups = OrderedDict()
     for row in rows:
-        key = (row["dataset"], row["eps"], row["method"], row[x])
+        key = (row["dataset"], row["eps"], row["method"], row[x],
+               row["L"] if split_lookahead else None)
         groups.setdefault(key, []).append(row)
 
     out = []
-    for (dataset, eps, method, budget), members in sorted(groups.items()):
+    for (dataset, eps, method, budget, lookahead), members in sorted(groups.items()):
         if over == "images":
             blank = [m for m in members if not m["rounds"]]
             if blank:
@@ -200,6 +217,7 @@ def summarise(rows: list[dict], metric: str, x: str, over: str = "runs") -> list
             "eps": eps,
             "method": method,
             x: budget,
+            **({"lookahead": lookahead} if split_lookahead else {}),
             "over": over,
             "n": len(values),
             "mean": st.mean(values),
@@ -234,7 +252,7 @@ def _error_plot(x, y, err, color=None, **kwargs):
 
 def plot(summary: list[dict], out_stem: Path, *, metric: str, x: str, band: str,
          title: str, xlabel: str, height: float, aspect: float,
-         formats=("pdf", "png")) -> None:
+         split_lookahead: bool = False, formats=("pdf", "png")) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -258,16 +276,41 @@ def plot(summary: list[dict], out_stem: Path, *, metric: str, x: str, band: str,
     columns = [f"{e:g}" for e in sorted(set(df["eps"]))]
     methods = [m for m in RULE_LABEL.values() if m in set(df["method"])]
 
+    if split_lookahead:
+        # One line per (rule, L). Colour carries `L` and the marker and dash
+        # carry the rule, so the rule stays readable exactly as it is on the
+        # budget axes and `L` is the new thing the eye has to separate.
+        lookaheads = sorted(set(df["lookahead"]))
+        colour = {L: LOOKAHEAD_COLORS[i % len(LOOKAHEAD_COLORS)]
+                  for i, L in enumerate(lookaheads)}
+        df["series"] = [f"{m}, L={L:g}"
+                        for m, L in zip(df["method"], df["lookahead"])]
+        present = set(df["series"])
+        # Rule-major, so one rule's lookaheads sit together in the legend.
+        order = [f"{m}, L={L:g}" for m in methods for L in lookaheads
+                 if f"{m}, L={L:g}" in present]
+        by_series = dict(zip(df["series"], zip(df["method"], df["lookahead"])))
+        hue, hue_order = "series", order
+        palette = {s: colour[by_series[s][1]] for s in order}
+        marker = [RULE_MARKER[by_series[s][0]] for s in order]
+        linestyle = [RULE_LINESTYLE[by_series[s][0]] for s in order]
+        legend_title = "Sampler and lookahead"
+    else:
+        hue, hue_order = "method", methods
+        palette = {m: RULE_COLOR[m] for m in methods}
+        marker = [RULE_MARKER[m] for m in methods]
+        linestyle = [RULE_LINESTYLE[m] for m in methods]
+        legend_title = "Sampler"
+
     g = sns.FacetGrid(
         data=df,
         row="dataset", row_order=datasets,
         col="eps_label", col_order=columns,
-        hue="method", hue_order=methods,
-        palette={m: RULE_COLOR[m] for m in methods},
+        hue=hue, hue_order=hue_order,
+        palette=palette,
         height=height, aspect=aspect,
         sharey="row",  # speed-ups differ by dataset, not across a dataset's row
-        hue_kws={"marker": [RULE_MARKER[m] for m in methods],
-                 "linestyle": [RULE_LINESTYLE[m] for m in methods]},
+        hue_kws={"marker": marker, "linestyle": linestyle},
     )
     g.map(_error_plot, x, "mean", "err", linewidth=1.8)
 
@@ -279,7 +322,7 @@ def plot(summary: list[dict], out_stem: Path, *, metric: str, x: str, band: str,
         handles.extend(panel_handles)
         labels.extend(panel_labels)
     by_label = dict(zip(labels, handles))
-    g.fig.legend(by_label.values(), by_label.keys(), title="Sampler",
+    g.fig.legend(by_label.values(), by_label.keys(), title=legend_title,
                  bbox_to_anchor=(0.5, 1.02), loc="center",
                  ncol=len(by_label), frameon=False)
 
@@ -311,8 +354,13 @@ def main() -> None:
     p.add_argument("--out", default="results/edm/figures/speedup_vs_budget", type=Path,
                    help="output stem; .pdf, .png and .csv are written")
     p.add_argument("--metric", default="mean_isolated_speedup", choices=METRICS)
-    p.add_argument("--x", default="verification", choices=("verification", "budget"),
-                   help="verification budget |I| (default) or drafted budget B")
+    p.add_argument("--x", default="verification",
+                   choices=("verification", "budget", "k"),
+                   help="verification budget |I| (default), drafted budget B, or "
+                        "the branching factor K. `k` draws one curve per "
+                        "lookahead L, since cells sharing a K but not an L are "
+                        "the comparison that mode exists to make and must not "
+                        "be pooled")
     p.add_argument("--xlabel", default=None, help="override the x-axis label")
     p.add_argument("--band", default="sem", choices=("sem", "std", "ci", "none"),
                    help="shaded band: standard error, standard deviation, or none")
@@ -348,7 +396,8 @@ def main() -> None:
             f"--metric {' or '.join(sorted(PER_IMAGE))}, or --over runs with repeated seeds."
         )
 
-    summary = summarise(rows, args.metric, args.x, args.over)
+    split_lookahead = args.x == "k"
+    summary = summarise(rows, args.metric, args.x, args.over, split_lookahead)
 
     csv_path = args.out.with_suffix(".csv")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -372,7 +421,7 @@ def main() -> None:
     try:
         plot(summary, args.out, metric=args.metric, x=args.x, band=args.band,
              title=args.title, xlabel=args.xlabel, height=args.height,
-             aspect=args.aspect)
+             aspect=args.aspect, split_lookahead=split_lookahead)
     except ImportError as exc:
         missing_module = getattr(exc, "name", None) or str(exc)
         print(f"cannot plot: {missing_module} is not installed ({exc}). "

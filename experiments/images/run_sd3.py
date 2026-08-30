@@ -129,8 +129,23 @@ PARAMS = (
           help="latents VAE-decoded per call; the decode peaks higher "
                "than the transformer at 1024px"),
     Param("keep_text_encoders", "execution", False, bool,
-          help="keep the text towers resident after pre-encoding. They "
+          help="keep the text encoders resident after pre-encoding. They "
                "are 11.2 of 16.3 GiB and never called again"),
+    Param("encode_device", "execution", None, str,
+          help="where the text encoders run, e.g. `cpu`. Unset keeps them "
+               "with the transformer, which needs all 16.3 GiB resident "
+               "at once; `cpu` leaves only the transformer and the VAE on "
+               "the GPU and drops the peak to ~4.8 GiB, at a few minutes "
+               "of CPU encoding per run. Required below ~16 GiB of VRAM"),
+
+    Param("prompt_cache", "", None, str, where="cli",
+          help="directory to cache the encoded captions in. Every cell of "
+               "a sweep encodes the same caption set, so this turns one "
+               "encode per cell into one for the grid. Placement, not "
+               "protocol: the key covers the model, the captions, the "
+               "negative prompt, the dtype, --encode-device and "
+               "--encode-batch, so a hit is the same computation and not "
+               "merely the same text. Ignored with --toy"),
 
     Param("out", "", None, str, where="cli", required=True),
     Param("device", "", None, str, where="cli",
@@ -202,6 +217,7 @@ def build_denoiser(args) -> sd3.SD3Denoiser:
         )
     return sd3.SD3Denoiser.from_pretrained(
         args.network, device=args.device, dtype=DTYPES[args.dtype],
+        encode_device=args.encode_device, prompt_cache=args.prompt_cache,
         prompt=prompt, negative_prompt=args.negative_prompt,
         guidance_scale=args.guidance_scale, resolution_px=args.resolution_px,
         encode_batch=args.encode_batch,

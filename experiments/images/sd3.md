@@ -23,6 +23,38 @@ which asks whether both rules produce equally prompt-faithful images.
 **doubles every forward**: a round pushes `sample_batch × |I| × 2` latents
 through the transformer. `--forward-batch` stops being optional.
 
+## Cards below ~16 GiB: `--encode-device cpu`
+
+By default the whole pipeline goes to one GPU, so the load alone needs ~18 GiB.
+`--encode-device cpu` runs the text encoders on the CPU instead. Only the
+transformer and the VAE ever reach the GPU, which drops the peak to about
+4.8 GiB. The text encoders run once, before the first latent exists, and
+`free_text_encoders` drops them immediately afterwards — so this changes *where*
+the conditioning is computed, and nothing about what is sampled.
+
+A CPU text encoder loads in float32, because bfloat16 has no useful CPU kernels
+(T5-XXL measures ~3x slower in it). Encoding 100 captions costs about 2.5
+minutes per run. The embeddings are cast back to `--dtype` before the
+transformer sees them.
+
+Measured on a 10 GiB RTX 3080, at the heaviest cell of the default grid
+(`K=7, L=2`, so `|I|=8`):
+
+| setting | peak | result |
+| --- | --- | --- |
+| default (no `--encode-device`) | — | fails during the load |
+| `--encode-device cpu --decode-batch 8` | 9999 MiB | fails in the VAE decode |
+| `--encode-device cpu --decode-batch 2` | 8839 MiB | works |
+
+**Lower `--decode-batch` before `--sample-batch`.** At 512px the VAE decode
+peaks higher than the transformer does, so it is the first thing to fail, and
+it costs nothing to shrink — the decode is a fixed cost per image either way.
+
+A driver note. On driver 470 an out-of-memory failure is reported as
+`RuntimeError: CUDA driver error: invalid argument`, not as the usual
+`CUDA out of memory`. Read that message as "too big", and lower
+`--decode-batch`.
+
 ## 0. Prerequisites
 
 ```bash

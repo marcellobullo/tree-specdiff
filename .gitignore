@@ -7,6 +7,7 @@ dist/
 .eggs/
 /edm/
 /results/
+/old/
 
 # Virtual environments
 .venv/
@@ -32,3 +33,5 @@ specdiff-docs.html
 
 # paper
 diffusion_speculative_sampling-paper.pdf
+
+

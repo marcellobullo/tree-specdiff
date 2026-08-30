@@ -16,10 +16,10 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 NETWORK="${NETWORK:-stabilityai/stable-diffusion-3.5-medium}"
 PROMPTS="${PROMPTS:?set PROMPTS to a captions file, one per line}"
 
-GPUS="${GPUS:-0,1,2,3}"
-NUM_SAMPLES="${NUM_SAMPLES:-1000}"
-NUM_STEPS="${NUM_STEPS:-28}"
-EPS="${EPS:-0.25}"
+GPUS="${GPUS:-0,1}"
+NUM_SAMPLES="${NUM_SAMPLES:-100}"
+NUM_STEPS="${NUM_STEPS:-50}"
+EPS="${EPS:-0.8}"
 SEED="${SEED:-0}"
 GUIDANCE="${GUIDANCE:-7.0}"
 RESOLUTION="${RESOLUTION:-512}"
@@ -27,18 +27,36 @@ DTYPE="${DTYPE:-bfloat16}"
 DECODE_BATCH="${DECODE_BATCH:-8}"
 FORWARD_BATCH="${FORWARD_BATCH:-16}"
 NEGATIVE="${NEGATIVE:-}"
+# Where the text encoders run. Empty keeps them with the transformer, which
+# needs all ~18 GiB resident at once. Set ENCODE_DEVICE=cpu below ~16 GiB VRAM:
+# only the transformer and the VAE then reach the GPU (~4.8 GiB), at the cost of
+# a few minutes of CPU encoding per cell.
+ENCODE_DEVICE="${ENCODE_DEVICE:-}"
+# Cache of the encoded captions. Every cell of a grid encodes the same caption
+# set with the same model and the same negative prompt, so one encode can serve
+# all of them instead of one per cell. Shared across sweeps on purpose: the key
+# covers what changes the numbers, and eps / cfg / match are not among them.
+# `-` not `:-`, so CACHE_ENCODED_PROMPTS= disables it. About 270 MB per 100
+# captions, so check the free space before pointing it at a 30k set.
+CACHE_ENCODED_PROMPTS="${CACHE_ENCODED_PROMPTS-$REPO/results/sd3/_prompt_cache}"
 # SD3.5-medium in bf16 is ~18 GiB of weights (T5-XXL dominates) before a single
 # latent exists, so the bar for a usable GPU is much higher than for EDM.
-MIN_FREE_MIB="${MIN_FREE_MIB:-24000}"
+#MIN_FREE_MIB="${MIN_FREE_MIB:-24000}"
+MIN_FREE_MIB="${MIN_FREE_MIB:-10000}"
 
-CONFIGS="${CONFIGS-2,2 3,2 2,3 3,3}"
+CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 6,2 7,2 8,2 9,2 10,2 3,2 3,3 3,4 3,5 3,6 3,7 3,8 3,9 3,10}"
 RULES="${RULES-d-grs rmc}"
 MATCH="${MATCH:-verification}"
-# Sampler options and S_noise: protocol that does not appear in a cell's output
-# path, so the guard in run_cell is the only thing stopping two settings being
-# pooled into one grid. Same treatment as sweep.sh.
+# Sampler options, S_noise and the timestep shift: protocol that does not appear
+# in a cell's output path, so the guard in run_cell is the only thing stopping
+# two settings being pooled into one grid. Same treatment as sweep.sh.
 SAMPLER_CONFIG="${SAMPLER_CONFIG:-}"
 S_NOISE="${S_NOISE:-1.0}"
+# SD3.5 is trained at 1024px and its noise schedule is resolution dependent, so
+# 512px generation shifts the grid by t -> kt / (1 + (k-1)t). 3.0 is what the
+# pipeline ships and what run_sd3.py defaults to; it is passed explicitly here
+# so a change to that default cannot move a grid without the guard noticing.
+SHIFT="${SHIFT:-3.0}"
 INCLUDE_TARGET="${INCLUDE_TARGET:-1}"
 # Latents per batched target call, BEFORE the CFG doubling. Divided by each
 # cell's |I| to give that cell's --sample-batch, so memory stays flat as K grows.
@@ -74,17 +92,19 @@ log "output   : $OUT_ROOT"
 log "network  : $NETWORK"
 log "prompts  : $PROMPTS (first $NUM_SAMPLES of $avail, noise seed i = $SEED + i)"
 log "sampling : $NUM_SAMPLES samples, T=$NUM_STEPS ($SPEC_STEPS speculative), eps=$EPS"
-log "sd3      : cfg=$GUIDANCE  ${RESOLUTION}px  $DTYPE"
+log "sd3      : cfg=$GUIDANCE  ${RESOLUTION}px  $DTYPE  shift=$SHIFT"
+log "encode   : ${ENCODE_DEVICE:-with the transformer}  cache ${CACHE_ENCODED_PROMPTS:-off}"
 log "gpus     : $GPUS ($NUM_PROC processes)"
 log "configs  : $CONFIGS   rules: $RULES   match: $MATCH"
-POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" <<'PY'
+POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" "$SHIFT" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path.cwd() / "experiments"))
 from images.run_common import load_sampler_config          # noqa: E402
 
 print(json.dumps({"sampler": load_sampler_config(sys.argv[1] or None),
-                  "s_noise": float(sys.argv[2])}, sort_keys=True))
+                  "s_noise": float(sys.argv[2]),
+                  "shift": float(sys.argv[3])}, sort_keys=True))
 PY
 )" || fail "could not resolve the sampler config"
 log "policy   : $POLICY_RESOLVED"
@@ -128,12 +148,14 @@ import json, sys
 
 meta = json.load(open(sys.argv[1]))
 # A cell with no `sampler` block predates the option, and the batched sampler
-# had exactly one behaviour then; s_noise was likewise fixed at 1.0. Naming both
-# lets an older grid be continued deliberately rather than by accident.
+# had exactly one behaviour then; s_noise was likewise fixed at 1.0 and the
+# shift at the pipeline's 3.0. Naming all three lets an older grid be continued
+# deliberately rather than by accident.
 print(json.dumps({
     "sampler": meta.get("sampler", {"evaluate_leaves": False,
                                     "prefetch": "parent"}),
     "s_noise": meta.get("s_noise", 1.0),
+    "shift": meta.get("shift", 3.0),
 }, sort_keys=True))
 PY
 )" || fail "cannot read $out/meta.json"
@@ -142,7 +164,7 @@ PY
          it has  : $was
          this run: $POLICY_RESOLVED
        Either delete the cell to regenerate it under this run's settings, or
-       set SAMPLER_CONFIG / S_NOISE to the ones it already has."
+       set SAMPLER_CONFIG / S_NOISE / SHIFT to the ones it already has."
     fi
     log "skip $rn K=$K L=$L (already done)"; return 0
   fi
@@ -154,6 +176,9 @@ PY
   log "generating $rn K=$K L=$L  (|I|=$iv, sample-batch $sb) -> $out"
   local mp=(); (( NUM_PROC > 1 )) && mp=(--multi_gpu)
   local sc=(); [[ -n "$SAMPLER_CONFIG" ]] && sc=(--sampler-config "$SAMPLER_CONFIG")
+  local ed=(); [[ -n "$ENCODE_DEVICE" ]] && ed=(--encode-device "$ENCODE_DEVICE")
+  local pc=(); [[ -n "$CACHE_ENCODED_PROMPTS" ]] \
+    && pc=(--prompt-cache "$CACHE_ENCODED_PROMPTS")
   accelerate launch "${mp[@]}" --num_processes "$NUM_PROC" --gpu_ids "$GPUS" \
     experiments/images/run_sd3.py \
       --network "$NETWORK" --prompts "$PROMPTS" --negative-prompt "$NEGATIVE" \
@@ -161,8 +186,8 @@ PY
       --num-samples "$NUM_SAMPLES" --num-steps "$NUM_STEPS" --eps "$EPS" \
       --seed "$SEED" --guidance-scale "$GUIDANCE" --resolution-px "$RESOLUTION" \
       --dtype "$DTYPE" --sample-batch "$sb" --forward-batch "$FORWARD_BATCH" \
-      --decode-batch "$DECODE_BATCH" --s-noise "$S_NOISE" \
-      "${sc[@]}" --out "$out" \
+      --decode-batch "$DECODE_BATCH" --s-noise "$S_NOISE" --shift "$SHIFT" \
+      "${sc[@]}" "${ed[@]}" "${pc[@]}" --out "$out" \
     > "$out/generate.log" 2>&1 \
     || fail "failed: $rn K=$K L=$L -- see $out/generate.log"
   log "done $rn K=$K L=$L: $(python - "$out/meta.json" <<'PY'

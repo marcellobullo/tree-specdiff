@@ -197,6 +197,12 @@ IGNORED_IN_SIGNATURE = frozenset({
     "out", "device", "cpu", "no_accelerate", "overwrite", "check_contract",
     "progress", "config", "print_config", "config_provenance",
     "sampler_config", "print_sampler_config",
+    # `prompt_cache` is SD3's alone, and it is placement for the same reason
+    # `sampler_config` is: its key already covers every input that changes the
+    # encoded captions, so a hit reproduces the computation rather than
+    # replacing it. Two runs differing only in whether they read the cache must
+    # therefore share a signature, or their shards would stop being reusable.
+    "prompt_cache",
 })
 
 CONFIG_VERSION = 1
