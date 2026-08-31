@@ -816,6 +816,31 @@ def save_grid(samples: torch.Tensor, path: Path) -> None:
     grid.save(path)
 
 
+# ------------------------------------------------------------------ distributed
+# A shard is one rank's whole block of images, and ranks finish minutes to hours
+# apart: GPUs differ, and with `--encode-device cpu` they also contend for the
+# same cores. The first rank done then sits in `wait_for_everyone()` for exactly
+# that skew. NCCL's default collective timeout is 10 minutes, far below it, so
+# the watchdog would abort the fast rank while the slow one is still generating
+# -- and the merge that follows fails on the shard that was never written. Size
+# the timeout to a shard instead, and let a long sweep raise it further.
+DIST_TIMEOUT_HOURS = 12.0
+
+
+def build_accelerator(*, cpu: bool = False):
+    """`Accelerator` whose collectives outlive the slowest rank's shard."""
+    from datetime import timedelta
+
+    from accelerate import Accelerator
+    from accelerate.utils import InitProcessGroupKwargs
+
+    hours = float(os.environ.get("SPECDIFF_DIST_TIMEOUT_HOURS", DIST_TIMEOUT_HOURS))
+    return Accelerator(
+        cpu=cpu,
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=hours))],
+    )
+
+
 # --------------------------------------------------------------------- progress
 _BAR_WIDTH = 22
 
