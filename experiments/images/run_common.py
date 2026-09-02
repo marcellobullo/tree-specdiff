@@ -11,6 +11,7 @@ import shutil
 import statistics as st
 import sys
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
 
@@ -193,6 +194,37 @@ def load_sampler_config(path: Optional[str]) -> dict:
 #
 # This set and each driver's `where="cli"` parameters are the same fact stated
 # twice, and a test holds them together.
+# The barrier a rank reaches after writing its shard has to absorb the whole
+# straggler gap between the ranks, and torch's default NCCL watchdog is ten
+# minutes. That is a fraction of a percent of a long cell. At `--sample-batch 1`
+# a trajectory's round count varies with its prompt, so two ranks doing equal
+# work finish at unequal times: a 7-hour SD3 cell whose ranks differ by 1% puts
+# the finished one four minutes into the barrier, and a slightly worse split
+# kills a job with both shards all but complete.
+#
+# Waiting here costs an idle GPU and never costs correctness -- the barrier is
+# only reached once a rank's own shard is on disk -- so the timeout is set well
+# past any plausible gap. A genuinely dead rank still fails, just later.
+PROCESS_GROUP_TIMEOUT_HOURS = 4.0
+
+
+def process_group_kwargs():
+    """`InitProcessGroupKwargs` with a straggler-tolerant collective timeout.
+
+    Imported lazily: `run_common` is otherwise dependency-light, and the
+    single-process paths (`--no-accelerate`) never construct an Accelerator.
+
+    `SPECDIFF_PG_TIMEOUT_HOURS` overrides the default for a cell longer than it
+    allows.
+    """
+    from accelerate.utils import InitProcessGroupKwargs
+
+    hours = float(
+        os.environ.get("SPECDIFF_PG_TIMEOUT_HOURS", PROCESS_GROUP_TIMEOUT_HOURS)
+    )
+    return InitProcessGroupKwargs(timeout=timedelta(hours=hours))
+
+
 IGNORED_IN_SIGNATURE = frozenset({
     "out", "device", "cpu", "no_accelerate", "overwrite", "check_contract",
     "progress", "config", "print_config", "config_provenance",

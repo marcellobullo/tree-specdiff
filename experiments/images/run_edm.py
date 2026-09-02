@@ -67,7 +67,8 @@ from images.run_common import (  # noqa: E402
     Param, ProgressReporter, add_arguments, add_metrics, apply_config,
     at_least_one, file_identity, load_shards, merged_metrics, metric_totals,
     non_negative, positive, print_config_template, print_sampler_template,
-    run_signature, save_grid, summarise_metrics, validate_reusable_shard,
+    process_group_kwargs, run_signature, save_grid, summarise_metrics,
+    validate_reusable_shard,
 )
 
 REPORT_EVERY_S = 60.0     # progress-line cadence when there is no bar to redraw
@@ -519,7 +520,9 @@ def main(argv=None) -> None:
     if not args.no_accelerate:
         from accelerate import Accelerator
 
-        accelerator = Accelerator(cpu=args.cpu)
+        accelerator = Accelerator(
+            cpu=args.cpu, kwargs_handlers=[process_group_kwargs()]
+        )
         rank, world = accelerator.process_index, accelerator.num_processes
         args.device = str(accelerator.device)
 
