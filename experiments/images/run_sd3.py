@@ -64,9 +64,9 @@ from specdiff import (  # noqa: E402
 from images import sd3_models as sd3  # noqa: E402
 from images.run_common import (  # noqa: E402
     Param, add_arguments, add_metrics, apply_config, at_least_one,
-    file_identity, load_shards, merged_metrics, metric_totals, non_negative,
-    positive, print_config_template, print_sampler_template,
-    process_group_kwargs, run_signature, save_grid, summarise_metrics,
+    build_accelerator, file_identity, load_shards, merged_metrics,
+    metric_totals, non_negative, positive, print_config_template,
+    print_sampler_template, run_signature, save_grid, summarise_metrics,
     validate_reusable_shard,
 )
 
@@ -477,11 +477,7 @@ def main(argv=None) -> None:
 
     accelerator, rank, world = None, 0, 1
     if not args.no_accelerate:
-        from accelerate import Accelerator
-
-        accelerator = Accelerator(
-            cpu=args.cpu, kwargs_handlers=[process_group_kwargs()]
-        )
+        accelerator = build_accelerator(cpu=args.cpu)
         rank, world = accelerator.process_index, accelerator.num_processes
         args.device = str(accelerator.device)
 
