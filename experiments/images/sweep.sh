@@ -55,7 +55,7 @@ INCLUDE_TARGET="${INCLUDE_TARGET:-1}"
 # Verified nodes per batched target call. Divided by each cell's |I| to get that
 # cell's --sample-batch, so memory stays roughly flat across the grid rather
 # than growing with K.
-NODE_BUDGET="${NODE_BUDGET:-100}"
+NODE_BUDGET="${NODE_BUDGET:-500}"
 
 # Optional JSON file of sampler options (prefetch, evaluate_leaves), passed to
 # every cell so one grid is one policy. Unset, the library defaults apply and
