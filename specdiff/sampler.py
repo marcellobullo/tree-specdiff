@@ -11,6 +11,18 @@ from typing import Any, Callable, List, Optional
 
 from .kernels import NoiseSchedule, ProposalTransition, TargetTransition
 from .ops import Backend, resolve_backend
+from .refinement import (
+    ExactTargetCache,
+    ExactTargetMean,
+    RefinementLayout,
+    RefinementLevel,
+    RefinementUpdateFn,
+    normalize_refinement_iters,
+    picard_update_fn,
+    refine_tree,
+    reusable_exact_target_mean,
+    reusable_target_rows,
+)
 from .trees import ROOT, DraftTree
 from .types import RoundRecord, SamplingResult, VerifyRequest, VerifyResult
 from .verify import CheckedVerifier, Verifier
@@ -84,6 +96,8 @@ class SpeculativeSampler:
         prefetch: str = "nearest",
         evaluate_leaves: bool = False,
         backend: Optional[Backend] = None,
+        proposal_refinement_iters: Optional[int] = None,
+        refinement_update_fn: Optional[RefinementUpdateFn] = None,
     ) -> None:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
@@ -93,6 +107,13 @@ class SpeculativeSampler:
                 'Use "parent" to reuse the verified parent drift or "none" '
                 "to re-evaluate the root."
             )
+        refinement_iters = normalize_refinement_iters(proposal_refinement_iters)
+        if (
+            refinement_iters
+            and refinement_update_fn is not None
+            and not callable(refinement_update_fn)
+        ):
+            raise TypeError("refinement_update_fn must be callable")
         verifier.check_topology(tree)
         self.target = target
         self.proposal = proposal
@@ -105,6 +126,10 @@ class SpeculativeSampler:
         self._check_root_mean = bool(check_contract)
         self._exact_root_mean = None
         self._backend = backend
+        self.proposal_refinement_iters = refinement_iters
+        self.refinement_update_fn = (
+            picard_update_fn if refinement_update_fn is None else refinement_update_fn
+        )
 
     # ------------------------------------------------------------------ public
     def sample(
@@ -163,10 +188,15 @@ class SpeculativeSampler:
         # line 3: L_n = min(L, N - n); the tree is truncated for the final rounds
         lookahead = min(self.tree.depth, self.num_steps - n)
         tree = self.tree.truncate(lookahead)
+        round_calls_before = self.target.num_calls
+        round_states_before = self.target.num_states
 
         states = ops.zeros_stack(tree.size, root_state)
         ops.put(states, [ROOT], root_state[None])
         proposal_means = ops.zeros_stack(tree.size, root_state)
+        scaled_innovations = (
+            ops.zeros_stack(tree.size, root_state) if self.proposal_refinement_iters else None
+        )
 
         # One image is batch_size = 1: every entry belongs to image 0.
         self.proposal.on_round_start((0,), (n,), ops.stack_rows([root_state]))
@@ -189,7 +219,27 @@ class SpeculativeSampler:
             counts = [len(tree.children(u)) for u in parents]
             child_ids = [v for u in parents for v in tree.children(u)]
             noise = ops.randn_stack(len(child_ids), root_state, rng)
-            ops.put(states, child_ids, ops.repeat_rows(means, counts) + sigma * noise)
+            scaled = sigma * noise
+            if scaled_innovations is not None:
+                ops.put(scaled_innovations, child_ids, scaled)
+            ops.put(states, child_ids, ops.repeat_rows(means, counts) + scaled)
+
+        refinement_calls_before = self.target.num_calls
+        refinement_states_before = self.target.num_states
+        refinement_cache: Optional[ExactTargetCache] = None
+        if self.proposal_refinement_iters:
+            refinement_cache = refine_tree(
+                states=states,
+                proposal_means=proposal_means,
+                scaled_innovations=scaled_innovations,
+                layout=self._refinement_layout(tree, n),
+                iterations=self.proposal_refinement_iters,
+                update_fn=self.refinement_update_fn,
+                target=self.target,
+                ops=ops,
+            )
+        refinement_target_calls = self.target.num_calls - refinement_calls_before
+        refinement_target_states = self.target.num_states - refinement_states_before
 
         # ------------------------------------------------ Phase 2: verification
         # lines 11-13. The single target evaluation of the round, batched over
@@ -205,27 +255,59 @@ class SpeculativeSampler:
 
         internal = tree.internal_nodes
         if self.evaluate_leaves:
-            # Leaves are never parents, so nothing needs their target mean to
-            # be *verified*. They are evaluated only so `prefetch="nearest"`
-            # has an exact drift to carry when the round accepts every level.
-            # Costs K^L extra rows; see DraftTree.verification_budget.
-            evaluated = internal + tuple(u for u in range(tree.size)
-                                         if u not in set(internal))
+            # Leaves are evaluated only to support exact next-root prefetching.
+            requested = internal + tuple(
+                u for u in range(tree.size) if u not in set(internal)
+            )
         else:
-            evaluated = internal
-        has_mean = set(evaluated)
-        if known_root_mean is not None:
-            evaluated = tuple(u for u in evaluated if u != ROOT)
+            requested = internal
+        has_mean = set(requested)
 
-        steps = tuple(n + tree.depth_of(u) for u in evaluated)
+        cached = reusable_target_rows(
+            refinement_cache, target=self.target, final_states=states, ops=ops
+        )
         target_means = ops.zeros_stack(tree.size, root_state)
+        reused_ids, reused_indices, reused_steps, reused_values = [], [], [], []
+        evaluated = []
+        for u in requested:
+            step = n + tree.depth_of(u)
+            key = (u, 0, u, step)
+            value = cached.get(key)
+            if value is None and u == ROOT and known_root_mean is not None:
+                value = reusable_exact_target_mean(
+                    known_root_mean, target=self.target, index_in_batch=0,
+                    step=step, state=states[u], ops=ops,
+                )
+            if value is None:
+                evaluated.append(u)
+            else:
+                reused_ids.append(u)
+                reused_indices.append(0)
+                reused_steps.append(step)
+                reused_values.append(value)
+
+        if reused_ids:
+            ops.put(target_means, reused_ids, ops.stack_rows(reused_values))
+        verification_calls_before = self.target.num_calls
+        verification_states_before = self.target.num_states
+        steps = tuple(n + tree.depth_of(u) for u in evaluated)
         if evaluated:
-            ops.put(target_means, evaluated,
-                    self.target((0,) * len(steps), ops.take(states, evaluated), steps))
-        if known_root_mean is not None:
-            ops.put(target_means, [ROOT], known_root_mean[None])
-            if self._check_root_mean:
-                self._verify_exact_root(ops, states, target_means, n)
+            ops.put(
+                target_means,
+                evaluated,
+                self.target((0,) * len(steps), ops.take(states, evaluated), steps),
+            )
+        verification_target_calls = self.target.num_calls - verification_calls_before
+        verification_target_states = self.target.num_states - verification_states_before
+        if self._check_root_mean and reused_ids:
+            self._verify_exact_cached(
+                ops,
+                states,
+                target_means,
+                tuple(reused_ids),
+                tuple(reused_indices),
+                tuple(reused_steps),
+            )
 
         # -------------------------------------------------- Phase 3: acceptance
         # lines 15-23. Walk down from the root, stopping at the first rejection.
@@ -280,6 +362,14 @@ class SpeculativeSampler:
                 last_parent, last_children, last_committed, u, rejected,
             )
 
+        round_target_calls = self.target.num_calls - round_calls_before
+        round_target_states = self.target.num_states - round_states_before
+        proposal_target_calls = (
+            round_target_calls - refinement_target_calls - verification_target_calls
+        )
+        proposal_target_states = (
+            round_target_states - refinement_target_states - verification_target_states
+        )
         return RoundRecord(
             start_step=n,
             lookahead=lookahead,
@@ -289,24 +379,61 @@ class SpeculativeSampler:
             drafted=tree.budget,
             verified=len(evaluated),
             proposals_examined=tuple(examined),
+            proposal_target_calls=proposal_target_calls,
+            proposal_target_states_evaluated=proposal_target_states,
+            refinement_iters=self.proposal_refinement_iters,
+            refinement_target_calls=refinement_target_calls,
+            refinement_target_states_evaluated=refinement_target_states,
+            verification_target_calls=verification_target_calls,
+            verification_target_states_evaluated=verification_target_states,
+            verification_target_means_reused=len(reused_ids),
+            target_calls=round_target_calls,
+            target_states_evaluated=round_target_states,
         )
 
-    def _verify_exact_root(self, ops, states, target_means, n: int) -> None:
-        """Validate a reused root mean against a fresh evaluation.
+    def _refinement_layout(self, tree: DraftTree, n: int) -> RefinementLayout:
+        """Describe this truncated scalar tree in flat-buffer coordinates."""
 
-        The optimisation rests on an invariant -- that the committed leaf of the
-        previous round is this round's root at the same step. Truncation,
-        topology changes, or indexing errors can violate that invariant.
-        ``check_contract`` enables this validation. It calls ``target.means``
-        directly, so the check does not increment the NFE counter.
-        """
-        fresh = self.target.means((0,), states[ROOT][None], (n,))[0]
-        if not ops.allclose(fresh, target_means[ROOT]):
-            raise ValueError(
-                "the reused root target mean does not match a fresh evaluation "
-                f"at step {n}. The exact-root optimisation assumed the previous "
-                "round's committed leaf is this round's root; it is not."
+        internal = tuple(tree.internal_nodes)
+        positions = {u: i for i, u in enumerate(internal)}
+        levels = []
+        for level in range(1, tree.depth + 1):
+            parents = tuple(u for u in tree.layer(level - 1) if tree.children(u))
+            if not parents:
+                continue
+            children = tuple(v for u in parents for v in tree.children(u))
+            levels.append(
+                RefinementLevel(
+                    parent_ids=parents,
+                    parent_positions=tuple(positions[u] for u in parents),
+                    child_ids=children,
+                    child_counts=tuple(len(tree.children(u)) for u in parents),
+                    child_innovation_ids=children,
+                )
             )
+        steps = tuple(n + tree.depth_of(u) for u in internal)
+        return RefinementLayout(
+            root_ids=(ROOT,),
+            internal_ids=internal,
+            logical_nodes=internal,
+            indices_in_batch=(0,) * len(internal),
+            steps=steps,
+            sigmas=tuple(self.schedule(step) for step in steps),
+            levels=tuple(levels),
+        )
+
+    def _verify_exact_cached(
+        self, ops, states, target_means, ids, indices, steps
+    ) -> None:
+        """Validate all reused target means in one unaccounted debug batch."""
+
+        fresh = self.target.means(indices, ops.take(states, ids), steps)
+        for j, u in enumerate(ids):
+            if not ops.allclose(fresh[j], target_means[u]):
+                raise ValueError(
+                    "a reused target mean does not match a fresh evaluation "
+                    f"for node {u}, image {indices[j]}, step {steps[j]}"
+                )
 
     def _prefetch_nearest(
         self, ops, tree, n, states, target_means, has_mean,
@@ -346,7 +473,13 @@ class SpeculativeSampler:
             self._hand_over(
                 ops, n + tree.depth_of(terminal), states[terminal], target_means[terminal]
             )
-            self._exact_root_mean = target_means[terminal]
+            self._exact_root_mean = ExactTargetMean(
+                target=self.target,
+                index_in_batch=0,
+                step=n + tree.depth_of(terminal),
+                state=ops.copy(states[terminal]),
+                mean=ops.copy(target_means[terminal]),
+            )
             return
 
         usable = [v for v in children if v in has_mean]

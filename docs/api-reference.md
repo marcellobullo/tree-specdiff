@@ -25,6 +25,8 @@ SpeculativeSampler(
     num_steps: int,
     check_contract: bool = False,
     backend: Backend | None = None,
+    proposal_refinement_iters: int | None = None,
+    refinement_update_fn: RefinementUpdateFn | None = None,
 )
 ```
 
@@ -34,6 +36,9 @@ construction.
 - `num_steps` — the horizon `N`. Must be `>= 1`.
 - `check_contract` — wrap the rule in `CheckedVerifier`; recommended during development.
 - `backend` — only needed for a framework `resolve_backend` does not know.
+- `proposal_refinement_iters` — synchronous tree-refinement sweeps; `None` or `0` disables them.
+- `refinement_update_fn` — row-local increment callback. Positive iterations default to
+  `picard_update_fn`.
 
 ```python
 .sample(init, *, rng=None, on_round=None, record=True) -> SamplingResult
@@ -51,6 +56,7 @@ BatchedSpeculativeSampler(
     target, proposal: ProposalTransition, schedule, tree, verifier,
     *, num_steps: int, check_contract: bool = False,
     keep_trajectories: bool = False, backend: Backend | None = None,
+    proposal_refinement_iters: int | None = None, refinement_update_fn=None,
 )
 ```
 
@@ -67,6 +73,16 @@ Runs the algorithm over `batch_size` independent trajectories. The tree must be
 `init` has shape `(batch, *state_shape)`. Trajectories are independent but share an RNG stream,
 so a given trajectory is **not** bit-reproducible across different batch sizes. Its law is
 unaffected.
+
+### Refinement callbacks
+
+`RefinementRequest` contains the iteration, image indices, logical nodes, steps, parent
+states, current proposal means, sigmas, target, and backend. A callback must be row-local
+and returns exactly one `RefinementUpdate(increments, exact_target_means=None)`.
+
+`picard_update_fn` is the default for positive iteration counts and returns
+`m^q_s(x) - x` together with correctness-bearing exact target means. See
+[Proposal refinement](refinement.md) for the mathematical and caching contracts.
 
 ### `standard_sampler`
 
@@ -121,6 +137,9 @@ so progress is limited by the slowest member. Their difference measures straggle
 `RoundRecord`: `start_step`, `lookahead` (`L_n`), `committed` (in `[1, L_n]`), `accepted_depth`
 (`committed - 1` if rejected, else `committed`), `rejected`, `drafted` (`B_n`), `verified`
 (`|I(T_n)|`), `proposals_examined`.
+Both records also expose proposal-, refinement-, and verification-owned target calls and
+evaluated rows, `verification_target_means_reused`, and total per-round target work. New
+fields default to zero for compatibility.
 
 `BatchedRoundRecord`: `iteration`, `active` (indices in the batch), `start_steps`, `committed`,
 `accepted_depth`, `rejected`, `drafted`, `verified` — the per-trajectory fields are tuples

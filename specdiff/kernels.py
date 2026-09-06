@@ -62,10 +62,11 @@ class ConstantSchedule(NoiseSchedule):
 class TargetTransition(ABC):
     """Expensive target mean map ``m^q``.
 
-    Implementations override :meth:`means`, which is called **once per round**
-    with the whole verification batch (all internal nodes of the round's tree).
-    Invoke the instance through ``__call__`` rather than calling ``means``
-    directly, because ``__call__`` maintains NFE accounting.
+    Implementations override :meth:`means`. With refinement disabled it is
+    called once with the round's verification batch; target-backed refinement
+    adds one batched call per sweep and may eliminate the final call through
+    exact cache reuse. Invoke the instance through ``__call__`` because it
+    maintains NFE accounting.
     """
 
     def __init__(self) -> None:
@@ -86,6 +87,9 @@ class TargetTransition(ABC):
         ignore it.
 
         Must be a single batched evaluation of the target network.
+        Each output row must be deterministic for its image index, state, and
+        step, and independent of other rows or the way the batch is partitioned.
+        Exact verification and refinement target-cache reuse rely on this.
         """
 
     def __call__(

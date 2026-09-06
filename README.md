@@ -23,6 +23,10 @@ result = sampler.sample(y0, rng=rng)
 print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ```
 
+Set `proposal_refinement_iters=J` to run `J` target-backed Picard sweeps after
+the initial draft and before verification. See [Proposal refinement](docs/refinement.md)
+for the recurrence, callback contract, conditional Gaussian law, and target-mean reuse.
+
 ## Installation
 
 Create a Python environment:
@@ -81,6 +85,7 @@ The code and documentation use the following notation consistently:
 | --- | --- | --- |
 | `N` | `num_steps` | denoising steps in the full trajectory — the standard sampler's NFE count |
 | `L` | `lookahead`, `tree.depth` | levels of the draft tree below the root; how far ahead one round speculates |
+| `J` | `proposal_refinement_iters` | synchronous proposal-refinement sweeps within each round |
 | `K` | `branching`, `tree.branching` | candidate children per node. `K = 1` is RMC's chain |
 | `B` | `tree.budget` | states **drafted** per round, `K + ... + K^L` (eq. 12) — the *proposal* budget the paper plots against |
 | `\|I\|` | `tree.verification_budget()` | states the **target** evaluates per round, `B / K` when uniform — the *verification* budget, and the batch that must fit in memory |
@@ -97,7 +102,7 @@ diffusion state is for your model — `(d,)`, `(3, 32, 32)`, `(16, 64, 64)` for 
 ```
 pyproject.toml
 specdiff/
-  sampler.py  batched.py  trees.py  kernels.py  verify.py  types.py  testing.py  ops.py
+  sampler.py  batched.py  refinement.py  trees.py  kernels.py  verify.py  types.py  testing.py  ops.py
   verifiers/
     rank1.py  rmc.py  dgrs.py
 tests/       test_sampler.py  test_batched.py  test_rank1.py  test_rmc.py  test_dgrs.py
@@ -111,6 +116,7 @@ examples/    gaussian_mixture.py
 | `specdiff/batched.py` | the same, over many trajectories per target call |
 | `specdiff/trees.py` | draft topologies, layers, internal nodes, truncation `T|_m` |
 | `specdiff/kernels.py` | `TargetTransition`, `ProposalTransition`, noise schedules, delayed drift |
+| `specdiff/refinement.py` | row-local refinement contract, tree scan, fixed-noise Picard update, exact target cache |
 | `specdiff/verify.py` | the `Verifier` contract, contract checker, name registry |
 | `specdiff/types.py` | `VerifyRequest`/`VerifyResult` and the run records |
 | `specdiff/verifiers/rank1.py` | the rank-1 reduction (eqs. 8–11), shared by any isotropic rule |
@@ -131,6 +137,7 @@ the trajectory, so `sample()` rejects them. Both `float32` and `float64` are sup
 | | |
 | --- | --- |
 | [docs/writing-a-verifier.md](docs/writing-a-verifier.md) | verifier contract, rank-1 coordinates, exactness testing, and implementation guidance |
+| [docs/refinement.md](docs/refinement.md) | tree Picard derivation, callback invariants, exact target-mean reuse, and accounting |
 | [docs/models.md](docs/models.md) | plugging in your own diffusion model, proposals, trees, backends |
 | [docs/architecture.md](docs/architecture.md) | how a round works, data flow, cost accounting, design decisions |
 | [docs/api-reference.md](docs/api-reference.md) | every exported symbol |

@@ -140,12 +140,22 @@ class RoundRecord:
     drafted: int
     """Number of drafted states ``B_n = |V(T_n)| - 1``."""
     verified: int
-    """Size of the verification batch, ``|I(T_n)|``. One target call."""
+    """Final-verification rows freshly evaluated rather than exactly reused."""
     proposals_examined: Tuple[Optional[int], ...] = ()
+    proposal_target_calls: int = 0
+    proposal_target_states_evaluated: int = 0
+    refinement_iters: int = 0
+    refinement_target_calls: int = 0
+    refinement_target_states_evaluated: int = 0
+    verification_target_calls: int = 0
+    verification_target_states_evaluated: int = 0
+    verification_target_means_reused: int = 0
+    target_calls: int = 0
+    target_states_evaluated: int = 0
 
     @property
     def steps_per_target_call(self) -> float:
-        return float(self.committed)
+        return self.committed / max(self.target_calls, 1)
 
 
 @dataclass
@@ -157,8 +167,7 @@ class SamplingResult:
     rounds: Tuple[RoundRecord, ...]
     num_steps: int
     target_calls: int
-    """Neural function evaluations, the paper's cost metric: one batched call
-    per round, plus any warm-up call a proposal needed."""
+    """All target calls: proposal-owned, refinement, and final verification."""
     target_states_evaluated: int
     """Total states pushed through the target model (batch volume, not NFEs)."""
     drafted_states: int
@@ -292,7 +301,7 @@ class BatchedVerifyResult:
 
 @dataclass(frozen=True)
 class BatchedRoundRecord:
-    """One outer iteration of the batched sampler: a single target call."""
+    """One outer iteration of the batched sampler."""
 
     iteration: int
     active: Tuple[int, ...]
@@ -303,7 +312,7 @@ class BatchedRoundRecord:
     of the tree this trajectory had verified before its round ended."""
     drafted: int
     verified: int
-    """Rows in this iteration's single batched target call."""
+    """Final-verification rows freshly evaluated rather than exactly reused."""
     accepted_depth: Tuple[int, ...] = ()
     """Accepted prefix length per active trajectory: ``committed`` if every
     verified level accepted, ``committed - 1`` if the round ended in a
@@ -311,6 +320,16 @@ class BatchedRoundRecord:
     diagnostic and it cannot be recovered from ``committed`` alone."""
     rejected: Tuple[bool, ...] = ()
     """Whether each active trajectory's round ended in a rejection."""
+    proposal_target_calls: int = 0
+    proposal_target_states_evaluated: int = 0
+    refinement_iters: int = 0
+    refinement_target_calls: int = 0
+    refinement_target_states_evaluated: int = 0
+    verification_target_calls: int = 0
+    verification_target_states_evaluated: int = 0
+    verification_target_means_reused: int = 0
+    target_calls: int = 0
+    target_states_evaluated: int = 0
 
 
 @dataclass
