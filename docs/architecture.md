@@ -86,9 +86,15 @@ before its parent exists, so the levels are ordered; but every node at a given l
 expanded in one proposal call. Every sibling is expanded, because which one survives is not
 decided until Phase 3.
 
-**Phase 2 makes one target call over internal nodes.** Leaves are not parents, so their target
-means are unnecessary. For a uniform tree, this gives `|I| = B / K` (Equation 26). The call
-can validate up to `L` drafted steps while incurring one NFE.
+With positive `proposal_refinement_iters`, Phase 1 continues with synchronous tree Picard
+sweeps. Each sweep evaluates one row-local increment for every internal node, then rebuilds
+the tree breadth-first with the original fixed edge innovations. See
+[Proposal refinement](refinement.md).
+
+**With refinement disabled, Phase 2 makes one target call over internal nodes.** With
+refinement enabled, exact target means from the final sweep are reused wherever the final
+state is exactly unchanged; all remaining internal nodes share at most one final call.
+Leaves are not parents unless `evaluate_leaves` requests them for prefetching.
 
 **Phase 3 descends and stops at the first rejection.** At each level the rule sees one
 parent and its `K` drafted children, and returns a state that is an exact draw from
@@ -157,7 +163,7 @@ override `means` and callers invoke the instance:
 
 | field | meaning |
 | --- | --- |
-| `target_calls` | batched calls to the target: **the NFE count the paper plots**, one per round plus proposal warm-up |
+| `target_calls` | batched target calls: proposal-owned, refinement, and final verification NFEs |
 | `target_states_evaluated` | total rows pushed through the target — batch volume, not NFEs |
 | `drafted_states` | states the proposal produced, `sum of B_n` |
 

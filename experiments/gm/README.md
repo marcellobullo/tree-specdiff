@@ -11,6 +11,8 @@ making it suitable for validating an installation before running image models.
 | `lazy.py` | cost simulator: realises only the committed branch, so the top of the grid is runnable |
 | `validate_lazy.py` | gate — does `lazy.py` agree with the eager sampler? |
 | `plot_gm.py` | `raw.csv` → `summary.csv` + both paper figures |
+| `picard_sweep.py` | eager `(K,L,J)` refinement sweep with normalized diagnostic tables |
+| `plot_picard.py` | refinement convergence, depth, cost, reuse, and sample diagnostics |
 | `heatmap.py` | the annotated `(K, L)` grid panels |
 
 The sweep itself needs only NumPy. **Plotting needs matplotlib, pandas and seaborn**,
@@ -87,3 +89,61 @@ difference between **1.27x and 1.77x**, so it is not a detail. It is recorded in
 
 For details on budgets, leaf evaluation, prefetch policies, and deterministic endpoints, see
 [`../README.md`](../README.md).
+
+## Picard refinement experiments
+
+Picard refinement requires the complete frozen draft tree and therefore uses
+the eager sampler. It is deliberately separate from the lazy paper sweep.
+
+Start with a small smoke run:
+
+```bash
+RUN=/tmp/gm-picard-smoke
+python experiments/gm/picard_sweep.py --out "$RUN" \
+  --dimension 32 --num-steps 10 --K-values 1 2 --L-values 3 \
+  --J-values 0 1 2 3 --replicates 4
+python experiments/gm/plot_picard.py --out "$RUN"
+```
+
+The recommended first full diagnostic holds the topology at `L=4`, uses
+common random numbers across every refinement count, and includes both an RMC
+chain and branching D-GRS trees:
+
+```bash
+RUN=results/gm-picard/$(date +%Y%m%d-%H%M%S)
+python experiments/gm/picard_sweep.py --out "$RUN" \
+  --seed 14 --K-values 1 2 3 --L-values 4 \
+  --J-values 0 1 2 3 4 --replicates 100 --n-workers 8
+python experiments/gm/plot_picard.py --out "$RUN"
+```
+
+RMC is run only for `K=1`; incompatible `K` values are skipped. Each
+`(rule,K,L,J)` cell is saved atomically, and rerunning the same command
+resumes completed cells.
+
+The top-level output is normalized rather than restricted to one predetermined
+figure:
+
+| output | granularity and purpose |
+| --- | --- |
+| `trajectories.csv` | aggregate acceptance, speedup, target calls/rows by phase, reuse, and state summaries |
+| `rounds.csv` | every sampler `RoundRecord`, including the complete cost decomposition |
+| `levels.csv` | every verification event, including `delta`, drift geometry, candidates, and outcome |
+| `refinements.csv` | every internal node at every sweep, including iterate change and current mismatch |
+| `cells/*/samples.npz` | full initial, terminal, and committed trajectory arrays |
+| `schema.json` | machine-readable column inventory |
+
+`plot_picard.py` derives `summary.csv`, `round_summary.csv`,
+`level_summary.csv`, and `refinement_summary.csv`, then writes one set of
+figures per `(rule,K,L)`. The raw normalized tables remain the source of
+truth, so new aggregations and plots do not require another sampling run.
+Line and convergence panels show 95% confidence bands. Levelwise intervals
+aggregate repeated node observations within each trajectory before estimating
+uncertainty, so the independent unit remains the sampled trajectory. Heatmap
+cells in the theorem-guaranteed prefix are labeled `exact` instead of showing
+an empirical interval.
+
+To isolate exact final-target reuse, compare `J=L` with and without
+`--evaluate-leaves`. Without leaf evaluation, converged internal-node target
+means can remove the final verification call entirely; with leaf evaluation,
+the leaves still require a fresh final call.

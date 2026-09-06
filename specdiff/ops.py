@@ -139,6 +139,14 @@ class Backend(ABC):
     @abstractmethod
     def allclose(self, x: Array, y: Array) -> bool: ...
 
+    def equal_rows(self, x: Array, y: Array):
+        """Exact equality for corresponding stack rows.
+
+        Custom backends conservatively disable target-mean reuse unless they
+        override this method. Approximate equality is not safe here.
+        """
+        return (False,) * int(x.shape[0])
+
     def numel(self, x: Array) -> int:
         n = 1
         for s in tuple(x.shape):
@@ -221,6 +229,12 @@ class NumpyBackend(Backend):
 
     def allclose(self, x, y):
         return bool(self._np.allclose(x, y))
+
+    def equal_rows(self, x, y):
+        if tuple(x.shape) != tuple(y.shape):
+            return (False,) * int(x.shape[0])
+        same = self._np.equal(x, y).reshape((len(x), -1)).all(axis=1)
+        return tuple(bool(v) for v in same)
 
 
 class TorchBackend(Backend):
@@ -310,6 +324,12 @@ class TorchBackend(Backend):
 
     def allclose(self, x, y):
         return bool(self._torch.allclose(x, y))
+
+    def equal_rows(self, x, y):
+        if tuple(x.shape) != tuple(y.shape):
+            return (False,) * int(x.shape[0])
+        same = self._torch.eq(x, y).reshape((len(x), -1)).all(dim=1)
+        return tuple(bool(v) for v in same.detach().cpu().tolist())
 
 
 _CACHE: dict[str, Backend] = {}

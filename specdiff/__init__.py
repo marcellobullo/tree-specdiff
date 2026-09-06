@@ -31,6 +31,12 @@ from .kernels import (
     TargetTransition,
 )
 from .ops import Backend, resolve_backend
+from .refinement import (
+    RefinementRequest,
+    RefinementUpdate,
+    RefinementUpdateFn,
+    picard_update_fn,
+)
 from .sampler import SpeculativeSampler, standard_sampler
 from .testing import ExactnessReport, check_exactness
 from .trees import ROOT, DraftTree
@@ -96,6 +102,10 @@ __all__ = [
     "DEGENERATE_TOL",
     "ReflectionMaximalCoupling",
     "GreedyRejectionSampling",
+    "RefinementRequest",
+    "RefinementUpdate",
+    "RefinementUpdateFn",
+    "picard_update_fn",
     # contract types
     "VerifyRequest",
     "VerifyResult",

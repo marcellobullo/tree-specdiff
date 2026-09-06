@@ -28,6 +28,18 @@ from typing import Any, Callable, List, Optional, Tuple
 
 from .kernels import NoiseSchedule, ProposalTransition, TargetTransition
 from .ops import Backend, resolve_backend
+from .refinement import (
+    ExactTargetCache,
+    ExactTargetMean,
+    RefinementLayout,
+    RefinementLevel,
+    RefinementUpdateFn,
+    normalize_refinement_iters,
+    picard_update_fn,
+    refine_tree,
+    reusable_exact_target_mean,
+    reusable_target_rows,
+)
 from .sampler import PREFETCH_MODES
 from .trees import ROOT, DraftTree
 from .types import (
@@ -83,6 +95,8 @@ class BatchedSpeculativeSampler:
         prefetch: str = "nearest",
         evaluate_leaves: bool = False,
         backend: Optional[Backend] = None,
+        proposal_refinement_iters: Optional[int] = None,
+        refinement_update_fn: Optional[RefinementUpdateFn] = None,
     ) -> None:
         if num_steps < 1:
             raise ValueError("num_steps must be >= 1")
@@ -93,6 +107,13 @@ class BatchedSpeculativeSampler:
                 '"parent" for the verified parent\'s, or "none" to re-evaluate '
                 "the root."
             )
+        refinement_iters = normalize_refinement_iters(proposal_refinement_iters)
+        if (
+            refinement_iters
+            and refinement_update_fn is not None
+            and not callable(refinement_update_fn)
+        ):
+            raise TypeError("refinement_update_fn must be callable")
         if not tree.is_level_uniform():
             raise ValueError(
                 f"{tree} is not level-uniform, so its candidates cannot form a rectangular "
@@ -114,6 +135,10 @@ class BatchedSpeculativeSampler:
         self._exact_root_means: dict = {}
         self._evaluated_cache: dict = {}
         self._backend = backend
+        self.proposal_refinement_iters = refinement_iters
+        self.refinement_update_fn = (
+            picard_update_fn if refinement_update_fn is None else refinement_update_fn
+        )
 
     # ------------------------------------------------------------------ public
     def sample(
@@ -157,20 +182,50 @@ class BatchedSpeculativeSampler:
         iteration = 0
 
         while any(n < N for n in steps_done):
+            round_calls_before = self.target.num_calls
+            round_states_before = self.target.num_states
             active = [i for i in range(batch) if steps_done[i] < N]
             lookaheads = [min(self.tree.depth, N - steps_done[i]) for i in active]
             roots = ops.take(current, active)
 
             states = ops.zeros_stack(len(active) * size, init[0])
             proposal_means = ops.zeros_stack(len(active) * size, init[0])
+            scaled_innovations = (
+                ops.zeros_stack(len(active) * size, init[0])
+                if self.proposal_refinement_iters else None
+            )
             ops.put(states, [r * size + ROOT for r in range(len(active))], roots)
 
             self.proposal.on_round_start(active, [steps_done[i] for i in active], roots)
 
-            drafted = self._draft(active, lookaheads, states, proposal_means, steps_done, ops, rng)
-            target_means, verified, has_mean = self._verify(
-                active, lookaheads, states, steps_done, ops
+            drafted = self._draft(
+                active, lookaheads, states, proposal_means, scaled_innovations,
+                steps_done, ops, rng,
             )
+            refinement_calls_before = self.target.num_calls
+            refinement_states_before = self.target.num_states
+            refinement_cache: Optional[ExactTargetCache] = None
+            if self.proposal_refinement_iters:
+                refinement_cache = refine_tree(
+                    states=states,
+                    proposal_means=proposal_means,
+                    scaled_innovations=scaled_innovations,
+                    layout=self._refinement_layout(active, lookaheads, steps_done),
+                    iterations=self.proposal_refinement_iters,
+                    update_fn=self.refinement_update_fn,
+                    target=self.target,
+                    ops=ops,
+                )
+            refinement_target_calls = self.target.num_calls - refinement_calls_before
+            refinement_target_states = self.target.num_states - refinement_states_before
+
+            verification_calls_before = self.target.num_calls
+            verification_states_before = self.target.num_states
+            target_means, verified, has_mean, reused_count = self._verify(
+                active, lookaheads, states, steps_done, ops, refinement_cache
+            )
+            verification_target_calls = self.target.num_calls - verification_calls_before
+            verification_target_states = self.target.num_states - verification_states_before
             committed, accepted_depth, rejected = self._accept(
                 active,
                 lookaheads,
@@ -185,6 +240,14 @@ class BatchedSpeculativeSampler:
                 rng,
             )
 
+            round_target_calls = self.target.num_calls - round_calls_before
+            round_target_states = self.target.num_states - round_states_before
+            proposal_target_calls = (
+                round_target_calls - refinement_target_calls - verification_target_calls
+            )
+            proposal_target_states = (
+                round_target_states - refinement_target_states - verification_target_states
+            )
             record_ = BatchedRoundRecord(
                 iteration=iteration,
                 active=tuple(active),
@@ -194,6 +257,16 @@ class BatchedSpeculativeSampler:
                 verified=verified,
                 accepted_depth=tuple(accepted_depth),
                 rejected=tuple(rejected),
+                proposal_target_calls=proposal_target_calls,
+                proposal_target_states_evaluated=proposal_target_states,
+                refinement_iters=self.proposal_refinement_iters,
+                refinement_target_calls=refinement_target_calls,
+                refinement_target_states_evaluated=refinement_target_states,
+                verification_target_calls=verification_target_calls,
+                verification_target_states_evaluated=verification_target_states,
+                verification_target_means_reused=reused_count,
+                target_calls=round_target_calls,
+                target_states_evaluated=round_target_states,
             )
             for pos, i in enumerate(active):
                 if committed[pos] < 1:
@@ -224,7 +297,9 @@ class BatchedSpeculativeSampler:
         )
 
     # ------------------------------------------------------------ phase 1
-    def _draft(self, active, lookaheads, states, proposal_means, steps_done, ops, rng) -> int:
+    def _draft(
+        self, active, lookaheads, states, proposal_means, scaled_innovations, steps_done, ops, rng
+    ) -> int:
         size = self.tree.size
         drafted = 0
         for level in range(1, self.tree.depth + 1):
@@ -250,11 +325,65 @@ class BatchedSpeculativeSampler:
             sigmas = [self.schedule(s) for s in parent_steps]
             noise = ops.randn_stack(len(child_ids), states[0], rng)
             scaled = ops.scale_rows(noise, [s for s, c in zip(sigmas, counts) for _ in range(c)])
+            if scaled_innovations is not None:
+                ops.put(scaled_innovations, child_ids, scaled)
             ops.put(states, child_ids, ops.repeat_rows(means, counts) + scaled)
             drafted += len(child_ids)
         return drafted
 
     # ------------------------------------------------------------ phase 2
+    def _refinement_layout(self, active, lookaheads, steps_done) -> RefinementLayout:
+        """Describe all live, variably truncated trees in flat coordinates."""
+
+        size = self.tree.size
+        internal_ids, logical_nodes, indices, steps, sigmas = [], [], [], [], []
+        for r, lookahead in enumerate(lookaheads):
+            for u in self.tree.internal_nodes:
+                if self.tree.depth_of(u) >= lookahead:
+                    continue
+                step = steps_done[active[r]] + self.tree.depth_of(u)
+                internal_ids.append(r * size + u)
+                logical_nodes.append(u)
+                indices.append(active[r])
+                steps.append(step)
+                sigmas.append(self.schedule(step))
+
+        positions = {flat_id: i for i, flat_id in enumerate(internal_ids)}
+        levels = []
+        for level in range(1, self.tree.depth + 1):
+            rows = [r for r, lookahead in enumerate(lookaheads) if lookahead >= level]
+            parents = [u for u in self.tree.layer(level - 1) if self.tree.children(u)]
+            if not rows or not parents:
+                continue
+            parent_ids = tuple(r * size + u for r in rows for u in parents)
+            child_ids = tuple(
+                r * size + v
+                for r in rows
+                for u in parents
+                for v in self.tree.children(u)
+            )
+            levels.append(
+                RefinementLevel(
+                    parent_ids=parent_ids,
+                    parent_positions=tuple(positions[u] for u in parent_ids),
+                    child_ids=child_ids,
+                    child_counts=tuple(
+                        len(self.tree.children(u)) for _ in rows for u in parents
+                    ),
+                    child_innovation_ids=child_ids,
+                )
+            )
+
+        return RefinementLayout(
+            root_ids=tuple(r * size + ROOT for r in range(len(active))),
+            internal_ids=tuple(internal_ids),
+            logical_nodes=tuple(logical_nodes),
+            indices_in_batch=tuple(indices),
+            steps=tuple(steps),
+            sigmas=tuple(sigmas),
+            levels=tuple(levels),
+        )
+
     def _evaluated_nodes(self, lookahead: int):
         """Nodes of ``T|_{L_n}`` whose target mean this round computes.
 
@@ -280,69 +409,64 @@ class BatchedSpeculativeSampler:
             self._evaluated_cache[lookahead] = cached
         return cached
 
-    def _verify(self, active, lookaheads, states, steps_done, ops):
-        """The single batched target call of the iteration.
+    def _verify(self, active, lookaheads, states, steps_done, ops, refinement_cache):
+        """Assemble exact final target means from reusable and fresh rows."""
 
-        A row whose previous round accepted every level already knows its own
-        root's target mean -- the committed leaf's, evaluated last round at this
-        very state and this very step -- so that row's root is dropped from the
-        batch instead of recomputed. Rows are independent here: one row can skip
-        its root while its neighbours pay for theirs.
-
-        Returns the mean buffer, the number of rows actually evaluated, and the
-        per-row set of nodes that have a mean, which Phase 3 needs to know which
-        drifts it is allowed to carry.
-        """
         size = self.tree.size
+        cached = reusable_target_rows(
+            refinement_cache, target=self.target, final_states=states, ops=ops
+        )
         ids, steps, indices_in_batch = [], [], []
-        has_mean, known_roots = [], []
-        for r, la in enumerate(lookaheads):
-            known = self._exact_root_means.pop(active[r], None)
-            known_roots.append(known)
-            nodes, node_set = self._evaluated_nodes(la)
+        reused_ids, reused_steps, reused_indices, reused_values = [], [], [], []
+        has_mean = []
+        for r, lookahead in enumerate(lookaheads):
+            known_root = self._exact_root_means.pop(active[r], None)
+            nodes, node_set = self._evaluated_nodes(lookahead)
             has_mean.append(node_set)
             for u in nodes:
-                if u == ROOT and known is not None:
-                    continue
-                ids.append(r * size + u)
-                steps.append(steps_done[active[r]] + self.tree.depth_of(u))
-                # active[r], not r: r is the position in the live list, which
-                # shifts as images finish and leave the batch.
-                indices_in_batch.append(active[r])
+                flat_id = r * size + u
+                step = steps_done[active[r]] + self.tree.depth_of(u)
+                key = (flat_id, active[r], u, step)
+                value = cached.get(key)
+                if value is None and u == ROOT and known_root is not None:
+                    value = reusable_exact_target_mean(
+                        known_root, target=self.target, index_in_batch=active[r],
+                        step=step, state=states[flat_id], ops=ops,
+                    )
+                if value is None:
+                    ids.append(flat_id)
+                    steps.append(step)
+                    indices_in_batch.append(active[r])
+                else:
+                    reused_ids.append(flat_id)
+                    reused_steps.append(step)
+                    reused_indices.append(active[r])
+                    reused_values.append(value)
 
         buffer = ops.zeros_stack(len(active) * size, states[0])
+        if reused_ids:
+            ops.put(buffer, reused_ids, ops.stack_rows(reused_values))
         if ids:
             means = self.target(tuple(indices_in_batch), ops.take(states, ids), tuple(steps))
             ops.put(buffer, ids, means)
-        reused = [r for r, known in enumerate(known_roots) if known is not None]
-        if reused:
-            ops.put(buffer, [r * size + ROOT for r in reused],
-                    ops.stack_rows([known_roots[r] for r in reused]))
-            if self._check_root_mean:
-                self._verify_exact_roots(active, reused, states, buffer, steps_done, ops)
-        return buffer, len(ids), has_mean
+        if self._check_root_mean and reused_ids:
+            self._verify_exact_cached(
+                ops, states, buffer, tuple(reused_ids),
+                tuple(reused_indices), tuple(reused_steps),
+            )
+        return buffer, len(ids), has_mean, len(reused_ids)
 
-    def _verify_exact_roots(self, active, reused, states, target_means, steps_done, ops):
-        """Validate every reused root mean against a fresh evaluation.
+    def _verify_exact_cached(
+        self, ops, states, target_means, ids, indices, steps
+    ) -> None:
+        """Validate all reused target means in one unaccounted debug batch."""
 
-        The batched mirror of :meth:`SpeculativeSampler._verify_exact_root`. The
-        reuse rests on an invariant -- that a row's committed leaf last round is
-        its root this round, at the same step -- which truncation, topology
-        changes, or an indexing slip can violate. Calls ``target.means``
-        directly, so the check does not inflate the NFE counters.
-        """
-        size = self.tree.size
-        ids = [r * size + ROOT for r in reused]
-        indices = [active[r] for r in reused]
-        steps = [steps_done[active[r]] for r in reused]
-        fresh = self.target.means(tuple(indices), ops.take(states, ids), tuple(steps))
-        for j, r in enumerate(reused):
-            if not ops.allclose(fresh[j], target_means[r * size + ROOT]):
+        fresh = self.target.means(indices, ops.take(states, ids), steps)
+        for j, flat_id in enumerate(ids):
+            if not ops.allclose(fresh[j], target_means[flat_id]):
                 raise ValueError(
-                    "the reused root target mean does not match a fresh evaluation "
-                    f"for image {active[r]} at step {steps[j]}. The exact-root "
-                    "optimisation assumed the previous round's committed leaf is "
-                    "this round's root; it is not."
+                    "a reused target mean does not match a fresh evaluation "
+                    f"for flat node {flat_id}, image {indices[j]}, step {steps[j]}"
                 )
 
     # ------------------------------------------------------------ phase 3
@@ -473,7 +597,13 @@ class BatchedSpeculativeSampler:
                 # same step -- so record it and let that row drop its root from
                 # the next batch.
                 pick, step = node, n + self.tree.depth_of(node)
-                self._exact_root_means[active[r]] = ops.copy(target_means[r * size + pick])
+                self._exact_root_means[active[r]] = ExactTargetMean(
+                    target=self.target,
+                    index_in_batch=active[r],
+                    step=step,
+                    state=ops.copy(states[r * size + pick]),
+                    mean=ops.copy(target_means[r * size + pick]),
+                )
             else:
                 usable = [v for v in self.tree.children(parent) if v in has_mean[r]]
                 if rejected[r] and usable:
