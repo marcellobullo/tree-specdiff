@@ -6,7 +6,7 @@ build/
 dist/
 .eggs/
 /edm/
-/results/
+/results*/
 /old/
 
 # Virtual environments
