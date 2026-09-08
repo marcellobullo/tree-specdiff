@@ -115,6 +115,7 @@ def summarize_trajectories(rows):
     summary = []
     for (rule, K, L, J), group in sorted(_groups(rows).items()):
         row = {
+            "eps": _float(group[0], "eps"),
             "rule": rule,
             "K": int(K),
             "L": int(L),
@@ -161,6 +162,7 @@ def summarize_levels(rows):
         mismatch = _trajectory_values(group, "mean_mismatch_l2")
         delta_se = _se(deltas)
         summary.append({
+            "eps": _float(group[0], "eps"),
             "rule": rule,
             "K": int(K),
             "L": int(L),
@@ -189,30 +191,74 @@ def summarize_levels(rows):
     return summary
 
 
+def _refinement_trajectory_values(group, metric):
+    """Return node-count-weighted per-trajectory means from raw or summary rows."""
+    if not group:
+        return []
+    if f"{metric}_mean" not in group[0]:
+        return _trajectory_values(group, metric)
+    totals = collections.defaultdict(float)
+    counts = collections.defaultdict(int)
+    for row in group:
+        value = _float(row, f"{metric}_mean")
+        count = int(row["node_count"])
+        if math.isfinite(value):
+            totals[row["trajectory_id"]] += value * count
+            counts[row["trajectory_id"]] += count
+    return [totals[key] / counts[key] for key in totals if counts[key]]
+
+
+def _refinement_zero_fractions(group, metric):
+    if not group:
+        return []
+    if f"{metric}_zero_fraction" not in group[0]:
+        clustered = collections.defaultdict(list)
+        for row in group:
+            clustered[row["trajectory_id"]].append(_float(row, metric) == 0.0)
+        return [_mean(values) for values in clustered.values()]
+    totals = collections.defaultdict(float)
+    counts = collections.defaultdict(int)
+    for row in group:
+        value = _float(row, f"{metric}_zero_fraction")
+        count = int(row["node_count"])
+        if math.isfinite(value):
+            totals[row["trajectory_id"]] += value * count
+            counts[row["trajectory_id"]] += count
+    return [totals[key] / counts[key] for key in totals if counts[key]]
+
+
 def summarize_refinements(rows):
     fields = GROUP_FIELDS + ("refinement_iteration", "node_depth")
     summary = []
     for key, group in sorted(_groups(rows, fields).items()):
         rule, K, L, J, iteration, depth = key
-        delta = _trajectory_values(group, "current_delta")
-        change = _trajectory_values(group, "iterate_change_l2")
-        change_rms = _trajectory_values(group, "iterate_change_rms")
+        delta = _refinement_trajectory_values(group, "current_delta")
+        change = _refinement_trajectory_values(group, "iterate_change_l2")
+        change_rms = _refinement_trajectory_values(group, "iterate_change_rms")
+        zero = _refinement_zero_fractions(group, "current_delta")
+        if "node_count" in group[0]:
+            observations = sum(int(row["node_count"]) for row in group)
+            delta_max = max(_float(row, "current_delta_max") for row in group)
+        else:
+            observations = len(group)
+            delta_max = max(delta)
         summary.append({
+            "eps": _float(group[0], "eps"),
             "rule": rule,
             "K": int(K),
             "L": int(L),
             "J": int(J),
             "refinement_iteration": int(iteration),
             "node_depth": int(depth),
-            "n": len(group),
+            "n": observations,
             "n_trajectories": len(delta),
             "current_delta_mean": _mean(delta),
             "current_delta_std": _std(delta),
             "current_delta_se": _se(delta),
             "current_delta_median": _percentile(delta, 50),
             "current_delta_p90": _percentile(delta, 90),
-            "current_delta_max": max(delta),
-            "current_delta_zero_fraction": sum(x == 0.0 for x in delta) / len(delta),
+            "current_delta_max": delta_max,
+            "current_delta_zero_fraction": _mean(zero),
             "iterate_change_l2_mean": _mean(change),
             "iterate_change_l2_std": _std(change),
             "iterate_change_l2_se": _se(change),
@@ -221,11 +267,11 @@ def summarize_refinements(rows):
         })
     return summary
 
-
 def summarize_rounds(rows):
     summary = []
     for (rule, K, L, J), group in sorted(_groups(rows).items()):
         row = {
+            "eps": _float(group[0], "eps"),
             "rule": rule,
             "K": int(K),
             "L": int(L),
@@ -594,11 +640,14 @@ def plot_sample_norms(out, trajectory_summary, figures):
         data, labels = [], []
         for row in sorted(rows, key=lambda item: int(item["J"])):
             J = int(row["J"])
-            path = out / "cells" / f"{rule.replace('-', '_')}-K{K}-L{L}-J{J}" / "samples.npz"
+            path = out / f"K{K}_L{L}" / f"J{J}" / "samples.npz"
             if not path.exists():
                 continue
             with np.load(path) as archive:
-                sample = archive["sample"]
+                mask = archive["rule"] == rule
+                sample = archive["sample"][mask]
+            if not len(sample):
+                continue
             data.append(np.linalg.norm(sample.reshape(len(sample), -1), axis=1)
                         / math.sqrt(sample[0].size))
             labels.append(str(J))
@@ -642,7 +691,10 @@ def main(argv=None):
     trajectories = _read(out / "trajectories.csv")
     rounds = _read(out / "rounds.csv")
     levels = _read(out / "levels.csv")
-    refinements = _read(out / "refinements.csv")
+    refinement_path = out / "refinement_summary.csv"
+    if not refinement_path.exists():
+        refinement_path = out / "refinements.csv"
+    refinements = _read(refinement_path)
     trajectory_summary = summarize_trajectories(trajectories)
     round_summary = summarize_rounds(rounds)
     level_summary = summarize_levels(levels)
@@ -650,7 +702,7 @@ def main(argv=None):
     _write(out / "summary.csv", trajectory_summary)
     _write(out / "round_summary.csv", round_summary)
     _write(out / "level_summary.csv", level_summary)
-    _write(out / "refinement_summary.csv", refinement_summary)
+    _write(out / "refinement_overview.csv", refinement_summary)
 
     try:
         import matplotlib

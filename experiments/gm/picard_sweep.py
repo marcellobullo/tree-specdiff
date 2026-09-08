@@ -13,14 +13,14 @@ rounds.csv
     One row per speculative round, including the full target-cost decomposition.
 levels.csv
     One row per verification decision, including normalized mean mismatch.
-refinements.csv
-    One row per internal node and Picard sweep, including iterate change.
-cells/<cell>/samples.npz
+refinement_summary.csv
+    Online node summaries by trajectory, round, Picard sweep, and tree depth.
+eps<eps>/K<K>_L<L>/J<J>/samples.npz
     Initial, terminal, and complete committed trajectories, keyed by replicate.
 
-Each cell is written atomically before the four top-level CSVs are rebuilt.
-Interrupted runs therefore resume at cell granularity without mixing partial
-tables.
+Each ``(eps, K, L, J)`` directory contains both rules and is written atomically.
+Replicates are checkpointed individually while a cell is running, so interrupted
+runs resume without retaining every replicate in memory.
 """
 
 from __future__ import annotations
@@ -53,8 +53,18 @@ from specdiff import (  # noqa: E402
     picard_update_fn,
 )
 
-SCHEMA_VERSION = 1
-IDENTITY_FIELDS = ("trajectory_id", "rule", "K", "L", "J", "replicate")
+SCHEMA_VERSION = 3
+IDENTITY_FIELDS = (
+    "trajectory_id",
+    "eps",
+    "rule",
+    "K",
+    "L",
+    "J",
+    "replicate",
+    "match",
+    "evaluate_leaves",
+)
 COST_FIELDS = (
     "proposal_target_calls",
     "proposal_target_states_evaluated",
@@ -68,7 +78,10 @@ COST_FIELDS = (
 )
 TRAJECTORY_FIELDS = IDENTITY_FIELDS + (
     "B",
+    "allocated_verification_budget",
+    "actual_proposal_budget",
     "verification_budget",
+    "chain_depth",
     "dimension",
     "num_steps",
     "total_steps",
@@ -100,7 +113,11 @@ TRAJECTORY_FIELDS = IDENTITY_FIELDS + (
 ROUND_FIELDS = IDENTITY_FIELDS + (
     "round_index",
     "start_step",
+    "end_step",
     "lookahead",
+    "cumulative_committed",
+    "cumulative_target_calls",
+    "cumulative_target_states_evaluated",
     "committed",
     "accepted_depth",
     "rejected",
@@ -137,14 +154,7 @@ LEVEL_FIELDS = IDENTITY_FIELDS + (
     "candidate_target_distance_mean",
     "candidate_target_distance_max",
 )
-REFINEMENT_FIELDS = IDENTITY_FIELDS + (
-    "round_index",
-    "sweep_index",
-    "refinement_iteration",
-    "node",
-    "node_depth",
-    "step",
-    "sigma",
+REFINEMENT_METRICS = (
     "state_l2",
     "current_proposal_mean_l2",
     "target_mean_l2",
@@ -155,13 +165,116 @@ REFINEMENT_FIELDS = IDENTITY_FIELDS + (
     "iterate_change_l2",
     "iterate_change_rms",
 )
+REFINEMENT_STATISTICS = (
+    "mean", "std", "rms", "min", "max", "p50", "p90", "p99",
+    "zero_fraction",
+)
+LEGACY_REFINEMENT_FIELDS = IDENTITY_FIELDS + (
+    "round_index",
+    "sweep_index",
+    "refinement_iteration",
+    "node",
+    "node_depth",
+    "step",
+    "sigma",
+) + REFINEMENT_METRICS
+REFINEMENT_FIELDS = IDENTITY_FIELDS + (
+    "round_index",
+    "sweep_index",
+    "refinement_iteration",
+    "node_depth",
+    "node_count",
+) + tuple(
+    f"{metric}_{statistic}"
+    for metric in REFINEMENT_METRICS
+    for statistic in REFINEMENT_STATISTICS
+)
 
 TABLES = {
     "trajectories.csv": TRAJECTORY_FIELDS,
     "rounds.csv": ROUND_FIELDS,
     "levels.csv": LEVEL_FIELDS,
-    "refinements.csv": REFINEMENT_FIELDS,
+    "refinement_summary.csv": REFINEMENT_FIELDS,
 }
+
+
+PROGRESS_BAR_WIDTH = 24
+
+
+def _elapsed(seconds: float) -> str:
+    seconds = int(max(0.0, seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+class ConfigurationProgress:
+    """Dependency-free progress for the complete configuration grid."""
+
+    def __init__(self, total: int, mode="auto", stream=None) -> None:
+        self.total = int(total)
+        self.done = 0
+        self.stream = sys.stderr if stream is None else stream
+        self.mode = self._resolve_mode(mode)
+        self.started = time.time()
+        self.last_plain = 0.0
+        self.drawn = False
+
+    def _resolve_mode(self, mode: str) -> str:
+        if mode != "auto":
+            return mode
+        try:
+            return "bar" if self.stream.isatty() else "plain"
+        except Exception:  # noqa: BLE001
+            return "plain"
+
+    def update(self, advance=0, *, label="", force=False) -> None:
+        self.done = min(self.total, self.done + int(advance))
+        if self.mode == "none":
+            return
+        now = time.time()
+        if (
+            self.mode == "plain"
+            and not force
+            and self.done < self.total
+            and now - self.last_plain < 60.0
+        ):
+            return
+        elapsed = now - self.started
+        rate = self.done / elapsed if self.done and elapsed > 0 else 0.0
+        remaining = (self.total - self.done) / rate if rate else 0.0
+        fraction = self.done / max(self.total, 1)
+        filled = min(PROGRESS_BAR_WIDTH, int(PROGRESS_BAR_WIDTH * fraction))
+        bar = "#" * filled + "-" * (PROGRESS_BAR_WIDTH - filled)
+        eta = _elapsed(remaining) if rate else "--:--"
+        suffix = f"  {label}" if label else ""
+        line = (
+            f"[{bar}] {self.done}/{self.total} configurations "
+            f"({100.0 * fraction:5.1f}%) elapsed {_elapsed(elapsed)} ETA {eta}{suffix}"
+        )
+        if self.mode == "bar":
+            self.stream.write("\r" + line + "\033[K")
+            self.drawn = True
+        else:
+            self.stream.write(line + "\n")
+            self.last_plain = now
+        self.stream.flush()
+
+    def log(self, message: str) -> None:
+        """Print a message without leaving it embedded in the live bar."""
+        if self.mode == "bar" and self.drawn:
+            self.stream.write("\r\033[K")
+        self.stream.write(message + "\n")
+        self.stream.flush()
+        self.drawn = False
+
+    def close(self) -> None:
+        if self.mode == "bar" and self.drawn:
+            self.stream.write("\n")
+            self.stream.flush()
+        self.drawn = False
 
 
 def _l2(x) -> float:
@@ -239,57 +352,100 @@ class RecordingVerifier(Verifier):
         return result
 
 
+def _row_l2(values) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    flat = array.reshape(len(array), -1)
+    return np.sqrt(np.einsum("ij,ij->i", flat, flat))
+
+
+def _aggregate_values(metric: str, values) -> dict:
+    if values is None:
+        return {
+            f"{metric}_{statistic}": ""
+            for statistic in REFINEMENT_STATISTICS
+        }
+    array = np.asarray(values, dtype=float)
+    quantiles = np.percentile(array, (50, 90, 99))
+    return {
+        f"{metric}_mean": float(np.mean(array)),
+        f"{metric}_std": float(np.std(array)),
+        f"{metric}_rms": float(np.sqrt(np.mean(array * array))),
+        f"{metric}_min": float(np.min(array)),
+        f"{metric}_max": float(np.max(array)),
+        f"{metric}_p50": float(quantiles[0]),
+        f"{metric}_p90": float(quantiles[1]),
+        f"{metric}_p99": float(quantiles[2]),
+        f"{metric}_zero_fraction": float(np.mean(array == 0.0)),
+    }
+
+
 class RecordingPicardUpdate:
-    """Canonical Picard callback with one diagnostic row per internal node."""
+    """Canonical Picard callback with online summaries by round/sweep/depth."""
 
     def __init__(self, tree: DraftTree) -> None:
         self.tree = tree
-        self.events: list[dict] = []
+        self.summaries: list[dict] = []
         self.sweep_index = 0
-        self._previous: dict[tuple[int, int], np.ndarray] = {}
+        self.round_index = -1
+        self._previous_states = None
 
     def reset(self) -> None:
-        self.events = []
+        self.summaries = []
         self.sweep_index = 0
-        self._previous = {}
+        self.round_index = -1
+        self._previous_states = None
 
     def __call__(self, request: RefinementRequest) -> RefinementUpdate:
         if request.iteration == 0:
-            self._previous = {}
+            self.round_index += 1
+            self._previous_states = None
         update = picard_update_fn(request)
         states = np.asarray(request.parent_states)
         current = np.asarray(request.current_proposal_means)
         target = np.asarray(update.exact_target_means)
-        for row, (image, node, step, sigma) in enumerate(zip(
-            request.indices_in_batch,
-            request.nodes,
-            request.steps,
-            request.sigmas,
-        )):
-            state = states[row]
-            key = (int(image), int(node))
-            previous = self._previous.get(key)
-            change = None if previous is None else state - previous
-            mismatch = target[row] - current[row]
-            increment = np.asarray(update.increments[row])
-            self.events.append({
+        increment = np.asarray(update.increments)
+        mismatch_l2 = _row_l2(target - current)
+        state_size = int(np.prod(states.shape[1:]))
+        change_l2 = (
+            None
+            if self._previous_states is None
+            else _row_l2(states - self._previous_states)
+        )
+        metrics = {
+            "state_l2": _row_l2(states),
+            "current_proposal_mean_l2": _row_l2(current),
+            "target_mean_l2": _row_l2(target),
+            "target_drift_l2": _row_l2(increment),
+            "picard_increment_l2": _row_l2(increment),
+            "current_mean_mismatch_l2": mismatch_l2,
+            "current_delta": mismatch_l2 / np.asarray(request.sigmas),
+            "iterate_change_l2": change_l2,
+            "iterate_change_rms": (
+                None if change_l2 is None else change_l2 / math.sqrt(state_size)
+            ),
+        }
+        depths = np.fromiter(
+            (self.tree.depth_of(int(node)) for node in request.nodes),
+            dtype=int,
+            count=len(request.nodes),
+        )
+        for depth in np.unique(depths):
+            selected = depths == depth
+            summary = {
+                "round_index": self.round_index,
                 "sweep_index": self.sweep_index,
                 "refinement_iteration": int(request.iteration) + 1,
-                "node": int(node),
-                "node_depth": self.tree.depth_of(int(node)),
-                "step": int(step),
-                "sigma": float(sigma),
-                "state_l2": _l2(state),
-                "current_proposal_mean_l2": _l2(current[row]),
-                "target_mean_l2": _l2(target[row]),
-                "target_drift_l2": _l2(target[row] - state),
-                "picard_increment_l2": _l2(increment),
-                "current_mean_mismatch_l2": _l2(mismatch),
-                "current_delta": _l2(mismatch) / sigma,
-                "iterate_change_l2": "" if change is None else _l2(change),
-                "iterate_change_rms": "" if change is None else _rms(change),
-            })
-            self._previous[key] = np.array(state, copy=True)
+                "node_depth": int(depth),
+                "node_count": int(np.sum(selected)),
+            }
+            for metric, values in metrics.items():
+                summary.update(
+                    _aggregate_values(
+                        metric, None if values is None else values[selected]
+                    )
+                )
+            self.summaries.append(summary)
+        self._previous_states = np.array(states, copy=True)
         self.sweep_index += 1
         return update
 
@@ -301,20 +457,51 @@ def trajectory_rngs(seed: int, replicate: int):
     return np.random.default_rng(init), np.random.default_rng(run)
 
 
-def make_tree(rule: str, K: int, L: int) -> DraftTree:
+def matched_chain_depth(
+    tree: DraftTree,
+    num_steps: int,
+    match: str,
+    evaluate_leaves: bool,
+) -> int:
+    """Return the horizon-clamped RMC depth matched to ``tree``."""
+    if match == "budget":
+        depth = tree.budget
+    else:
+        depth = tree.verification_budget(evaluate_leaves=evaluate_leaves)
+        if evaluate_leaves:
+            depth -= 1
+    return max(1, min(depth, num_steps))
+
+
+def make_tree(rule, K, L, num_steps, match, evaluate_leaves) -> DraftTree:
+    uniform = DraftTree.uniform(K, L)
     if rule == "rmc":
-        if K != 1:
-            raise ValueError("RMC configurations require K=1")
-        return DraftTree.chain(L)
-    return DraftTree.uniform(K, L)
+        depth = matched_chain_depth(uniform, num_steps, match, evaluate_leaves)
+        return DraftTree.chain(depth)
+    return uniform
 
 
-def cell_slug(rule: str, K: int, L: int, J: int) -> str:
-    return f"{rule.replace('-', '_')}-K{K}-L{L}-J{J}"
+def epsilon_slug(eps: float) -> str:
+    return f"eps{eps:g}"
+
+
+def topology_slug(K: int, L: int) -> str:
+    return f"K{K}_L{L}"
+
+
+def iteration_slug(J: int) -> str:
+    return f"J{J}"
+
+
+def cell_slug(eps: float, rule: str, K: int, L: int, J: int) -> str:
+    return f"{epsilon_slug(eps)}-{rule.replace('-', '_')}-{topology_slug(K, L)}-{iteration_slug(J)}"
 
 
 def build_sampler(setting, rule, K, L, J, cfg):
-    tree = make_tree(rule, K, L)
+    allocated_tree = DraftTree.uniform(K, L)
+    tree = make_tree(
+        rule, K, L, setting.num_steps, cfg["match"], cfg["evaluate_leaves"]
+    )
     verifier = RecordingVerifier(create_verifier(rule))
     refiner = RecordingPicardUpdate(tree)
     sampler = SpeculativeSampler(
@@ -330,29 +517,32 @@ def build_sampler(setting, rule, K, L, J, cfg):
         proposal_refinement_iters=J,
         refinement_update_fn=refiner,
     )
-    return sampler, verifier, refiner, tree
+    return sampler, verifier, refiner, tree, allocated_tree
 
 
-def _identity(rule, K, L, J, replicate):
+def _identity(rule, K, L, J, replicate, cfg):
     return {
-        "trajectory_id": f"{cell_slug(rule, K, L, J)}-r{replicate:06d}",
+        "trajectory_id": f"{cell_slug(cfg['eps'], rule, K, L, J)}-r{replicate:06d}",
+        "eps": cfg["eps"],
         "rule": rule,
         "K": K,
         "L": L,
         "J": J,
         "replicate": replicate,
+        "match": cfg["match"],
+        "evaluate_leaves": int(cfg["evaluate_leaves"]),
     }
 
 
 def one_trajectory(setting, rule, K, L, J, replicate, cfg, built):
-    sampler, verifier, refiner, tree = built
+    sampler, verifier, refiner, tree, allocated_tree = built
     init_rng, run_rng = trajectory_rngs(cfg["seed"], replicate)
     initial = setting.initial_state(init_rng)
     refiner.reset()
     started = time.perf_counter()
     result = sampler.sample(initial, rng=run_rng)
     sampling_seconds = time.perf_counter() - started
-    identity = _identity(rule, K, L, J, replicate)
+    identity = _identity(rule, K, L, J, replicate, cfg)
 
     cost = {
         field: sum(getattr(record, field) for record in result.rounds)
@@ -382,10 +572,15 @@ def one_trajectory(setting, rule, K, L, J, replicate, cfg, built):
     terminal = np.asarray(result.sample)
     trajectory_row = {
         **identity,
-        "B": tree.budget,
+        "B": allocated_tree.budget,
+        "allocated_verification_budget": allocated_tree.verification_budget(
+            evaluate_leaves=cfg["evaluate_leaves"]
+        ),
+        "actual_proposal_budget": tree.budget,
         "verification_budget": tree.verification_budget(
             evaluate_leaves=cfg["evaluate_leaves"]
         ),
+        "chain_depth": tree.depth if rule == "rmc" else "",
         "dimension": setting.dimension,
         "num_steps": setting.num_steps,
         "total_steps": setting.total_steps,
@@ -416,12 +611,20 @@ def one_trajectory(setting, rule, K, L, J, replicate, cfg, built):
     }
 
     round_rows = []
+    cumulative_target_calls = 0
+    cumulative_target_states = 0
     for round_index, record in enumerate(result.rounds):
+        cumulative_target_calls += record.target_calls
+        cumulative_target_states += record.target_states_evaluated
         row = {
             **identity,
             "round_index": round_index,
             "start_step": record.start_step,
+            "end_step": record.start_step + record.committed,
             "lookahead": record.lookahead,
+            "cumulative_committed": record.start_step + record.committed,
+            "cumulative_target_calls": cumulative_target_calls,
+            "cumulative_target_states_evaluated": cumulative_target_states,
             "committed": record.committed,
             "accepted_depth": record.accepted_depth,
             "rejected": int(record.rejected),
@@ -450,16 +653,16 @@ def one_trajectory(setting, rule, K, L, J, replicate, cfg, built):
     if cursor != len(verifier.events):
         raise RuntimeError("unassigned verification events remain")
 
-    refinement_rows = []
-    for event in refiner.events:
-        round_index = event["sweep_index"] // J if J else 0
-        refinement_rows.append({**identity, "round_index": round_index, **event})
+    refinement_rows = [
+        {**identity, **summary}
+        for summary in refiner.summaries
+    ]
 
     return {
         "trajectory": trajectory_row,
         "rounds": round_rows,
         "levels": level_rows,
-        "refinements": refinement_rows,
+        "refinement_summary": refinement_rows,
         "initial": np.array(initial, copy=True),
         "sample": np.array(terminal, copy=True),
         "path": np.array(result.trajectory, copy=True),
@@ -481,17 +684,24 @@ def _init_worker(cfg):
     _WORKER["samplers"] = {}
 
 
-def _job(args):
-    rule, K, L, J, replicate = args
-    key = (rule, K, L, J)
-    if key not in _WORKER["samplers"]:
-        _WORKER["samplers"][key] = build_sampler(
-            _WORKER["setting"], rule, K, L, J, _WORKER["cfg"]
-        )
-    return one_trajectory(
-        _WORKER["setting"], rule, K, L, J, replicate,
-        _WORKER["cfg"], _WORKER["samplers"][key],
-    )
+def _job_replicate(args):
+    K, L, J, replicate, rules = args
+    cell = (K, L, J)
+    if _WORKER.get("cell") != cell:
+        _WORKER["samplers"].clear()
+        _WORKER["cell"] = cell
+    bundles = []
+    for rule in rules:
+        key = (rule, K, L, J)
+        if key not in _WORKER["samplers"]:
+            _WORKER["samplers"][key] = build_sampler(
+                _WORKER["setting"], rule, K, L, J, _WORKER["cfg"]
+            )
+        bundles.append(one_trajectory(
+            _WORKER["setting"], rule, K, L, J, replicate,
+            _WORKER["cfg"], _WORKER["samplers"][key],
+        ))
+    return bundles
 
 
 def _write_csv(path: Path, fields, rows) -> None:
@@ -503,31 +713,61 @@ def _write_csv(path: Path, fields, rows) -> None:
         os.fsync(handle.fileno())
 
 
-def write_cell(out: Path, rule, K, L, J, bundles, save_samples=True) -> Path:
-    cells = out / "cells"
-    cells.mkdir(parents=True, exist_ok=True)
-    slug = cell_slug(rule, K, L, J)
-    destination = cells / slug
-    temporary = cells / f".{slug}.tmp-{os.getpid()}"
+def _bundle_rows(filename, bundles):
+    key = filename.removesuffix(".csv")
+    if key == "trajectories":
+        return [bundle["trajectory"] for bundle in bundles]
+    return [row for bundle in bundles for row in bundle[key]]
+
+
+def _sample_arrays(bundles):
+    return {
+        "replicate": np.array([b["trajectory"]["replicate"] for b in bundles]),
+        "trajectory_id": np.array([
+            b["trajectory"]["trajectory_id"] for b in bundles
+        ]),
+        "eps": np.array([b["trajectory"]["eps"] for b in bundles]),
+        "rule": np.array([b["trajectory"]["rule"] for b in bundles]),
+        "K": np.array([b["trajectory"]["K"] for b in bundles]),
+        "L": np.array([b["trajectory"]["L"] for b in bundles]),
+        "J": np.array([b["trajectory"]["J"] for b in bundles]),
+        "match": np.array([b["trajectory"]["match"] for b in bundles]),
+        "evaluate_leaves": np.array([
+            b["trajectory"]["evaluate_leaves"] for b in bundles
+        ]),
+        "initial": np.stack([b["initial"] for b in bundles]),
+        "sample": np.stack([b["sample"] for b in bundles]),
+        "trajectory": np.stack([b["path"] for b in bundles]),
+    }
+
+
+def _write_samples(path: Path, arrays) -> None:
+    with path.open("wb") as handle:
+        np.savez_compressed(handle, **arrays)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _write_bundle_files(directory, bundles, save_samples) -> None:
+    for filename, fields in TABLES.items():
+        _write_csv(
+            directory / filename, fields, _bundle_rows(filename, bundles)
+        )
+    if save_samples:
+        _write_samples(directory / "samples.npz", _sample_arrays(bundles))
+
+
+def write_cell(out: Path, K, L, J, bundles, save_samples=True) -> Path:
+    """Write a complete cell atomically; retained for small callers/tests."""
+    parent = out / topology_slug(K, L)
+    parent.mkdir(parents=True, exist_ok=True)
+    slug = iteration_slug(J)
+    destination = parent / slug
+    temporary = parent / f".{slug}.tmp-{os.getpid()}"
     if temporary.exists():
         shutil.rmtree(temporary)
     temporary.mkdir()
-    for filename, fields in TABLES.items():
-        key = filename.removesuffix(".csv")
-        if key == "trajectories":
-            rows = [bundle["trajectory"] for bundle in bundles]
-        else:
-            rows = [row for bundle in bundles for row in bundle[key]]
-        _write_csv(temporary / filename, fields, rows)
-    if save_samples:
-        np.savez_compressed(
-            temporary / "samples.npz",
-            replicate=np.array([b["trajectory"]["replicate"] for b in bundles]),
-            trajectory_id=np.array([b["trajectory"]["trajectory_id"] for b in bundles]),
-            initial=np.stack([b["initial"] for b in bundles]),
-            sample=np.stack([b["sample"] for b in bundles]),
-            trajectory=np.stack([b["path"] for b in bundles]),
-        )
+    _write_bundle_files(temporary, bundles, save_samples)
     (temporary / "COMPLETE").write_text("ok\n")
     if destination.exists():
         shutil.rmtree(temporary)
@@ -536,13 +776,150 @@ def write_cell(out: Path, rule, K, L, J, bundles, save_samples=True) -> Path:
     return destination
 
 
-def consolidate(out: Path) -> None:
-    """Rebuild normalized top-level tables from atomically completed cells."""
+def streamed_cell_paths(out: Path, K: int, L: int, J: int):
+    parent = out / topology_slug(K, L)
+    parent.mkdir(parents=True, exist_ok=True)
+    slug = iteration_slug(J)
+    return parent / slug, parent / f".{slug}.work"
 
-    complete = sorted(
-        path for path in (out / "cells").iterdir()
-        if path.is_dir() and (path / "COMPLETE").exists()
+
+def completed_replicates(work: Path) -> set[int]:
+    replicates = work / "replicates"
+    if not replicates.exists():
+        return set()
+    return {
+        int(marker.parent.name[1:])
+        for marker in replicates.glob("r*/COMPLETE")
+    }
+
+
+def write_replicate(work: Path, replicate: int, bundles, save_samples=True) -> Path:
+    replicates = work / "replicates"
+    replicates.mkdir(parents=True, exist_ok=True)
+    slug = f"r{replicate:06d}"
+    destination = replicates / slug
+    if (destination / "COMPLETE").exists():
+        return destination
+    temporary = replicates / f".{slug}.tmp-{os.getpid()}"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir()
+    _write_bundle_files(temporary, bundles, save_samples)
+    (temporary / "COMPLETE").write_text("ok\n")
+    if destination.exists():
+        shutil.rmtree(destination)
+    os.replace(temporary, destination)
+    return destination
+
+
+def finalize_streamed_cell(
+    work: Path,
+    destination: Path,
+    expected_replicates: int,
+    save_samples=True,
+) -> Path:
+    shards = sorted((work / "replicates").glob("r*"))
+    complete = [shard for shard in shards if (shard / "COMPLETE").exists()]
+    if len(complete) != expected_replicates:
+        raise RuntimeError(
+            f"cannot finalize {destination}: {len(complete)}/"
+            f"{expected_replicates} replicates are complete"
+        )
+    for filename, fields in TABLES.items():
+        temporary = work / f".{filename}.tmp"
+        with temporary.open("w", newline="") as dst:
+            writer = csv.DictWriter(dst, fieldnames=fields)
+            writer.writeheader()
+            for shard in complete:
+                with (shard / filename).open(newline="") as src:
+                    writer.writerows(csv.DictReader(src))
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(temporary, work / filename)
+    if save_samples:
+        combined = {}
+        for shard in complete:
+            with np.load(shard / "samples.npz") as archive:
+                for field in archive.files:
+                    combined.setdefault(field, []).append(np.array(archive[field]))
+        _write_samples(
+            work / "samples.npz",
+            {field: np.concatenate(parts) for field, parts in combined.items()},
+        )
+    (work / "COMPLETE").write_text("ok\n")
+    if destination.exists():
+        raise RuntimeError(f"incomplete destination already exists: {destination}")
+    os.replace(work, destination)
+    shards = destination / "replicates"
+    if shards.exists():
+        shutil.rmtree(shards)
+    return destination
+
+
+def migrate_legacy_refinements(cell: Path) -> bool:
+    """Add an online-summary-format file to a schema-v2 completed cell."""
+    destination = cell / "refinement_summary.csv"
+    if destination.exists():
+        return False
+    source = cell / "refinements.csv"
+    temporary = cell / ".refinement_summary.csv.tmp"
+    with temporary.open("w", newline="") as dst:
+        writer = csv.DictWriter(dst, fieldnames=REFINEMENT_FIELDS)
+        writer.writeheader()
+        if source.exists():
+            with source.open(newline="") as src:
+                first = None
+                key = None
+                values = None
+                for row in csv.DictReader(src):
+                    row_key = tuple(
+                        row[field]
+                        for field in IDENTITY_FIELDS + (
+                            "round_index", "sweep_index",
+                            "refinement_iteration", "node_depth",
+                        )
+                    )
+                    if key is not None and row_key != key:
+                        writer.writerow(_legacy_summary(first, values))
+                        first = values = None
+                    if first is None:
+                        first = row
+                        key = row_key
+                        values = {metric: [] for metric in REFINEMENT_METRICS}
+                    for metric in REFINEMENT_METRICS:
+                        value = row.get(metric, "")
+                        if value not in ("", None):
+                            values[metric].append(float(value))
+                if first is not None:
+                    writer.writerow(_legacy_summary(first, values))
+        dst.flush()
+        os.fsync(dst.fileno())
+    os.replace(temporary, destination)
+    return True
+
+
+def _legacy_summary(first, values):
+    summary = {
+        field: first[field]
+        for field in IDENTITY_FIELDS + (
+            "round_index", "sweep_index", "refinement_iteration", "node_depth",
+        )
+    }
+    summary["node_count"] = max(
+        (len(metric_values) for metric_values in values.values()), default=0
     )
+    for metric, metric_values in values.items():
+        summary.update(
+            _aggregate_values(metric, metric_values if metric_values else None)
+        )
+    return summary
+
+
+def consolidate(out: Path) -> None:
+    """Rebuild normalized epsilon-level tables from completed cells."""
+    complete = sorted(marker.parent for marker in out.glob("K*_L*/J*/COMPLETE"))
+    for cell in complete:
+        migrate_legacy_refinements(cell)
     for filename, fields in TABLES.items():
         temporary = out / f".{filename}.tmp"
         with temporary.open("w", newline="") as dst:
@@ -555,20 +932,35 @@ def consolidate(out: Path) -> None:
             os.fsync(dst.fileno())
         os.replace(temporary, out / filename)
 
-
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", default="results/gm-picard")
     p.add_argument("--dimension", type=int, default=512)
     p.add_argument("--num-components", type=int, default=5)
     p.add_argument("--num-steps", type=int, default=30)
-    p.add_argument("--eps", type=float, default=0.06)
+    p.add_argument(
+        "--eps-values", "--eps", dest="eps_values", type=float, nargs="+",
+        default=[0.1, 0.3, 0.6], help="churn values; each gets an eps<value> directory",
+    )
     p.add_argument("--mixture-seed", type=int, default=20260714)
     p.add_argument("--seed", type=int, default=20260714)
-    p.add_argument("--K-values", type=int, nargs="+", default=[1, 2, 3])
-    p.add_argument("--L-values", type=int, nargs="+", default=[4])
-    p.add_argument("--J-values", type=int, nargs="+", default=[0, 1, 2, 3, 4])
+    p.add_argument("--K-values", type=int, nargs="+", default=list(range(1, 8)))
+    p.add_argument("--L-values", type=int, nargs="+", default=list(range(1, 8)))
+    refinement_grid = p.add_mutually_exclusive_group()
+    refinement_grid.add_argument(
+        "--J-values", type=int, nargs="+", default=argparse.SUPPRESS
+    )
+    refinement_grid.add_argument(
+        "--J-up-to-L",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="for each depth L, sweep Picard iterations J from 0 through L",
+    )
     p.add_argument("--rules", nargs="+", default=["rmc", "d-grs"])
+    p.add_argument(
+        "--match", default="verification", choices=["verification", "budget"],
+        help="match each RMC chain to the (K,L) tree's target batch or proposal budget",
+    )
     p.add_argument("--replicates", type=int, default=100)
     p.add_argument(
         "--prefetch", default="nearest", choices=["none", "parent", "nearest"]
@@ -582,42 +974,47 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--save-samples", action=argparse.BooleanOptionalAction, default=True
     )
+    p.add_argument(
+        "--progress", default="auto", choices=["auto", "bar", "plain", "none"],
+        help="overall configuration progress display",
+    )
     p.add_argument("--n-workers", type=int, default=1)
-    p.add_argument("--max-verification-budget", type=int, default=60000)
+    p.add_argument(
+        "--max-verification-budget", type=int, default=0,
+        help="skip larger (K,L) trees; 0 keeps the complete canonical grid",
+    )
     return p
 
 
-def main(argv=None) -> None:
-    args = parser().parse_args(argv)
-    if any(x < 1 for x in args.K_values + args.L_values):
-        raise SystemExit("K and L values must be positive")
-    if any(x < 0 for x in args.J_values):
-        raise SystemExit("J values must be non-negative")
-    unknown = set(args.rules) - {"rmc", "d-grs"}
-    if unknown:
-        raise SystemExit(f"unsupported rules: {sorted(unknown)}")
+def picard_iterations(args, L: int):
+    """Return the Picard-iteration grid for a tree of depth ``L``."""
+    if hasattr(args, "J_values"):
+        return args.J_values
+    return range(L + 1)
 
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=True)
-    cfg = {k: v for k, v in sorted(vars(args).items()) if k not in {"out", "n_workers"}}
-    cfg["schema_version"] = SCHEMA_VERSION
-    config_path = out / "config.json"
-    if config_path.exists() and json.loads(config_path.read_text()) != cfg:
-        raise SystemExit(
-            f"{config_path} has a different protocol; use a new --out directory"
-        )
-    config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
-    (out / "schema.json").write_text(json.dumps({
-        "version": SCHEMA_VERSION,
-        "tables": {name: list(fields) for name, fields in TABLES.items()},
-        "samples": (
-            "cells/<cell>/samples.npz: replicate, trajectory_id, initial, "
-            "sample, trajectory"
-        ),
-    }, indent=2, sort_keys=True) + "\n")
 
+def configuration_count(args) -> int:
+    """Count ``(eps, rule, K, L, J)`` configurations in this run."""
+    per_epsilon = len(args.rules) * len(args.K_values) * sum(
+        len(tuple(picard_iterations(args, L))) for L in args.L_values
+    )
+    return len(args.eps_values) * per_epsilon
+
+
+def _run_epsilon(
+    args, out: Path, cfg: dict, eps: float, progress: ConfigurationProgress
+) -> None:
+    eps_out = out / epsilon_slug(eps)
+    eps_out.mkdir(parents=True, exist_ok=True)
+    eps_cfg = {**cfg, "eps": eps}
+    (eps_out / "config.json").write_text(
+        json.dumps(eps_cfg, indent=2, sort_keys=True) + "\n"
+    )
     setting = models.build(
-        args.dimension, args.num_components, args.num_steps, args.eps,
+        args.dimension,
+        args.num_components,
+        args.num_steps,
+        eps,
         mixture_seed=args.mixture_seed,
     )
     workers = max(1, args.n_workers)
@@ -629,75 +1026,181 @@ def main(argv=None) -> None:
         ):
             os.environ.setdefault(variable, "1")
         pool = mp.get_context("spawn").Pool(
-            workers, initializer=_init_worker, initargs=(cfg,)
+            workers, initializer=_init_worker, initargs=(eps_cfg,)
         )
 
-    print(
-        f"d={args.dimension} components={args.num_components} T={args.num_steps} "
-        f"eps={args.eps}; speculative steps={setting.num_steps}"
+    progress.log(
+        f"eps={eps:g} d={args.dimension} components={args.num_components} "
+        f"T={args.num_steps}; speculative steps={setting.num_steps} "
+        f"match={args.match} evaluate_leaves={args.evaluate_leaves}"
     )
     try:
-        for rule in args.rules:
-            for K in args.K_values:
-                if rule == "rmc" and K != 1:
+        for K in args.K_values:
+            for L in args.L_values:
+                iterations = tuple(picard_iterations(args, L))
+                allocated_tree = DraftTree.uniform(K, L)
+                budget = allocated_tree.verification_budget(
+                    evaluate_leaves=args.evaluate_leaves
+                )
+                if args.max_verification_budget and budget > args.max_verification_budget:
+                    label = f"{epsilon_slug(eps)}/{topology_slug(K, L)} skipped"
+                    progress.log(f"skip {label}: |I|={budget:,} exceeds cap")
+                    progress.update(len(iterations) * len(args.rules), label=label)
                     continue
-                for L in args.L_values:
-                    tree = make_tree(rule, K, L)
-                    budget = tree.verification_budget(
-                        evaluate_leaves=args.evaluate_leaves
-                    )
-                    if budget > args.max_verification_budget:
-                        print(
-                            f"skip {rule} K={K} L={L}: |I|={budget:,} exceeds cap"
-                        )
+                for J in iterations:
+                    destination, work = streamed_cell_paths(eps_out, K, L, J)
+                    label = str(destination.relative_to(out))
+                    if (destination / "COMPLETE").exists():
+                        if migrate_legacy_refinements(destination):
+                            progress.log(f"migrated legacy refinements: {label}")
+                        progress.log(f"resume: {label} already complete")
+                        progress.update(len(args.rules), label=f"{label} resumed")
                         continue
-                    for J in args.J_values:
-                        slug = cell_slug(rule, K, L, J)
-                        destination = out / "cells" / slug
-                        if (destination / "COMPLETE").exists():
-                            print(f"resume: {slug} already complete")
-                            continue
-                        started = time.time()
+                    work.mkdir(exist_ok=True)
+                    completed = completed_replicates(work)
+                    missing = [
+                        replicate for replicate in range(args.replicates)
+                        if replicate not in completed
+                    ]
+                    progress.update(
+                        label=f"{label} replicate {len(completed)}/{args.replicates}"
+                    )
+                    started = time.time()
+                    if pool is not None:
                         jobs = [
-                            (rule, K, L, J, replicate)
-                            for replicate in range(args.replicates)
+                            (K, L, J, replicate, tuple(args.rules))
+                            for replicate in missing
                         ]
-                        if pool is not None:
-                            bundles = pool.map(
-                                _job, jobs, chunksize=max(1, len(jobs) // workers)
-                            )
-                        else:
-                            built = build_sampler(setting, rule, K, L, J, cfg)
-                            bundles = [
+                        results = pool.imap(_job_replicate, jobs, chunksize=1)
+                    else:
+                        built = {
+                            rule: build_sampler(setting, rule, K, L, J, eps_cfg)
+                            for rule in args.rules
+                        }
+                        results = (
+                            [
                                 one_trajectory(
-                                    setting, rule, K, L, J, replicate, cfg, built
+                                    setting, rule, K, L, J, replicate,
+                                    eps_cfg, built[rule],
                                 )
-                                for replicate in range(args.replicates)
+                                for rule in args.rules
                             ]
-                        write_cell(
-                            out, rule, K, L, J, bundles,
+                            for replicate in missing
+                        )
+                    for finished, (replicate, bundles) in enumerate(
+                        zip(missing, results), start=len(completed) + 1
+                    ):
+                        write_replicate(
+                            work, replicate, bundles,
                             save_samples=args.save_samples,
                         )
-                        consolidate(out)
+                        progress.update(
+                            label=f"{label} replicate {finished}/{args.replicates}"
+                        )
+                    finalize_streamed_cell(
+                        work, destination, args.replicates,
+                        save_samples=args.save_samples,
+                    )
+                    with (destination / "trajectories.csv").open(newline="") as src:
+                        trajectory_rows = list(csv.DictReader(src))
+                    for rule in args.rules:
+                        selected = [
+                            row for row in trajectory_rows if row["rule"] == rule
+                        ]
                         mean_calls = float(np.mean([
-                            b["trajectory"]["target_calls"] for b in bundles
+                            float(row["target_calls"]) for row in selected
                         ]))
                         mean_accept = float(np.mean([
-                            b["trajectory"]["acceptance_rate"] for b in bundles
+                            float(row["acceptance_rate"]) for row in selected
                         ]))
-                        print(
-                            f"{slug:>20} calls={mean_calls:6.2f} "
+                        progress.log(
+                            f"  {rule:>5} {topology_slug(K, L)}/{iteration_slug(J)} "
+                            f"calls={mean_calls:6.2f} "
                             f"speed={setting.num_steps / mean_calls:5.2f}x "
                             f"accept={mean_accept:6.3f} "
                             f"[{time.time() - started:5.1f}s]"
                         )
+                    progress.update(len(args.rules), label=label)
     finally:
         if pool is not None:
             pool.close()
             pool.join()
-    consolidate(out)
-    print(f"wrote normalized tables under {out}")
+    consolidate(eps_out)
 
+
+def main(argv=None) -> None:
+    args = parser().parse_args(argv)
+    if any(x < 1 for x in args.K_values + args.L_values):
+        raise SystemExit("K and L values must be positive")
+    if hasattr(args, "J_values") and any(x < 0 for x in args.J_values):
+        raise SystemExit("J values must be non-negative")
+    if any(eps < 0 for eps in args.eps_values):
+        raise SystemExit("eps values must be non-negative")
+    eps_slugs = [epsilon_slug(eps) for eps in args.eps_values]
+    if len(set(eps_slugs)) != len(eps_slugs):
+        raise SystemExit("eps values must map to distinct output-directory names")
+    unknown = set(args.rules) - {"rmc", "d-grs"}
+    if unknown:
+        raise SystemExit(f"unsupported rules: {sorted(unknown)}")
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    cfg = {
+        key: value
+        for key, value in sorted(vars(args).items())
+        if key not in {"out", "n_workers", "progress"}
+    }
+    cfg["schema_version"] = SCHEMA_VERSION
+    config_path = out / "config.json"
+    if config_path.exists():
+        previous = json.loads(config_path.read_text())
+        previous_protocol = {
+            key: value for key, value in previous.items()
+            if key not in {"schema_version", "K_values", "L_values"}
+        }
+        current_protocol = {
+            key: value for key, value in cfg.items()
+            if key not in {"schema_version", "K_values", "L_values"}
+        }
+        if previous_protocol != current_protocol:
+            raise SystemExit(
+                f"{config_path} has a different protocol; use a new --out directory"
+            )
+        for axis in ("K_values", "L_values"):
+            if not set(cfg[axis]).issubset(previous[axis]):
+                raise SystemExit(
+                    f"{config_path}: {axis} must be a subset of the saved grid "
+                    f"{previous[axis]}; use a new --out directory to expand it"
+                )
+            # Keep the original grid in metadata: older cells remain valid,
+            # and a later invocation may resume any part of that grid.
+            # The run loops and progress count use args, the selected subset.
+            cfg[axis] = previous[axis]
+    config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    (out / "schema.json").write_text(json.dumps({
+        "version": SCHEMA_VERSION,
+        "tables": {name: list(fields) for name, fields in TABLES.items()},
+        "samples": (
+            "eps<eps>/K<K>_L<L>/J<J>/samples.npz: replicate, trajectory_id, "
+            "eps, rule, K, L, J, match, evaluate_leaves, initial, sample, trajectory"
+        ),
+        "legacy_refinements": (
+            "schema-v2 completed cells retain raw refinements.csv; "
+            "schema-v3 cells store refinement_summary.csv only"
+        ),
+    }, indent=2, sort_keys=True) + "\n")
+
+    progress = ConfigurationProgress(
+        configuration_count(args), mode=args.progress
+    )
+    progress.update(force=True, label="starting")
+    try:
+        for eps in args.eps_values:
+            _run_epsilon(args, out, cfg, eps, progress)
+        progress.update(force=True, label="complete")
+    finally:
+        progress.close()
+    print(f"wrote normalized tables under each epsilon directory in {out}")
 
 if __name__ == "__main__":
     main()

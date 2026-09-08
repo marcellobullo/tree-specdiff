@@ -100,43 +100,104 @@ Start with a small smoke run:
 ```bash
 RUN=/tmp/gm-picard-smoke
 python experiments/gm/picard_sweep.py --out "$RUN" \
-  --dimension 32 --num-steps 10 --K-values 1 2 --L-values 3 \
+  --eps 0.1 --dimension 32 --num-steps 10 --K-values 1 2 --L-values 3 \
   --J-values 0 1 2 3 --replicates 4
-python experiments/gm/plot_picard.py --out "$RUN"
+python experiments/gm/plot_picard.py --out "$RUN/eps0.1"
 ```
 
-The recommended first full diagnostic holds the topology at `L=4`, uses
-common random numbers across every refinement count, and includes both an RMC
-chain and branching D-GRS trees:
+The canonical sweep uses `K,L = 1,...,7`, 100 replicates, the epsilon grid
+`0.1, 0.3, 0.6`, and the depth-specific Picard grid `J=0,...,L`. RMC is
+matched separately to every `(K,L)` D-GRS tree. The initial protocol uses equal
+verification batches and does not evaluate leaves:
 
 ```bash
 RUN=results/gm-picard/$(date +%Y%m%d-%H%M%S)
 python experiments/gm/picard_sweep.py --out "$RUN" \
-  --seed 14 --K-values 1 2 3 --L-values 4 \
-  --J-values 0 1 2 3 4 --replicates 100 --n-workers 8
-python experiments/gm/plot_picard.py --out "$RUN"
+  --eps-values 0.1 0.3 0.6 \
+  --K-values 1 2 3 4 5 6 7 --L-values 1 2 3 4 5 6 7 \
+  --J-up-to-L --rules rmc d-grs --replicates 100 \
+  --match verification --no-evaluate-leaves --n-workers 1
+
+for EPS in 0.1 0.3 0.6; do
+  python experiments/gm/plot_picard.py --out "$RUN/eps$EPS"
+done
 ```
 
-RMC is run only for `K=1`; incompatible `K` values are skipped. Each
-`(rule,K,L,J)` cell is saved atomically, and rerunning the same command
-resumes completed cells.
+The command-line defaults encode this epsilon, topology, replicate, matching,
+and leaf-evaluation protocol; `--J-up-to-L` is explicit above to make the
+per-depth refinement grid visible. `--J-up-to-L` and an explicit `--J-values`
+list are mutually exclusive.
 
-The top-level output is normalized rather than restricted to one predetermined
-figure:
+`--progress auto` (the default) displays one overall configuration bar in an
+interactive terminal and periodic progress lines in redirected logs. The count
+includes both sampler rules and advances for completed, resumed, and
+budget-skipped configurations. Use `--progress bar`, `--progress plain`, or
+`--progress none` to override the display mode.
+
+Picard refinement is eager. In particular, `(K,L)=(7,7)` materializes almost a
+million draft states, so the full grid requires a high-memory machine and should
+start with one worker. `--max-verification-budget 60000` provides an optional
+safety cap, but capped cells are deliberately absent from the output.
+
+For each `(K,L)`, D-GRS uses `DraftTree.uniform(K,L)`. RMC uses a chain whose
+depth matches that tree under `--match verification` (equal target batch) or
+`--match budget` (equal proposal budget), clamped to the trajectory horizon.
+`--evaluate-leaves` participates in verification matching as well as controlling
+which rows the sampler evaluates.
+
+Results have this hierarchy:
+
+```text
+RUN/
+  config.json
+  schema.json
+  eps0.1/
+    config.json
+    trajectories.csv
+    rounds.csv
+    levels.csv
+    refinement_summary.csv
+    K2_L2/
+      J0/
+        trajectories.csv
+        rounds.csv
+        levels.csv
+        refinement_summary.csv
+        samples.npz
+        COMPLETE
+      J1/
+      J2/
+  eps0.3/
+  eps0.6/
+```
+
+Each `J` directory contains both rules and is saved atomically. While it is
+running, each replicate is checkpointed separately; rerunning the same command
+resumes both completed directories and incomplete cells. Each epsilon directory
+also gets normalized aggregate tables. Schema-v2 cells retain their raw
+`refinements.csv` and receive a derived summary during resume; new schema-v3
+cells contain only the summary:
+
+To resume only part of an existing grid, pass subsets of its saved `--K-values`
+and `--L-values`. For example, `--K-values 1 2 3 4 5 6 --L-values 1 2 3 4 5 6`
+skips all cells with either `K=7` or `L=7`. Other protocol settings must still
+match. The saved configuration retains the original grid so you can resume the
+excluded cells later. Existing results are preserved, and the consolidated
+epsilon tables still include all completed cells, including excluded ones.
 
 | output | granularity and purpose |
 | --- | --- |
-| `trajectories.csv` | aggregate acceptance, speedup, target calls/rows by phase, reuse, and state summaries |
-| `rounds.csv` | every sampler `RoundRecord`, including the complete cost decomposition |
+| `trajectories.csv` | aggregate acceptance, speedup, allocated/actual budgets, target calls/rows by phase, reuse, and state summaries |
+| `rounds.csv` | every sampler `RoundRecord`, including committed and accepted steps and the complete cost decomposition |
 | `levels.csv` | every verification event, including `delta`, drift geometry, candidates, and outcome |
-| `refinements.csv` | every internal node at every sweep, including iterate change and current mismatch |
-| `cells/*/samples.npz` | full initial, terminal, and committed trajectory arrays |
-| `schema.json` | machine-readable column inventory |
+| `refinement_summary.csv` | online count, mean, standard deviation, RMS, extrema, percentiles, and zero fraction per trajectory/round/sweep/depth |
+| `K*/J*/samples.npz` | rule labels plus full initial, terminal, and committed trajectory arrays |
+| `schema.json` | machine-readable column inventory at the run root |
 
 `plot_picard.py` derives `summary.csv`, `round_summary.csv`,
-`level_summary.csv`, and `refinement_summary.csv`, then writes one set of
-figures per `(rule,K,L)`. The raw normalized tables remain the source of
-truth, so new aggregations and plots do not require another sampling run.
+`level_summary.csv`, and `refinement_overview.csv`, then writes one set of
+figures per `(rule,K,L)`. The normalized tables remain the source of truth, so
+new aggregations and plots do not require another sampling run.
 Line and convergence panels show 95% confidence bands. Levelwise intervals
 aggregate repeated node observations within each trajectory before estimating
 uncertainty, so the independent unit remains the sampled trajectory. Heatmap
