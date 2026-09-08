@@ -92,6 +92,34 @@ class TargetTransition(ABC):
         Exact verification and refinement target-cache reuse rely on this.
         """
 
+    @abstractmethod
+    def freeze_drift(self, states: Array, means: Array, steps: Sequence[int]) -> Array:
+        """What :class:`DelayedDriftProposal` stores about a verified node.
+
+        ``means`` are this target's means at ``(states, steps)``, one row per
+        entry, and the return value is whatever per-row quantity the proposal
+        should carry to the next round; :meth:`apply_drift` turns it back into
+        a mean at a *different* state and step. Both must be exact inverses at
+        a fixed ``(state, step)``.
+
+        There is deliberately no default. Freeze the expensive quantity the
+        mean is built from, not the mean itself: the churn kernels of the
+        experiments are affine in the network velocity, ``m = a_n x + b_n v``,
+        so they freeze ``v`` and re-apply the kernel at the drafted node's own
+        state and step. Freezing the increment ``m^q(Y~) - Y~`` of eq. (7) and
+        sliding it onto the drafted node would carry the score-correction term
+        ``-(1/2) eps^2 g^2(sigma) score(x)`` evaluated at the stale state and
+        step, an error that grows with ``eps``; that form is only right for a
+        target whose mean is a translation of its input.
+        """
+
+    @abstractmethod
+    def apply_drift(self, drift: Array, states: Array, steps: Sequence[int]) -> Array:
+        """Rebuild a mean at ``(states, steps)`` from a frozen ``drift`` row.
+
+        The inverse of :meth:`freeze_drift`; see there.
+        """
+
     def __call__(
         self, indices_in_batch: Sequence[int], states: Array, steps: Sequence[int]
     ) -> Array:
@@ -210,31 +238,37 @@ class MirrorProposal(ProposalTransition):
 class DelayedDriftProposal(ProposalTransition):
     """The self-speculative proposal of eq. (7), with root-drift prefetching.
 
-    The target transition mean is ``m^q_n(y) = y + gamma b^q_{t_n}(y)``, so the
-    increment ``gamma b^q`` can be recovered from means alone::
-
-        gamma b^q_{t_n'}(Y~) = m^q_{n'}(Y~) - Y~
-
-    The proposal then freezes that increment and reuses it at every depth of
-    the tree::
+    The target transition mean is ``m^q_n(y) = y + gamma b^q_{t_n}(y)``. The
+    proposal freezes the drift behind a mean the sampler already computed at
+    some node ``(Y~, n')`` and reuses it at every depth of the tree. In the
+    paper's form that is the increment::
 
         m^p(y) = y + (m^q_{n'}(Y~) - Y~)
 
-    Because the increment is read from a target mean already computed during
+    What exactly is frozen, and how it is turned back into a mean at the
+    drafted node, is the **target's** decision through
+    :meth:`TargetTransition.freeze_drift` and
+    :meth:`TargetTransition.apply_drift`; this class never forms the
+    increment itself. The churn kernels of the experiments freeze the network
+    velocity and re-run the step at the drafted node's state and step, which
+    keeps the ``eps``-dependent score correction exact (see ``freeze_drift``).
+
+    Because the drift is read from a target mean already computed during
     verification, no additional target call is needed per round (Appendix C,
     "root-drift prefetching"). One warm-up call per image is required at
     ``n = 0`` and included in the counters.
 
-    ``_delayed_drift`` holds those increments in a ``(batch_size, *state_shape)``
-    buffer, one row per image, indexed by ``indices_in_batch`` -- so drafting is
-    a single gather-and-add no matter how many images are in flight, no image
+    ``_delayed_drift`` holds the frozen rows in a ``(batch_size, *state_shape)``
+    buffer, one per image, indexed by ``indices_in_batch`` -- so drafting is a
+    single gather-and-apply no matter how many images are in flight, no image
     can read another's drift, and the warm-up evaluations are collected into one
     target call rather than one per image.
 
     Parameters
     ----------
     target:
-        Used for the warm-up calls, and per round under ``prefetch="none"``.
+        Used for the warm-up calls, per round under ``prefetch="none"``, and
+        for ``freeze_drift`` / ``apply_drift``.
     Which drift gets reused is the **sampler's** ``prefetch`` setting, not this
     class's: selecting it needs the tree and the drafted states, which a
     proposal cannot see. The sampler announces the policy through
@@ -275,10 +309,13 @@ class DelayedDriftProposal(ProposalTransition):
         if not missing:
             return
         rows = ops.take(roots, missing)
-        means = self._target(
-            [indices_in_batch[i] for i in missing], rows, tuple(steps[i] for i in missing)
+        missing_steps = tuple(steps[i] for i in missing)
+        means = self._target([indices_in_batch[i] for i in missing], rows, missing_steps)
+        ops.put(
+            self._delayed_drift,
+            [indices_in_batch[i] for i in missing],
+            self._target.freeze_drift(rows, means, missing_steps),
         )
-        ops.put(self._delayed_drift, [indices_in_batch[i] for i in missing], means - rows)
         for i in missing:
             self._have[indices_in_batch[i]] = True
 
@@ -288,7 +325,11 @@ class DelayedDriftProposal(ProposalTransition):
         from .ops import resolve_backend
 
         ops = self._backend or resolve_backend(states)
-        ops.put(self._delayed_drift, list(indices_in_batch), target_means - states)
+        ops.put(
+            self._delayed_drift,
+            list(indices_in_batch),
+            self._target.freeze_drift(states, target_means, tuple(steps)),
+        )
         for b in indices_in_batch:
             self._have[b] = True
 
@@ -298,4 +339,5 @@ class DelayedDriftProposal(ProposalTransition):
         if self._delayed_drift is None:
             raise RuntimeError("on_round_start must run before drafting")
         ops = self._backend or resolve_backend(states)
-        return states + ops.take(self._delayed_drift, list(indices_in_batch))
+        drift = ops.take(self._delayed_drift, list(indices_in_batch))
+        return self._target.apply_drift(drift, states, tuple(steps))

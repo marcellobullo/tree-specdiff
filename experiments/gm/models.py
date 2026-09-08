@@ -114,6 +114,49 @@ class MixtureFlowTarget(TargetTransition):
             out[idx] = self.kernel(states[idx], step + self.step_offset)[0]
         return out
 
+    def affine(self, step: int) -> Tuple[float, float]:
+        """``(a, b)`` with ``mean = a x + b v``, in *absolute* step indices.
+
+        :meth:`kernel` written out: with ``c = (1/2) eps^2 g^2 / sigma`` the
+        churn mean is ``x (1 + dt c) + v dt (1 + c (1 - sigma))``; the
+        deterministic fallback is ``x + dt v``.
+        """
+        sigma, sigma_next = self.sigmas[step], self.sigmas[step + 1]
+        dt = sigma_next - sigma  # < 0
+        stochastic = (
+            self.eps > 0.0
+            and 1e-6 < sigma < 1.0 - 1e-6
+            and sigma_next > 0.0
+        )
+        if not stochastic:
+            return 1.0, float(dt)
+        g2 = 2.0 * sigma / (1.0 - sigma)
+        c = 0.5 * self.eps**2 * g2 / sigma
+        return float(1.0 + dt * c), float(dt * (1.0 + c * (1.0 - sigma)))
+
+    def freeze_drift(self, states, means, steps):
+        """The velocity behind ``means``: ``v = (m - a x) / b``.
+
+        Freezing ``v`` rather than ``m - x`` makes the delayed-drift proposal
+        re-evaluate the churn score correction at the drafted node's own state
+        and step; see :meth:`TargetTransition.freeze_drift`.
+        """
+        out = np.empty_like(states)
+        for step in sorted(set(steps)):
+            idx = [i for i, s in enumerate(steps) if s == step]
+            a, b = self.affine(step + self.step_offset)
+            out[idx] = (means[idx] - a * states[idx]) / b
+        return out
+
+    def apply_drift(self, drift, states, steps):
+        """One churn step at ``(states, steps)`` with the frozen velocity."""
+        out = np.empty_like(states)
+        for step in sorted(set(steps)):
+            idx = [i for i, s in enumerate(steps) if s == step]
+            a, b = self.affine(step + self.step_offset)
+            out[idx] = a * states[idx] + b * drift[idx]
+        return out
+
 
 class ChurnSchedule(NoiseSchedule):
     """``sigma_n`` of the churn kernel. Cached: it is state-independent."""

@@ -193,9 +193,19 @@ keeps the NFE accounting.
 ```python
 means(indices_in_batch, states, steps) -> Array      # -> (rows, *shape)
 __call__(indices_in_batch, states, steps) -> Array   # counts the call, validates lengths
+freeze_drift(states, means, steps) -> Array          # required; see below
+apply_drift(drift, states, steps) -> Array           # required; inverse of freeze_drift
 num_calls, num_states                                # counters
 reset_stats()                                        # called at the start of each sample()
 ```
+
+`freeze_drift` / `apply_drift` are what `DelayedDriftProposal` stores about a verified node
+and how it turns that back into a proposal mean at a drafted node. Freeze the expensive
+quantity the mean is built from, not the mean: the churn kernels in `experiments/` are affine
+in the network velocity, `m = a_n x + b_n v`, so they freeze `v` and re-run the step at the
+drafted node's own state and step. Sliding the increment `m - x` of eq. (7) onto the drafted
+node is only exact for a translation-like mean. The two must be exact inverses at a fixed
+`(state, step)`; there is no default.
 
 `indices_in_batch[i]` is which of the `batch_size` images entry `i` belongs to — the same
 convention as `ProposalTransition`. One call carries entries from several images, so a target
@@ -236,7 +246,7 @@ stateful proposals should use it as the cache key.
 | --- | --- |
 | `IdentityProposal()` | `y` |
 | `MirrorProposal(target)` | `m^q(y)` — perfect proposal, `delta = 0` |
-| `DelayedDriftProposal(target, *, prefetch=True)` | `y + (m^q(Y~) - Y~)`, eq. (7) |
+| `DelayedDriftProposal(target, *, prefetch=True)` | `target.apply_drift(target.freeze_drift(Y~, m^q(Y~)), y)` — eq. (7) with the target deciding what is frozen |
 
 `prefetch=True` reuses the freshest committed drift, so no extra target call per round;
 `prefetch=False` re-evaluates at each round's root, costing one NFE per round for a strictly

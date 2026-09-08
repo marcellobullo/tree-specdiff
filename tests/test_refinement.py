@@ -35,6 +35,13 @@ class AffineTarget(TargetTransition):
         ).reshape(shape)
         return self.a * states + offsets
 
+    # A translation-like toy map: the increment is the thing to freeze.
+    def freeze_drift(self, states, means, steps):
+        return means - states
+
+    def apply_drift(self, drift, states, steps):
+        return states + drift
+
 
 class AcceptFirst(Verifier):
     max_children = None
@@ -302,6 +309,12 @@ def test_torch_refinement_and_exact_cache_reuse():
                 device=states.device,
             ).reshape((len(steps),) + (1,) * (states.ndim - 1))
             return 0.7 * states + offsets
+
+        def freeze_drift(self, states, means, steps):
+            return means - states
+
+        def apply_drift(self, drift, states, steps):
+            return states + drift
 
     target = TorchAffineTarget()
     sampler = SpeculativeSampler(

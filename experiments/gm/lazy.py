@@ -90,15 +90,16 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
 
     state = init
     n = calls = rows = rounds = accepted_total = 0
-    increment: Optional[np.ndarray] = None
+    drift: Optional[np.ndarray] = None       # what DelayedDriftProposal holds
     known_root_mean: Optional[np.ndarray] = None
 
     while n < N:
         lookahead = min(L, N - n)
 
         # --- the proposal's frozen drift (DelayedDriftProposal.on_round_start)
-        if increment is None or prefetch == "none":
-            increment = target.means((0,), state[None], (n,))[0] - state
+        if drift is None or prefetch == "none":
+            root_mean = target.means((0,), state[None], (n,))
+            drift = target.freeze_drift(state[None], root_mean, (n,))[0]
             calls += 1
             rows += 1
             known_root_mean = None
@@ -123,7 +124,7 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
         for level in range(1, lookahead + 1):
             step = n + level - 1
             sigma = schedule(step)
-            proposal_mean = parent + increment
+            proposal_mean = target.apply_drift(drift[None], parent[None], (step,))[0]
             if parent_mean is None:
                 parent_mean = target.means((0,), parent[None], (step,))[0]
 
@@ -144,9 +145,11 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
 
         # --- the prefetch policy, mirroring SpeculativeSampler._prefetch_nearest
         if prefetch == "parent":
-            increment = verified_mean - verified_parent
+            drift = target.freeze_drift(
+                verified_parent[None], verified_mean[None], (n + committed - 1,)
+            )[0]
         elif prefetch == "nearest":
-            increment, known_root_mean = _prefetch_nearest(
+            drift, known_root_mean = _prefetch_nearest(
                 ops, target, state, verified_parent, verified_mean, verified_children,
                 n, committed, lookahead, rejected, evaluate_leaves,
             )
@@ -160,14 +163,15 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
 
 def _prefetch_nearest(ops, target, committed_state, parent, parent_mean, children,
                       n, committed, lookahead, rejected, evaluate_leaves):
-    """Returns ``(increment, known_root_mean)``; see the sampler's version."""
+    """Returns ``(drift, known_root_mean)``; see the sampler's version."""
     depth = committed  # the committed state sits at this depth
+    freeze = lambda x, m, step: target.freeze_drift(x[None], m[None], (step,))[0]  # noqa: E731
 
     if not rejected and evaluate_leaves:
         # Case 1: the committed leaf's own drift -- exact at the next root, and
         # therefore also the next root's target mean.
         mean = target.means((0,), committed_state[None], (n + depth,))[0]
-        return mean - committed_state, mean
+        return freeze(committed_state, mean, n + depth), mean
 
     if rejected and (depth <= lookahead - 1 or evaluate_leaves):
         # Case 2: nearest drafted sibling at the committed depth. Its siblings
@@ -176,7 +180,7 @@ def _prefetch_nearest(ops, target, committed_state, parent, parent_mean, childre
         means = target.means((0,) * len(children), children, (n + depth,) * len(children))
         d = [ops.norm(children[j] - committed_state) for j in range(len(children))]
         j = int(np.argmin(d))
-        return means[j] - children[j], None
+        return freeze(children[j], means[j], n + depth), None
 
     # Case 3: the last verified parent's, one step stale.
-    return parent_mean - parent, None
+    return freeze(parent, parent_mean, n + depth - 1), None

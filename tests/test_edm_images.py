@@ -1244,3 +1244,67 @@ def test_merge_refuses_unexpected_extra_rank(tmp_path):
         (tmp_path / f"shard_{rank:03d}.pt").touch()
     with pytest.raises(SystemExit, match="expected shards"):
         load_shards(tmp_path, signature={}, num_samples=2, world=2)
+
+
+class TestFrozenDrift:
+    """``ChurnKernelTarget.freeze_drift`` / ``apply_drift``: the delayed-drift
+    proposal carries the network velocity and re-runs the churn step at the
+    drafted node, not the increment ``m^q(Y~) - Y~`` of the stale node.
+    """
+
+    EPS = 0.6  # large enough that the score correction is not negligible
+
+    def _target(self):
+        return models.build(make_denoiser(img_resolution=8), num_steps=STEPS,
+                            eps=self.EPS).target
+
+    def test_freeze_recovers_the_velocity_and_apply_inverts_it(self):
+        t = self._target()
+        x = torch.randn((4, 3, 8, 8), generator=torch.Generator().manual_seed(30))
+        steps = (0, 3, 7, 12)
+        m = t((0,) * 4, x, steps)
+        v = t.freeze_drift(x, m, steps)
+        idx = torch.tensor([s + t.step_offset for s in steps])
+        v_true = t.denoiser.velocity(x, t.sigmas[idx].to(torch.float32), None)
+        assert torch.allclose(v, v_true, atol=1e-4, rtol=1e-5)
+        assert torch.allclose(t.apply_drift(v, x, steps), m, atol=1e-6)
+
+    def test_proposal_reruns_the_kernel_at_the_drafted_node(self):
+        """``m^p(y)`` at ``(y, n)`` is the churn step at ``(y, n)`` driven by the
+        frozen node's velocity -- checked against a second kernel whose
+        denoiser *is* that constant velocity, so the expectation is built from
+        ``kernel`` and not from ``apply_drift`` itself."""
+        t = self._target()
+        gen = torch.Generator().manual_seed(31)
+        root = torch.randn((1, 3, 8, 8), generator=gen)
+        proposal = DelayedDriftProposal(t)
+        proposal.reset(1)
+        proposal.on_round_start((0,), (2,), root)
+
+        def frozen_kernel(v):
+            class Constant:
+                num_classes = 0
+
+                @staticmethod
+                def velocity(x, sigma, labels):
+                    return v.expand_as(x)
+
+            return models.ChurnKernelTarget(Constant(), t.sigmas, t.eps,
+                                            step_offset=t.step_offset)
+
+        sig = lambda n: t.sigmas[[n + t.step_offset]].to(torch.float32)  # noqa: E731
+        y = root + 0.3 * torch.randn(root.shape, generator=gen)
+        got = proposal.means((0,), y, (4,))
+        expected = frozen_kernel(t.denoiser.velocity(root, sig(2), None))((0,), y, (4,))
+        assert torch.allclose(got, expected, atol=1e-5)
+        # ... and it is NOT the paper's frozen increment, which drags the
+        # score correction of step 2 at `root` along to step 4 at `y`.
+        stale = y + (t((0,), root, (2,)) - root)
+        assert not torch.allclose(got, stale, atol=1e-3)
+
+        # A hand-over through `on_verified` replaces the frozen velocity.
+        proposal.on_verified((0,), (5,), y, t((0,), y, (5,)))
+        z = y + 0.3 * torch.randn(root.shape, generator=gen)
+        got = proposal.means((0,), z, (6,))
+        expected = frozen_kernel(t.denoiser.velocity(y, sig(5), None))((0,), z, (6,))
+        assert torch.allclose(got, expected, atol=1e-5)

@@ -293,8 +293,11 @@ scale, since at zero churn both kernels are point masses and speculation is vacu
 delayed reverse drift needs to know when a round starts and which target drifts have become
 available; root-drift prefetching then reuses a drift the previous round already paid for
 during verification, instead of spending an extra NFE per round. The hooks let that live in
-the proposal rather than as a special case in the sampler. Note the increment is recoverable
-from means alone: `gamma * b^q = m^q(y) - y`, so the proposal never needs drift access.
+the proposal rather than as a special case in the sampler. What gets frozen is the target's
+decision (`freeze_drift` / `apply_drift`, both required): the churn kernels freeze the network
+velocity and re-run the step at the drafted node, so the `eps`-dependent score correction
+stays exact; sliding the paper's increment `m^q(y) - y` along instead is only right for a
+translation-like mean.
 
 **Where the NFEs are counted.** `TargetTransition.__call__` counts; that is why you call the
 instance rather than `.means()`. Cost is reported as `target_calls` (the paper's metric: one

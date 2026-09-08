@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -36,6 +37,13 @@ class LinearGaussianTarget(TargetTransition):
 
     def means(self, indices_in_batch, states, steps):
         return self.a * states
+
+    # A translation-like toy map: the increment is the thing to freeze.
+    def freeze_drift(self, states, means, steps):
+        return means - states
+
+    def apply_drift(self, drift, states, steps):
+        return states + drift
 
 
 class ExactProposal(ProposalTransition):
@@ -388,3 +396,39 @@ def test_explicit_backend_reaches_builtin_verifiers():
     )
     sampler.sample(np.ones(4), rng=np.random.default_rng(0))
     assert backend.uniform_calls > 0
+
+
+def test_delayed_drift_defers_to_the_target_for_what_it_freezes():
+    """A target's ``freeze_drift`` / ``apply_drift`` decide both what a
+    verified node leaves behind and how that becomes a mean at a drafted node
+    -- here a kernel affine in a per-step coefficient, ``m = c_n * (y + d)``,
+    which freezes ``d`` and re-applies the drafted node's own ``c_n``. There
+    is no library default: a target without the hooks cannot be built."""
+    with pytest.raises(TypeError):
+        class NoHooks(TargetTransition):
+            def means(self, indices_in_batch, states, steps):
+                return states
+
+        NoHooks()
+
+    class Affine(TargetTransition):
+        c = (1.0, 2.0, 4.0)
+
+        def means(self, indices_in_batch, states, steps):
+            return np.stack([self.c[s] * (states[i] + 1.0) for i, s in enumerate(steps)])
+
+        def freeze_drift(self, states, means, steps):
+            return np.stack([means[i] / self.c[s] - states[i] for i, s in enumerate(steps)])
+
+        def apply_drift(self, drift, states, steps):
+            return np.stack([self.c[s] * (states[i] + drift[i]) for i, s in enumerate(steps)])
+
+    target = Affine()
+    proposal = DelayedDriftProposal(target)
+    proposal.reset(1)
+    root = np.array([[0.5, -1.0]])
+    proposal.on_round_start((0,), (0,), root)
+    y = np.array([[3.0, 3.0]])
+    # frozen d = 1, re-applied with step 2's coefficient: 4 * (y + 1)
+    assert np.allclose(proposal.means((0,), y, (2,)), 4.0 * (y + 1.0))
+    assert not np.allclose(proposal.means((0,), y, (2,)), y + (root + 1.0 - root))

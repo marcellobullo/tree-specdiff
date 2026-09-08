@@ -570,3 +570,19 @@ def test_clip_cache_signature_tracks_model_prompts_and_samples(tmp_path):
     args.model = "model-a"
     prompts.write_text("a dog\n")
     assert clip.cache_signature(cell, args, meta) != first
+
+
+class TestFrozenDrift:
+    def test_freeze_recovers_the_velocity_and_apply_inverts_it(self):
+        """The latent kernel freezes the velocity like the pixel one does."""
+        den, s = make()
+        t = s.target
+        rows, steps = (0, 1, 2), (0, 5, 11)
+        den.set_prompt_batch(list(rows))
+        x = torch.randn((3, *s.state_shape), generator=torch.Generator().manual_seed(32))
+        m = t(rows, x, steps)
+        v = t.freeze_drift(x, m, steps)
+        idx = torch.tensor([st + t.step_offset for st in steps])
+        v_true = den.velocity(x, t.sigmas[idx].to(torch.float32), rows)
+        assert torch.allclose(v, v_true, atol=1e-4, rtol=1e-5)
+        assert torch.allclose(t.apply_drift(v, x, steps), m, atol=1e-6)

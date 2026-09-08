@@ -37,6 +37,16 @@ class MyDenoiser(TargetTransition):
         t = self.times[list(steps)]           # steps is a tuple of ints, one per row
         drift = self.net(states, t)
         return states + self.gamma * drift
+
+    # What `DelayedDriftProposal` carries between rounds, and how it becomes a
+    # mean at a drafted node. Freeze the network output, not the mean: here
+    # `m = x + gamma * net(x, t)`, so the drift is `(m - x) / gamma` and is
+    # re-applied with the drafted node's own gamma.
+    def freeze_drift(self, states, means, steps):
+        return (means - states) / self.gamma
+
+    def apply_drift(self, drift, states, steps):
+        return states + self.gamma * drift
 ```
 
 `means` is called **once per round** with the round's entire verification batch — every
@@ -105,7 +115,7 @@ The cheap mean map `m^p`. Called once per tree level while drafting.
 
 | class | `m^p(y)` | use |
 | --- | --- | --- |
-| `DelayedDriftProposal` | `y + (m^q(Y~) - Y~)` | **the paper's, eq. (7)** — self-speculative, no draft network needed |
+| `DelayedDriftProposal` | `target.apply_drift(target.freeze_drift(Y~, m^q(Y~)), y)`; see below | **the paper's, eq. (7)** — self-speculative, no draft network needed |
 | `IdentityProposal` | `y` | zero-cost baseline for measuring proposal quality |
 | `MirrorProposal` | `m^q(y)` | ideal proposal (`delta = 0`) for tests and diagnostics |
 | custom | application-defined | for example, a distilled draft network |
@@ -122,6 +132,24 @@ The proposal freezes that increment and reuses it at every depth of the tree. Be
 read from a target mean already evaluated during verification, no additional target call is
 needed per round. This is Appendix C's root-drift prefetching. One warm-up call is required at
 `n = 0` and included in `target_calls`.
+
+What is frozen is the **target's** decision, through two required hooks:
+
+```python
+TargetTransition.freeze_drift(states, means, steps)   # verified node -> what to carry
+TargetTransition.apply_drift(drift, states, steps)    # carried value -> mean at a drafted node
+```
+
+Sliding the increment `m - x` itself onto the drafted node is only right for a target whose
+mean is a translation of its input. The churn kernels of `experiments/` (`gm/models.py`,
+`images/models.py`, `images/sd3_models.py`) and `examples/gaussian_mixture.py` are not: their
+mean is affine in the network velocity, `m_n(x) = a_n x + b_n v(x)`, where `b_n` carries the
+`eps`-dependent score correction `-(1/2) eps^2 g^2(sigma_n)`. Freezing `m - x` there would
+freeze that correction at the stale state and step, and the proposal degrades with `eps`. So
+those kernels freeze `v` and re-run the step at the drafted node's own `(x, n)` — the
+frozen-velocity draft of the reference implementation. At a fixed `(state, step)` the two
+hooks are exact inverses. There is no library default: a target without them cannot be
+instantiated.
 
 ```python
 DelayedDriftProposal(target, prefetch=True)    # the paper's default

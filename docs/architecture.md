@@ -151,8 +151,9 @@ sequenceDiagram
     end
 ```
 
-`on_verified` supports **root-drift prefetching**. The delayed-drift proposal caches the target
-mean already computed in Phase 2 and reuses it in the next round. The hook runs after either
+`on_verified` supports **root-drift prefetching**. The delayed-drift proposal caches the drift
+behind a target mean already computed in Phase 2 (`target.freeze_drift`: the network
+velocity for the churn kernels) and reuses it in the next round. The hook runs after either
 acceptance or rejection because the target evaluation is available in both cases. This design
 requires one initial warm-up call at `n = 0`, which is included in `target_calls`.
 

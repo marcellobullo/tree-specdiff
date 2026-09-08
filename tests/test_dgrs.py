@@ -275,6 +275,13 @@ class _ShiftKernel(TargetTransition):
     def means(self, indices_in_batch, states, steps):
         return states + 0.1
 
+    # A translation-like toy map: the increment is the thing to freeze.
+    def freeze_drift(self, states, means, steps):
+        return means - states
+
+    def apply_drift(self, drift, states, steps):
+        return states + drift
+
 
 def test_runs_end_to_end_on_a_branching_tree():
     target = _ShiftKernel()

@@ -364,6 +364,50 @@ class ChurnKernelTarget(TargetTransition):
             self.labels_for(indices_in_batch),
         )[0]
 
+    def _affine(
+        self, x: torch.Tensor, steps: Sequence[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(a, b)`` with ``mean = a x + b v``, in *absolute* step indices.
+
+        :meth:`kernel` written out: with ``c = (1/2) eps^2 g^2 / sigma``, the
+        churn mean is ``x (1 + dt c) + v dt (1 + c (1 - sigma))``, and the
+        deterministic fallback is ``x + dt v``. Both are broadcast to ``x``.
+        """
+        idx = torch.as_tensor(list(steps), dtype=torch.long)
+        wide = torch.promote_types(x.dtype, torch.float32)
+        sigma = self.sigmas[idx].to(x.device, wide)
+        sigma_next = self.sigmas[idx + 1].to(x.device, wide)
+        dt = sigma_next - sigma  # < 0
+        expand = lambda s: s.view(-1, *([1] * (x.dim() - 1)))  # noqa: E731
+
+        g2 = 2.0 * sigma / (1.0 - sigma).clamp_min(_SIGMA_GUARD)
+        c = 0.5 * self.eps**2 * g2 / sigma.clamp_min(_SIGMA_GUARD)
+        active = (
+            (self.eps > 0.0)
+            & (sigma > _SIGMA_GUARD)
+            & (sigma < 1.0 - _SIGMA_GUARD)
+            & (sigma_next > 0.0)
+        )
+        a = torch.where(active, 1.0 + dt * c, torch.ones_like(dt))
+        b = torch.where(active, dt * (1.0 + c * (1.0 - sigma)), dt)
+        return expand(a), expand(b)
+
+    def freeze_drift(self, states, means, steps):
+        """The velocity behind ``means``: ``v = (m - a x) / b``.
+
+        Freezing ``v`` rather than ``m - x`` is what makes the delayed-drift
+        proposal re-evaluate the churn score correction at the drafted node's
+        own state and step (the reference implementation's frozen-velocity
+        draft); see :meth:`TargetTransition.freeze_drift`.
+        """
+        a, b = self._affine(states, [s + self.step_offset for s in steps])
+        return ((means - a * states) / b).to(states.dtype)
+
+    def apply_drift(self, drift, states, steps):
+        """One churn step at ``(states, steps)`` with the frozen velocity."""
+        a, b = self._affine(states, [s + self.step_offset for s in steps])
+        return (a * states + b * drift).to(states.dtype)
+
 
 @dataclass(frozen=True)
 class Setting:

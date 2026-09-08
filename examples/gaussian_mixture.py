@@ -82,6 +82,30 @@ class MixtureReverseKernel(TargetTransition):
             out[idx] = x + self.gamma * drift
         return out
 
+    def affine(self, step):
+        """``(a, b)`` with ``mean = a x + b v``: :meth:`means` written out."""
+        t = self.times[step]
+        return 1.0 - self.gamma * self.eps**2 / t, -self.gamma * (1.0 + self.eps**2)
+
+    def freeze_drift(self, states, means, steps):
+        """The velocity behind ``means``, ``v = (m - a x) / b``, so the delayed
+        drift proposal re-applies the churn term at the drafted node's own
+        state and step instead of sliding the stale increment along."""
+        out = np.empty_like(states)
+        for step in sorted(set(steps)):
+            idx = [i for i, s in enumerate(steps) if s == step]
+            a, b = self.affine(step)
+            out[idx] = (means[idx] - a * states[idx]) / b
+        return out
+
+    def apply_drift(self, drift, states, steps):
+        out = np.empty_like(states)
+        for step in sorted(set(steps)):
+            idx = [i for i, s in enumerate(steps) if s == step]
+            a, b = self.affine(step)
+            out[idx] = a * states[idx] + b * drift[idx]
+        return out
+
 
 class MixtureSchedule(NoiseSchedule):
     """sigma_n = eps * sqrt(2 gamma (1 - t_n) / t_n), eq. (37)."""
