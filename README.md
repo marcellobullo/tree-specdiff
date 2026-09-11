@@ -24,8 +24,10 @@ print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ```
 
 Set `proposal_refinement_iters=J` to run `J` target-backed Picard sweeps after
-the initial draft and before verification. See [Proposal refinement](docs/refinement.md)
-for the recurrence, callback contract, conditional Gaussian law, and target-mean reuse.
+the initial draft and before verification. Sweeps freeze only the target's drift by
+default (`picard_drift_update_fn`); `picard_update_fn` freezes the whole increment. See
+[Proposal refinement](docs/refinement.md) for the derivations: recurrence, conditional
+Gaussian law, finite-depth convergence, mismatch and error propagation, and target-mean reuse.
 
 ## Installation
 
@@ -72,8 +74,8 @@ an existing valid `edm/` checkout.
 | `edm` | dependencies and checkout command for pretrained EDM experiments and multi-GPU sharding |
 | `all` | everything above |
 
-The core library depends only on the Python standard library. Select an array backend with
-`[numpy]` or `[torch]`. On CUDA systems, install PyTorch from the appropriate PyTorch index
+The core library requires SciPy (including NumPy) for PAWS rank optimization and residual
+CDF inversion. NumPy is available by default; install `[torch]` for PyTorch states. On CUDA systems, install PyTorch from the appropriate PyTorch index
 before installing this package if a specific CUDA build is required; otherwise, `pip` uses
 the standard PyPI wheel.
 
@@ -104,7 +106,7 @@ pyproject.toml
 specdiff/
   sampler.py  batched.py  refinement.py  trees.py  kernels.py  verify.py  types.py  testing.py  ops.py
   verifiers/
-    rank1.py  rmc.py  dgrs.py
+    rank1.py  rmc.py  dgrs.py  paws.py
 tests/       test_sampler.py  test_batched.py  test_rank1.py  test_rmc.py  test_dgrs.py
              test_torch_backend.py
 examples/    gaussian_mixture.py
@@ -116,14 +118,15 @@ examples/    gaussian_mixture.py
 | `specdiff/batched.py` | the same, over many trajectories per target call |
 | `specdiff/trees.py` | draft topologies, layers, internal nodes, truncation `T|_m` |
 | `specdiff/kernels.py` | `TargetTransition`, `ProposalTransition`, noise schedules, delayed drift |
-| `specdiff/refinement.py` | row-local refinement contract, tree scan, fixed-noise Picard update, exact target cache |
+| `specdiff/refinement.py` | row-local refinement contract, tree scan, fixed-noise Picard updates (frozen drift, whole increment), exact target cache |
 | `specdiff/verify.py` | the `Verifier` contract, contract checker, name registry |
 | `specdiff/types.py` | `VerifyRequest`/`VerifyResult` and the run records |
 | `specdiff/verifiers/rank1.py` | the rank-1 reduction (eqs. 8–11), shared by any isotropic rule |
 | `specdiff/verifiers/rmc.py` | Algorithm 1: reflection maximal coupling (`rmc`), `K = 1` |
 | `specdiff/verifiers/dgrs.py` | Algorithm 2: greedy rejection sampling (`d-grs`), any `K` |
+| `specdiff/verifiers/paws.py` | PAWS rank-selection list coupling (`paws`), any `K` |
 | `specdiff/testing.py` | statistical exactness test for a rule |
-| `specdiff/ops.py` | the only module that touches NumPy/PyTorch |
+| `specdiff/ops.py` | array-backend operations; PAWS additionally uses NumPy/SciPy for scalar numerics |
 
 ```bash
 pip install -e '.[dev]' && python -m pytest tests -q
@@ -137,6 +140,7 @@ the trajectory, so `sample()` rejects them. Both `float32` and `float64` are sup
 | | |
 | --- | --- |
 | [docs/writing-a-verifier.md](docs/writing-a-verifier.md) | verifier contract, rank-1 coordinates, exactness testing, and implementation guidance |
+| [docs/paws.md](docs/paws.md) | PAWS derivation, rank/complement variants, numerical correction, and experiments |
 | [docs/refinement.md](docs/refinement.md) | tree Picard derivation, callback invariants, exact target-mean reuse, and accounting |
 | [docs/models.md](docs/models.md) | plugging in your own diffusion model, proposals, trees, backends |
 | [docs/architecture.md](docs/architecture.md) | how a round works, data flow, cost accounting, design decisions |

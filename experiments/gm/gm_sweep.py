@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lazy  # noqa: E402
 import experiments.gm.models as models  # noqa: E402
+from experiments.verifier_config import configured_verifier, parse_verifier_options
 
 from specdiff import (  # noqa: E402
     DelayedDriftProposal,
@@ -114,13 +115,9 @@ def matched_chain_depth(tree, num_steps, match, evaluate_leaves):
     would only cost memory. That clamp is also why the two protocols mostly
     coincide -- once the matched depth exceeds `N`, both give `chain(N)`.
     """
-    if match == "budget":
-        depth = tree.budget
-    else:
-        depth = tree.verification_budget(evaluate_leaves=evaluate_leaves)
-        if evaluate_leaves:
-            depth -= 1  # a chain of depth m evaluates m + 1 nodes with leaves
-    return max(1, min(depth, num_steps))
+    return create_verifier("rmc").matched_tree(
+        tree, num_steps=num_steps, match=match, evaluate_leaves=evaluate_leaves
+    ).depth
 
 
 def _matched_depth(K, L, budget, num_steps, match, evaluate_leaves):
@@ -134,17 +131,19 @@ def _matched_depth(K, L, budget, num_steps, match, evaluate_leaves):
     return max(1, min(depth, num_steps))
 
 
-def build_sampler(setting, rule, K, L, prefetch, evaluate_leaves, match):
+def build_sampler(setting, rule, K, L, prefetch, evaluate_leaves, match, verifier_options=None):
     """The eager sampler for one cell, plus the chain depth it was matched at."""
     uniform = DraftTree.uniform(K, L)
     depth = matched_chain_depth(uniform, setting.num_steps, match, evaluate_leaves)
-    tree = uniform if rule == "d-grs" else DraftTree.chain(depth)
+    tree = create_verifier(rule).matched_tree(
+        uniform, num_steps=setting.num_steps, match=match, evaluate_leaves=evaluate_leaves
+    )
     sampler = SpeculativeSampler(
         target=setting.target,
         proposal=DelayedDriftProposal(setting.target),
         schedule=setting.schedule,
         tree=tree,
-        verifier=create_verifier(rule),
+        verifier=configured_verifier(rule, verifier_options),
         num_steps=setting.num_steps,
         prefetch=prefetch,
         evaluate_leaves=evaluate_leaves,
@@ -165,10 +164,11 @@ def one_trajectory(setting, rule, K, L, replicate, cfg, sampler=None, tree=None)
 
     if cfg["lazy"]:
         depth = _matched_depth(K, L, budget, setting.num_steps, match, leaves)
-        sim_K, sim_L = (K, L) if rule == "d-grs" else (1, depth)
+        sim_K, sim_L = (1, depth) if create_verifier(rule).requires_chain else (K, L)
         res = lazy.simulate(setting, rule, sim_K, sim_L,
                             setting.initial_state(init_rng), run_rng,
-                            prefetch=prefetch, evaluate_leaves=leaves)
+                            prefetch=prefetch, evaluate_leaves=leaves,
+                            verifier_options=cfg.get("verifier_options"))
         calls, rows = res.target_calls, res.target_rows
         rounds, accepted = res.rounds, res.accepted_depth
         verif = lazy.verification_budget(sim_K, sim_L, leaves)
@@ -184,7 +184,7 @@ def one_trajectory(setting, rule, K, L, replicate, cfg, sampler=None, tree=None)
     return {
         "rule": rule, "K": K, "L": L, "B": budget,
         "verification_budget": verif,
-        "chain_depth": depth if rule != "d-grs" else "",
+        "chain_depth": depth if create_verifier(rule).requires_chain else "",
         "replicate": replicate, "target_calls": calls, "target_rows": rows,
         "rounds": rounds, "accepted_depth": accepted,
         "num_steps": setting.num_steps, "total_steps": setting.total_steps,
@@ -213,7 +213,8 @@ def _job(args):
         if key not in _WORKER["samplers"]:
             _WORKER["samplers"].clear()  # one cell at a time; trees are large
             sampler, tree, _ = build_sampler(setting, rule, K, L, cfg["prefetch"],
-                                             cfg["evaluate_leaves"], cfg["match"])
+                                             cfg["evaluate_leaves"], cfg["match"],
+                                             cfg.get("verifier_options"))
             _WORKER["samplers"][key] = (sampler, tree)
         sampler, tree = _WORKER["samplers"][key]
     return one_trajectory(setting, rule, K, L, replicate, cfg, sampler, tree)
@@ -231,7 +232,8 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=20260714, help="sampling seed")
     p.add_argument("--K-values", type=int, nargs="+", default=list(range(1, 8)))
     p.add_argument("--L-values", type=int, nargs="+", default=list(range(1, 8)))
-    p.add_argument("--rules", nargs="+", default=["d-grs", "rmc"])
+    p.add_argument("--rules", nargs="+", default=["d-grs", "rmc", "paws"])
+    p.add_argument("--verifier-options", type=parse_verifier_options, default={})
     p.add_argument("--replicates", type=int, default=100)
     p.add_argument("--prefetch", default="nearest", choices=["none", "parent", "nearest"],
                    help="which already-computed drift the next round reuses")

@@ -22,7 +22,7 @@ different location.
 | `models.py` | the adapter: denoiser → velocity → churn transition, plus the schedule |
 | `toy.py` | a closed-form stand-in denoiser, so the wiring is testable with no checkpoint and no GPU |
 | `run_edm.py` | generation driver — writes `samples.pt`, `meta.json`, `grid.png` |
-| `sweep.sh` | the `(K, L)` sweep — d-grs vs rmc across the grid, resumable |
+| `sweep.sh` | the `(K, L)` sweep — D-GRS, RMC, and PAWS across the grid, resumable |
 | `fid.py` | FID and Inception Score from saved samples, with a cached real set |
 | [`cifar10-conditional.md`](cifar10-conditional.md) | full protocol: generate + score, class-conditional CIFAR-10 |
 | [`ffhq.md`](ffhq.md) | the same for FFHQ 64x64 — what differs, and why |
@@ -52,6 +52,15 @@ SD3 conditions on **text**, one caption per image. `--prompts FILE` gives image
 (caption, starting noise) pairs and the comparison is paired rather than two
 marginals. There is no FID: these are samples of a text conditional, not of a
 dataset distribution.
+
+## PAWS
+
+Both drivers accept `--rule paws`, with optimized ranks and first-child residual
+complement reuse by default. Set `--verifier-options` to a per-rule JSON mapping,
+for example `'{"paws":{"rank_policy":"max","residual_complement":"fresh"}}'`.
+Shell sweeps accept the same mapping through `VERIFIER_OPTIONS`; they include it
+in protocol/resume checks. Keep variants in separate output roots.
+See [PAWS](../../docs/paws.md) for all options and numerical qualifications.
 
 ## Run it
 

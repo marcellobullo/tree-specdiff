@@ -69,7 +69,7 @@ def lazily(setting, rule, K, L, n, prefetch, evaluate_leaves):
 def main() -> None:
     setting = models.build()
     reps = 400
-    cases = [(rule, K, L) for rule in ("d-grs",) for K, L in ((1, 3), (2, 3), (4, 3), (3, 4))]
+    cases = [(rule, K, L) for rule in ("d-grs", "paws") for K, L in ((1, 3), (2, 3), (4, 3), (3, 4))]
     cases += [("rmc", 1, 3), ("rmc", 1, 8)]
 
     print(f"{reps} replicates per cell.  z on mean target_calls; |z| > 4 fails.\n")

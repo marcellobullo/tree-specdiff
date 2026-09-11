@@ -311,6 +311,7 @@ class TestSampling:
     @pytest.mark.parametrize("rule,tree", [
         ("rmc", DraftTree.chain(4)),
         ("d-grs", DraftTree.uniform(branching=3, lookahead=2)),
+        ("paws", DraftTree.uniform(branching=3, lookahead=2)),
     ])
     def test_runs_end_to_end_and_saves_calls(self, rule, tree):
         s = models.build(make_denoiser(img_resolution=8), num_steps=STEPS, eps=EPS)
@@ -844,6 +845,7 @@ class TestExperimentBookkeeping:
             "toy_resolution": 16, "toy_classes": 0,
             "num_steps": 100, "eps": 0.25, "s_noise": 1.0, "shift": 1.0,
             "rule": "d-grs", "branching": 2, "lookahead": 3,
+            "verifier_options": "{}",
             "match": "verification",
             "seed": 0, "num_samples": 64, "sample_batch": 0,
             "labels": "auto", "forward_batch": 0,

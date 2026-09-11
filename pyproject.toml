@@ -3,14 +3,14 @@ name = "specdiff"
 version = "0.1.0"
 description = "Speculative diffusion sampling over arbitrary draft trees"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["scipy>=1.10"]
 
 [project.scripts]
 specdiff-download-edm = "specdiff.edm_checkout:main"
 
 [project.optional-dependencies]
-# The library core imports nothing outside the standard library: you choose a
-# backend. These extras are the things built *on* it.
+# SciPy supplies PAWS optimization and inverse-CDF numerics.
+# These extras provide array backends and experiment dependencies.
 numpy = ["numpy>=1.24"]
 torch = ["torch>=2.0"]
 # experiments/gm: plot_gm.py / heatmap.py. The sweep itself needs none of them.

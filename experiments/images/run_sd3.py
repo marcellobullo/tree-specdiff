@@ -59,6 +59,7 @@ from specdiff import (  # noqa: E402
     IdentityProposal,
     ResampleVerifier,
     create_verifier,
+    available_verifiers,
 )
 
 from images import sd3_models as sd3  # noqa: E402
@@ -68,6 +69,10 @@ from images.run_common import (  # noqa: E402
     metric_totals, non_negative, positive, print_config_template,
     print_sampler_template, run_signature, save_grid, summarise_metrics,
     validate_reusable_shard,
+)
+
+from experiments.verifier_config import (
+    configured_verifier, check_verifier_options, parse_verifier_options,
 )
 
 REPORT_EVERY_S = 60.0
@@ -97,7 +102,9 @@ PARAMS = (
     Param("shift", "schedule", sd3.DEFAULT_SHIFT, float, check=positive,
           help="timestep shift; SD3.5 ships 3.0"),
 
-    Param("rule", "method", "d-grs", str, choices=("d-grs", "rmc", "target")),
+    Param("rule", "method", "d-grs", str, choices=available_verifiers() + ("target",)),
+    Param("verifier_options", "method", "{}", str, check=check_verifier_options,
+          help="JSON object of per-rule constructor options, e.g. paws rank_policy"),
     Param("branching", "method", 2, int, help="K", check=at_least_one),
     Param("lookahead", "method", 3, int, help="L", check=at_least_one),
     Param("match", "method", "verification", str,
@@ -228,8 +235,9 @@ def build_denoiser(args) -> sd3.SD3Denoiser:
 
 def matched_chain_depth(tree: DraftTree, num_steps: int, match: str) -> int:
     """Depth of the rmc chain matching `tree`; see `run_edm.matched_chain_depth`."""
-    depth = tree.budget if match == "budget" else tree.verification_budget()
-    return max(1, min(depth, num_steps))
+    return create_verifier("rmc").matched_tree(
+        tree, num_steps=num_steps, match=match
+    ).depth
 
 
 def build_setting(args, denoiser) -> sd3.Setting:
@@ -247,9 +255,10 @@ def build_tree(args, num_steps: int) -> DraftTree:
     if args.rule == "target":
         return DraftTree.chain(1)
     uniform = DraftTree.uniform(branching=args.branching, lookahead=args.lookahead)
-    if args.rule == "rmc":
-        return DraftTree.chain(matched_chain_depth(uniform, num_steps, args.match))
-    return uniform
+    return create_verifier(args.rule).matched_tree(
+        uniform, num_steps=num_steps, match=args.match,
+        evaluate_leaves=getattr(args, "sampler", {}).get("evaluate_leaves", False)
+    )
 
 
 def build_sampler(setting, tree, args):
@@ -261,7 +270,8 @@ def build_sampler(setting, tree, args):
         )
     return BatchedSpeculativeSampler(
         target=setting.target, proposal=DelayedDriftProposal(setting.target),
-        schedule=setting.schedule, tree=tree, verifier=create_verifier(args.rule),
+        schedule=setting.schedule, tree=tree, verifier=configured_verifier(
+            args.rule, getattr(args, "verifier_options", None)),
         num_steps=setting.num_steps, check_contract=args.check_contract,
         **args.sampler,
     )
@@ -419,10 +429,12 @@ def merge_shards(args, setting, tree, denoiser, out, world=None):
         "shift": args.shift,
         "branching": args.branching if args.rule != "target" else 1,
         "lookahead": args.lookahead if args.rule != "target" else 1,
-        "match": args.match if args.rule == "rmc" else None,
-        "chain_depth": tree.depth if args.rule == "rmc" else None,
+        "match": args.match if args.rule != "target" and create_verifier(args.rule).requires_chain else None,
+        "chain_depth": tree.depth if args.rule != "target" and create_verifier(args.rule).requires_chain else None,
+        "requires_chain": args.rule != "target" and create_verifier(args.rule).requires_chain,
         "proposal_budget": tree.budget,
-        "verification_budget": tree.verification_budget(),
+        "verification_budget": tree.verification_budget(
+            evaluate_leaves=args.sampler["evaluate_leaves"]),
         "sample_batch": args.sample_batch or args.num_samples,
         "forward_batch": args.forward_batch,
         "decode_batch": args.decode_batch,
@@ -443,6 +455,7 @@ def merge_shards(args, setting, tree, denoiser, out, world=None):
         "seconds": max(part["seconds"] for part in parts),
         "seconds_per_rank": [part["seconds"] for part in parts],
         "sampler": dict(args.sampler),
+        "verifier_options": parse_verifier_options(args.verifier_options),
         "run_signature": signature,
     }
 

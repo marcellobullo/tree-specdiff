@@ -37,8 +37,9 @@ construction.
 - `check_contract` — wrap the rule in `CheckedVerifier`; recommended during development.
 - `backend` — only needed for a framework `resolve_backend` does not know.
 - `proposal_refinement_iters` — synchronous tree-refinement sweeps; `None` or `0` disables them.
-- `refinement_update_fn` — row-local increment callback. Positive iterations default to
-  `picard_update_fn`.
+- `refinement_update_fn` — row-local refinement callback. Positive iterations default to
+  `picard_drift_update_fn`; `picard_update_fn` freezes the whole increment and reproduces
+  earlier runs.
 
 ```python
 .sample(init, *, rng=None, on_round=None, record=True) -> SamplingResult
@@ -78,11 +79,17 @@ unaffected.
 
 `RefinementRequest` contains the iteration, image indices, logical nodes, steps, parent
 states, current proposal means, sigmas, target, and backend. A callback must be row-local
-and returns exactly one `RefinementUpdate(increments, exact_target_means=None)`.
+and returns exactly one `RefinementUpdate(increments=None, exact_target_means=None,
+drifts=None)` with exactly one of `increments` and `drifts` set. `increments` are added to
+the rebuilt parent; `drifts` are passed to `target.apply_drift` at the rebuilt parent.
 
-`picard_update_fn` is the default for positive iteration counts and returns
-`m^q_s(x) - x` together with correctness-bearing exact target means. See
-[Proposal refinement](refinement.md) for the mathematical and caching contracts.
+`picard_drift_update_fn` is the default for positive iteration counts. It returns
+`target.freeze_drift` of the target means together with those means as correctness-bearing
+exact target means, so the part of the mean the target does not freeze is evaluated at the
+rebuilt parent. `picard_update_fn`, the former default, returns the whole increment
+`m^q_s(x) - x` instead. Both have the same fixed point; the drift update removes the stale
+`(a - 1) x` term of the churn kernels. See [Proposal refinement](refinement.md) for the
+derivations and the caching contract.
 
 ### `standard_sampler`
 
@@ -281,6 +288,8 @@ verify(request: VerifyRequest) -> VerifyResult          # required
 verify_batch(request: BatchedVerifyRequest) -> BatchedVerifyResult
 __call__(request) -> VerifyResult
 supports(num_children) -> bool
+requires_chain: bool                  # property: max_children == 1
+matched_tree(tree, *, num_steps, match="verification", evaluate_leaves=False)
 check_topology(tree)                   # called once, by the sampler, at construction
 reset()                                # drop per-run state
 backend_for(request) -> Backend        # static; a backend without importing ops
@@ -315,9 +324,18 @@ create_verifier("my-rule", **kwargs) -> Verifier
 available_verifiers() -> tuple[str, ...]
 ```
 
-Registered by the library: `resample`, `rmc`, `d-grs`, all registered on `import specdiff`.
+Registered by the library: `resample`, `rmc`, `d-grs`, `paws`, all registered on `import specdiff`.
 `rmc` is Algorithm 1 (`max_children = 1`, so pair it with `DraftTree.chain(L)`) and `d-grs` is
 Algorithm 2 (any `K`); see [the paper's two algorithms](writing-a-verifier.md#the-papers-two-algorithms).
+`paws` is `RankSelectionCoupling(rank_policy="optimized", residual_complement="first")`,
+with any `K`, shared positive Gaussian variance, and no temperature parameter. Rank policies
+are `optimized`, `uniform`, `max`, or a callable `(delta, K) -> weights`; complement policies
+are `first`, `fresh`, and `nearest_projection`. See [PAWS](paws.md).
+
+Experiments use `verifier.requires_chain` and `verifier.matched_tree(...)` instead of
+special-casing names. The latter returns the supplied tree for unrestricted rules; for
+single-child rules it returns a horizon-clamped chain matching the proposal or verification
+budget, accounting for `evaluate_leaves`. It always checks topology compatibility.
 
 ---
 
@@ -426,6 +444,6 @@ State arrays are always stacks of shape `(num_nodes, *state_shape)`. Node and st
 plain Python ints; nothing framework-specific crosses the public API except the state arrays.
 
 Module-level helpers: `default_state(dim)`, `standard_normal_cdf(x)`, `standard_normal_sf(x)` —
-the last two so verifiers and tests need no SciPy.
+the last two without SciPy; PAWS uses SciPy separately for its scalar coupling numerics.
 
 See [models.md](models.md#adding-a-backend) for writing one.

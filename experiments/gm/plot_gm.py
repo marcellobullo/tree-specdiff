@@ -35,10 +35,10 @@ import csv
 import statistics as st
 from pathlib import Path
 
-RULE_LABEL = {"rmc": "RMC (De Bortoli et al.)", "d-grs": "D-GRS (ours)"}
-RULE_SHORT = {"rmc": "RMC", "d-grs": "D-GRS"}
-RULE_COLOR = {"rmc": "seagreen", "d-grs": "#1D3557"}
-RULE_ORDER = ("rmc", "d-grs")
+RULE_LABEL = {"rmc": "RMC (De Bortoli et al.)", "d-grs": "D-GRS (ours)", "paws": "PAWS"}
+RULE_SHORT = {"rmc": "RMC", "d-grs": "D-GRS", "paws": "PAWS"}
+RULE_COLOR = {"rmc": "seagreen", "d-grs": "#1D3557", "paws": "#A85532"}
+RULE_ORDER = ("rmc", "d-grs", "paws")
 # `plot_speedup_vs_k` only: its D-GRS lines are coloured by lookahead depth off
 # viridis, and RMC's own seagreen sits inside that ramp -- the marker would read
 # as one more depth. Orange is the one accent the ramp does not contain.
@@ -118,10 +118,10 @@ def plot_heatmaps(summary, out_dir, cmap="viridis"):
     from heatmap import heatmap_grid
 
     df = pd.DataFrame(summary)
-    labels = {"rmc": "RMC", "d-grs": "D-GRS (ours)"}
+    labels = RULE_LABEL
 
     heatmap_grid(
-        df, rules=("rmc", "d-grs"),
+        df, rules=RULE_ORDER,
         metric="speedup", band=None, cmap=cmap,
         drop_l1=True,
         show_budget=True, robust=False, cbar_extend="neither",
@@ -130,7 +130,7 @@ def plot_heatmaps(summary, out_dir, cmap="viridis"):
         save=out_dir / "figure3_grid_speedup", formats=("pdf", "png"), dpi=400,
     )
     heatmap_grid(
-        df, rules=("rmc", "d-grs"),
+        df, rules=RULE_ORDER,
         metric="calls", band=None, cmap=f"{cmap}_r",
         drop_l1=True, titles=labels, highlight_best=False,
         cbar_extend="neither", robust=False,
@@ -367,13 +367,13 @@ def plot_calls_by_depth(summary, out_stem, band="se"):
     print(f"wrote {out_stem.with_suffix('.png')}")
 
 
-def plot_speedup_vs_k(summary, out_stem, band="se", drop_l1=True):
+def plot_speedup_vs_k(summary, out_stem, band="se", drop_l1=True, tree_rule="d-grs"):
     """Speed-up against the branching factor, one line per lookahead depth.
 
     The clearest statement of the topological argument, because it puts the two
     rules on the same axis and lets `K` do the talking:
 
-    * **D-GRS** gets one line per `L`, rising with `K`. Width buys acceptance.
+    * The selected tree rule (D-GRS or PAWS) gets one line per `L`.
     * **RMC** builds no tree, so every `(K, L)` cell of its panel is really a
       chain of the matched budget -- they all collapse onto `K = 1`. It is drawn
       as a single marker at the median with a bar spanning the full range, which
@@ -391,7 +391,7 @@ def plot_speedup_vs_k(summary, out_stem, band="se", drop_l1=True):
 
     rows = [s for s in summary if not (drop_l1 and s["L"] == 1)]
     rmc = [s["speedup_mean"] for s in rows if s["rule"] == "rmc"]
-    tree = [s for s in rows if s["rule"] == "d-grs"]
+    tree = [s for s in rows if s["rule"] == tree_rule]
     if not rmc or not tree:
         return
     lo, hi, mid = min(rmc), max(rmc), float(np.median(rmc))
@@ -453,7 +453,7 @@ def plot_speedup_vs_k(summary, out_stem, band="se", drop_l1=True):
 
         cb = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax,
                           ticks=depths, pad=0.02, fraction=0.04)
-        cb.set_label("Lookahead depth $L$ (D-GRS)", fontsize=9)
+        cb.set_label(f"Lookahead depth $L$ ({RULE_SHORT[tree_rule]})", fontsize=9)
         cb.ax.tick_params(labelsize=8)
         cb.outline.set_visible(False)
 
@@ -486,6 +486,7 @@ def main() -> None:
         plot_speedup_vs_budget(summary, out / "speedup_vs_budget")
         plot_calls_by_depth(summary, out / "calls_vs_budget_by_depth")
         plot_speedup_vs_k(summary, out / "speedup_vs_k")
+        plot_speedup_vs_k(summary, out / "speedup_vs_k_paws", tree_rule="paws")
     except ImportError as exc:
         # Report the dependency that raised the import error.
         missing = getattr(exc, "name", None) or str(exc)

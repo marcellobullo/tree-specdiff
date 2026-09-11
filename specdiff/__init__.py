@@ -35,6 +35,7 @@ from .refinement import (
     RefinementRequest,
     RefinementUpdate,
     RefinementUpdateFn,
+    picard_drift_update_fn,
     picard_update_fn,
 )
 from .sampler import SpeculativeSampler, standard_sampler
@@ -59,15 +60,16 @@ from .verify import (
     register_verifier,
 )
 
-# Imported for its side effect as much as its names: the rules in
-# `verifiers.rmc` and `verifiers.dgrs` register themselves under "rmc" and
-# "d-grs" at import time, and without this `create_verifier("rmc")` raises
+# Imported for its side effect as much as its names: the verifiers package
+# registers "rmc", "d-grs", and "paws"
+# at import time, and without this `create_verifier("rmc")` raises
 # KeyError after a bare `import specdiff` -- the registry would advertise only
 # "resample" until some other module happened to pull the subpackage in.
 from .verifiers import (  # noqa: E402
     DEGENERATE_TOL,
     GreedyRejectionSampling,
     Rank1Frame,
+    RankSelectionCoupling,
     ReflectionMaximalCoupling,
 )
 
@@ -102,10 +104,12 @@ __all__ = [
     "DEGENERATE_TOL",
     "ReflectionMaximalCoupling",
     "GreedyRejectionSampling",
+    "RankSelectionCoupling",
     "RefinementRequest",
     "RefinementUpdate",
     "RefinementUpdateFn",
     "picard_update_fn",
+    "picard_drift_update_fn",
     # contract types
     "VerifyRequest",
     "VerifyResult",

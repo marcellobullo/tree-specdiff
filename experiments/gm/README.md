@@ -1,6 +1,6 @@
 # Gaussian mixture — replicating Figures 1 and 3
 
-This experiment reproduces the Section 5.1 `(K, L)` sweep for both verifiers on an analytic
+This experiment reproduces the Section 5.1 `(K, L)` sweep and adds PAWS on an analytic
 Gaussian-mixture target. It runs with NumPy and requires neither a GPU nor a neural network,
 making it suitable for validating an installation before running image models.
 
@@ -15,7 +15,7 @@ making it suitable for validating an installation before running image models.
 | `plot_picard.py` | refinement convergence, depth, cost, reuse, and sample diagnostics |
 | `heatmap.py` | the annotated `(K, L)` grid panels |
 
-The sweep itself needs only NumPy. **Plotting needs matplotlib, pandas and seaborn**,
+The sweep itself needs NumPy and SciPy (installed with the core library). **Plotting needs matplotlib, pandas and seaborn**,
 none of which are core dependencies:
 
 ```bash
@@ -28,7 +28,7 @@ pip install -e '.[dev]'      # or '.[plots]' for plotting alone
 python experiments/gm/validate_lazy.py
 ```
 
-Expect `worst |z| = ... over 36 configurations; 0 failing` (it fails at
+Expect `worst |z| = ... over 60 configurations; 0 failing` (it fails at
 `|z| > 4`). The prefetch policy is implemented twice — once in the sampler,
 once in `lazy.py` — so this is what catches the two drifting apart. Run it
 before any sweep that uses `--lazy`.
@@ -40,6 +40,12 @@ python experiments/gm/gm_sweep.py --out /tmp/gm-smoke --dimension 64 --num-steps
 ```
 
 This short run validates the complete experiment path before starting the full sweep.
+
+The default rules are `d-grs rmc paws`; pass `--rules d-grs rmc` for the original
+comparison. PAWS variants use `--verifier-options`, for example
+`'{"paws":{"rank_policy":"max","residual_complement":"first"}}'`. This also works
+with `--lazy` and with `picard_sweep.py`. Use a separate output directory for each
+variant. See [PAWS](../../docs/paws.md) for the derivation and numerical caveats.
 
 ## 3. The full sweep
 
@@ -127,6 +133,14 @@ The command-line defaults encode this epsilon, topology, replicate, matching,
 and leaf-evaluation protocol; `--J-up-to-L` is explicit above to make the
 per-depth refinement grid visible. `--J-up-to-L` and an explicit `--J-values`
 list are mutually exclusive.
+
+`--picard-update drift` (the default) freezes only the target's velocity during
+refinement; `--picard-update increment` freezes the whole increment `m - x`, as
+every run did before the flag existed. The choice is part of the saved protocol:
+a `config.json` without it counts as `increment`, so older output directories
+resume only with `--picard-update increment`, and mixing the two in one `--out`
+directory is refused. See [docs/refinement.md](../../docs/refinement.md) for the
+derivations and measured differences.
 
 `--progress auto` (the default) displays one overall configuration bar in an
 interactive terminal and periodic progress lines in redirected logs. The count

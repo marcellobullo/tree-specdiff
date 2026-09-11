@@ -41,6 +41,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import experiments.gm.models as models  # noqa: E402
+from experiments.verifier_config import configured_verifier, parse_verifier_options
 
 from specdiff import (  # noqa: E402
     DelayedDriftProposal,
@@ -50,10 +51,14 @@ from specdiff import (  # noqa: E402
     SpeculativeSampler,
     Verifier,
     create_verifier,
+    available_verifiers,
+    picard_drift_update_fn,
     picard_update_fn,
 )
 
 SCHEMA_VERSION = 3
+PICARD_UPDATES = {"drift": picard_drift_update_fn, "increment": picard_update_fn}
+"""``--picard-update`` choices. Configs saved before the flag used ``increment``."""
 IDENTITY_FIELDS = (
     "trajectory_id",
     "eps",
@@ -380,10 +385,11 @@ def _aggregate_values(metric: str, values) -> dict:
 
 
 class RecordingPicardUpdate:
-    """Canonical Picard callback with online summaries by round/sweep/depth."""
+    """Picard callback with online summaries by round/sweep/depth."""
 
-    def __init__(self, tree: DraftTree) -> None:
+    def __init__(self, tree: DraftTree, update_fn=picard_drift_update_fn) -> None:
         self.tree = tree
+        self.update_fn = update_fn
         self.summaries: list[dict] = []
         self.sweep_index = 0
         self.round_index = -1
@@ -399,11 +405,12 @@ class RecordingPicardUpdate:
         if request.iteration == 0:
             self.round_index += 1
             self._previous_states = None
-        update = picard_update_fn(request)
+        update = self.update_fn(request)
         states = np.asarray(request.parent_states)
         current = np.asarray(request.current_proposal_means)
         target = np.asarray(update.exact_target_means)
-        increment = np.asarray(update.increments)
+        # m(X) - X at the snapshot, whichever form the update carries.
+        increment = target - states
         mismatch_l2 = _row_l2(target - current)
         state_size = int(np.prod(states.shape[1:]))
         change_l2 = (
@@ -464,21 +471,16 @@ def matched_chain_depth(
     evaluate_leaves: bool,
 ) -> int:
     """Return the horizon-clamped RMC depth matched to ``tree``."""
-    if match == "budget":
-        depth = tree.budget
-    else:
-        depth = tree.verification_budget(evaluate_leaves=evaluate_leaves)
-        if evaluate_leaves:
-            depth -= 1
-    return max(1, min(depth, num_steps))
+    return create_verifier("rmc").matched_tree(
+        tree, num_steps=num_steps, match=match, evaluate_leaves=evaluate_leaves
+    ).depth
 
 
 def make_tree(rule, K, L, num_steps, match, evaluate_leaves) -> DraftTree:
     uniform = DraftTree.uniform(K, L)
-    if rule == "rmc":
-        depth = matched_chain_depth(uniform, num_steps, match, evaluate_leaves)
-        return DraftTree.chain(depth)
-    return uniform
+    return create_verifier(rule).matched_tree(
+        uniform, num_steps=num_steps, match=match, evaluate_leaves=evaluate_leaves
+    )
 
 
 def epsilon_slug(eps: float) -> str:
@@ -502,8 +504,8 @@ def build_sampler(setting, rule, K, L, J, cfg):
     tree = make_tree(
         rule, K, L, setting.num_steps, cfg["match"], cfg["evaluate_leaves"]
     )
-    verifier = RecordingVerifier(create_verifier(rule))
-    refiner = RecordingPicardUpdate(tree)
+    verifier = RecordingVerifier(configured_verifier(rule, cfg.get("verifier_options")))
+    refiner = RecordingPicardUpdate(tree, PICARD_UPDATES[cfg.get("picard_update", "drift")])
     sampler = SpeculativeSampler(
         target=setting.target,
         proposal=DelayedDriftProposal(setting.target),
@@ -580,7 +582,7 @@ def one_trajectory(setting, rule, K, L, J, replicate, cfg, built):
         "verification_budget": tree.verification_budget(
             evaluate_leaves=cfg["evaluate_leaves"]
         ),
-        "chain_depth": tree.depth if rule == "rmc" else "",
+        "chain_depth": tree.depth if create_verifier(rule).requires_chain else "",
         "dimension": setting.dimension,
         "num_steps": setting.num_steps,
         "total_steps": setting.total_steps,
@@ -956,7 +958,13 @@ def parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="for each depth L, sweep Picard iterations J from 0 through L",
     )
-    p.add_argument("--rules", nargs="+", default=["rmc", "d-grs"])
+    p.add_argument(
+        "--picard-update", default="drift", choices=sorted(PICARD_UPDATES),
+        help="freeze the target's drift (default) or the whole increment m - x; "
+        "runs saved before this flag used increment",
+    )
+    p.add_argument("--rules", nargs="+", default=["rmc", "d-grs", "paws"])
+    p.add_argument("--verifier-options", type=parse_verifier_options, default={})
     p.add_argument(
         "--match", default="verification", choices=["verification", "budget"],
         help="match each RMC chain to the (K,L) tree's target batch or proposal budget",
@@ -1139,7 +1147,7 @@ def main(argv=None) -> None:
     eps_slugs = [epsilon_slug(eps) for eps in args.eps_values]
     if len(set(eps_slugs)) != len(eps_slugs):
         raise SystemExit("eps values must map to distinct output-directory names")
-    unknown = set(args.rules) - {"rmc", "d-grs"}
+    unknown = set(args.rules) - set(available_verifiers())
     if unknown:
         raise SystemExit(f"unsupported rules: {sorted(unknown)}")
 
@@ -1154,6 +1162,9 @@ def main(argv=None) -> None:
     config_path = out / "config.json"
     if config_path.exists():
         previous = json.loads(config_path.read_text())
+        # Runs saved before --picard-update existed used the increment update, so
+        # they resume only under --picard-update increment.
+        previous.setdefault("picard_update", "increment")
         previous_protocol = {
             key: value for key, value in previous.items()
             if key not in {"schema_version", "K_values", "L_values"}

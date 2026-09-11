@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import seaborn as sns  # noqa: E402
 
-RULE_LABELS = {"rmc": "RMC", "d-grs": "D-GRS (ours)"}
+RULE_LABELS = {"rmc": "RMC", "d-grs": "D-GRS (ours)", "paws": "PAWS"}
 
 # Tallest a line of cell text may be, as a fraction of the cell. Also the line
 # spacing, so `_draw_cells` and `_autofit_annotations` agree on what fits: with
@@ -125,7 +125,7 @@ def _autofit_annotations(fig, axes, fill, n_lines):
 def heatmap_grid(
     df,
     *,
-    rules=("rmc", "d-grs"),
+    rules=("rmc", "d-grs", "paws"),
     metric="calls",                  # "calls" (lower better) | "speedup" (higher better)
     baseline=None,
     diff_panel=False,

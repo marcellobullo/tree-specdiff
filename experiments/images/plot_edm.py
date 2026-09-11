@@ -68,10 +68,10 @@ from collections import OrderedDict
 from pathlib import Path
 
 # The rules that get a line, in legend order, with the paper's names.
-RULE_LABEL = OrderedDict([("d-grs", "D-GRS"), ("rmc", "RMC")])
-RULE_COLOR = {"D-GRS": "#1D3557", "RMC": "seagreen"}
-RULE_MARKER = {"D-GRS": "o", "RMC": "^"}
-RULE_LINESTYLE = {"D-GRS": "-", "RMC": "--"}
+RULE_LABEL = OrderedDict([("d-grs", "D-GRS"), ("rmc", "RMC"), ("paws", "PAWS")])
+RULE_COLOR = {"D-GRS": "#1D3557", "RMC": "seagreen", "PAWS": "#A85532"}
+RULE_MARKER = {"D-GRS": "o", "RMC": "^", "PAWS": "s"}
+RULE_LINESTYLE = {"D-GRS": "-", "RMC": "--", "PAWS": "-."}
 
 DATASET_LABEL = {"cifar10": "CIFAR-10", "ffhq": "FFHQ"}
 DATASET_ORDER = ("cifar10", "ffhq")
@@ -136,7 +136,8 @@ def load(root: Path, pattern: str = "*") -> list[dict]:
         budget = proposal_budget(K, L)
         # The one place the derived budget can be checked against the run: the
         # tree arm drafts every node, so its own field must agree.
-        if rule == "d-grs" and int(meta.get("proposal_budget", budget)) != budget:
+        requires_chain = meta.get("requires_chain", meta.get("chain_depth") is not None or rule == "rmc")
+        if not requires_chain and int(meta.get("proposal_budget", budget)) != budget:
             warned.append(f"{path}: proposal_budget={meta['proposal_budget']}, "
                           f"(K={K}, L={L}) implies B={budget}")
         row = {

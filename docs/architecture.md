@@ -87,9 +87,9 @@ expanded in one proposal call. Every sibling is expanded, because which one surv
 decided until Phase 3.
 
 With positive `proposal_refinement_iters`, Phase 1 continues with synchronous tree Picard
-sweeps. Each sweep evaluates one row-local increment for every internal node, then rebuilds
-the tree breadth-first with the original fixed edge innovations. See
-[Proposal refinement](refinement.md).
+sweeps. Each sweep evaluates one row-local update for every internal node, by default the
+target's frozen drift, then rebuilds the tree breadth-first with the original fixed edge
+innovations. See [Proposal refinement](refinement.md).
 
 **With refinement disabled, Phase 2 makes one target call over internal nodes.** With
 refinement enabled, exact target means from the final sweep are reused wherever the final
