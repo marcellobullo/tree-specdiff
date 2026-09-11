@@ -17,6 +17,8 @@ from specdiff import (
     TargetTransition,
     Verifier,
     VerifyResult,
+    picard_drift_update_fn,
+    picard_update_fn,
 )
 
 
@@ -41,6 +43,31 @@ class AffineTarget(TargetTransition):
 
     def apply_drift(self, drift, states, steps):
         return states + drift
+
+
+class VelocitySplitTarget(TargetTransition):
+    """``m = a x + b v(x)`` that freezes ``v``, the shape of the churn kernels."""
+
+    def __init__(self, a=0.8, b=-0.5, slope=0.5, bend=1.0):
+        super().__init__()
+        self.a, self.b = float(a), float(b)
+        self.slope, self.bend = float(slope), float(bend)
+
+    def velocity(self, states, steps):
+        shape = (len(steps),) + (1,) * (states.ndim - 1)
+        offsets = np.asarray([0.2 * (step + 1) for step in steps], dtype=states.dtype)
+        return (
+            self.slope * states + self.bend * np.tanh(states) + offsets.reshape(shape)
+        )
+
+    def means(self, indices_in_batch, states, steps):
+        return self.a * states + self.b * self.velocity(states, steps)
+
+    def freeze_drift(self, states, means, steps):
+        return (means - self.a * states) / self.b
+
+    def apply_drift(self, drift, states, steps):
+        return self.a * states + self.b * drift
 
 
 class AcceptFirst(Verifier):
@@ -221,14 +248,19 @@ def test_false_exact_target_cache_is_detected_in_contract_mode():
         sampler.sample(np.ones(1), rng=np.random.default_rng(0))
 
 
-def test_batch_of_one_matches_scalar_with_refinement():
+@pytest.mark.parametrize(
+    "target_type, callback",
+    [(AffineTarget, None), (VelocitySplitTarget, picard_drift_update_fn)],
+)
+def test_batch_of_one_matches_scalar_with_refinement(target_type, callback):
     common = dict(
         schedule=ConstantSchedule(0.2),
         tree=DraftTree.uniform(2, 3),
         num_steps=7,
         proposal_refinement_iters=2,
+        refinement_update_fn=callback,
     )
-    scalar_target, batch_target = AffineTarget(), AffineTarget()
+    scalar_target, batch_target = target_type(), target_type()
     scalar = SpeculativeSampler(
         target=scalar_target,
         proposal=IdentityProposal(),
@@ -298,7 +330,8 @@ def test_proposal_owned_target_accounting_is_complete(prefetch):
         assert [record.proposal_target_calls for record in result.rounds] == [1, 0]
 
 
-def test_torch_refinement_and_exact_cache_reuse():
+@pytest.mark.parametrize("callback", [None, picard_drift_update_fn])
+def test_torch_refinement_and_exact_cache_reuse(callback):
     torch = pytest.importorskip("torch")
 
     class TorchAffineTarget(TargetTransition):
@@ -325,6 +358,7 @@ def test_torch_refinement_and_exact_cache_reuse():
         verifier=AcceptFirst(),
         num_steps=2,
         proposal_refinement_iters=2,
+        refinement_update_fn=callback,
     )
     generator = torch.Generator().manual_seed(3)
     result = sampler.sample(torch.zeros(2), rng=generator)
@@ -403,6 +437,157 @@ def test_refined_rmc_preserves_affine_target_law():
     for step in range(num_steps):
         mean = a * mean + shift * (step + 1)
         variance = a * a * variance + sigma * sigma
+    standard_error = np.sqrt(variance / len(samples))
+    assert abs(samples.mean() - mean) < 5 * standard_error
+    assert abs(samples.var() / variance - 1.0) < 0.1
+
+
+def test_drift_picard_recurrence_and_cache_accounting():
+    target = VelocitySplitTarget()
+    _, sampler = scalar_sampler(
+        target=target, iterations=2, callback=picard_drift_update_fn
+    )
+    root = np.asarray([0.3, -0.4])
+    innovations = 0.2 * np.random.default_rng(7).standard_normal((3, 2))
+    old = [root.copy()]
+    for edge in innovations:
+        old.append(old[-1] + edge)
+    for _ in range(2):
+        # The affine part sees the rebuilt parent; only v comes from the snapshot.
+        new = [root.copy()]
+        for depth, edge in enumerate(innovations):
+            frozen = target.velocity(old[depth][None], (depth,))[0]
+            new.append(target.a * new[depth] + target.b * frozen + edge)
+        old = new
+
+    result = sampler.sample(root, rng=np.random.default_rng(7))
+    assert np.allclose(result.trajectory, np.stack(old))
+    record = result.rounds[0]
+    assert record.refinement_target_calls == 2
+    assert record.refinement_target_states_evaluated == 6
+    assert record.verification_target_calls == 1
+    assert record.verification_target_means_reused == 2
+
+
+def test_full_depth_drift_refinement_reaches_the_exact_target_chain():
+    target = VelocitySplitTarget()
+    _, sampler = scalar_sampler(
+        target=target, iterations=3, callback=picard_drift_update_fn
+    )
+    root = np.asarray([0.3, -0.4])
+    innovations = 0.2 * np.random.default_rng(5).standard_normal((3, 2))
+    exact = [root]
+    for depth, edge in enumerate(innovations):
+        exact.append(target.means((0,), exact[-1][None], (depth,))[0] + edge)
+
+    result = sampler.sample(root, rng=np.random.default_rng(5))
+    assert np.allclose(result.trajectory, np.stack(exact))
+    record = result.rounds[0]
+    assert record.verification_target_calls == 0
+    assert record.verification_target_means_reused == 3
+
+
+def test_drift_update_matches_increment_update_for_a_translation_drift():
+    # AffineTarget freezes the increment itself, so the updates agree up to rounding.
+    results = []
+    for callback in (picard_update_fn, picard_drift_update_fn):
+        _, sampler = scalar_sampler(
+            tree=DraftTree.uniform(2, 3), iterations=2, callback=callback
+        )
+        results.append(sampler.sample(np.zeros(2), rng=np.random.default_rng(4)))
+    assert np.allclose(results[0].trajectory, results[1].trajectory)
+    assert results[0].target_calls == results[1].target_calls
+
+
+def test_frozen_drift_is_the_default_refinement_update():
+    _, scalar = scalar_sampler(iterations=1)
+    batched = BatchedSpeculativeSampler(
+        target=AffineTarget(),
+        proposal=IdentityProposal(),
+        schedule=ConstantSchedule(0.2),
+        tree=DraftTree.chain(2),
+        verifier=AcceptFirst(),
+        num_steps=2,
+        proposal_refinement_iters=1,
+    )
+    assert scalar.refinement_update_fn is picard_drift_update_fn
+    assert batched.refinement_update_fn is picard_drift_update_fn
+
+
+def test_converged_drift_parents_keep_the_exact_target_mean():
+    verifier = AcceptFirst()
+    sampler = SpeculativeSampler(
+        target=VelocitySplitTarget(),
+        proposal=IdentityProposal(),
+        schedule=ConstantSchedule(0.2),
+        tree=DraftTree.chain(3),
+        verifier=verifier,
+        num_steps=3,
+        proposal_refinement_iters=2,
+    )
+    sampler.sample(np.asarray([0.3, -0.4]), rng=np.random.default_rng(8))
+    # Parents above depth J = 2 have converged: their proposal mean must be
+    # the target mean bit for bit, not apply(freeze(m)) up to rounding.
+    for request in verifier.requests[:2]:
+        assert np.array_equal(request.proposal_mean, request.target_mean)
+    assert not np.array_equal(
+        verifier.requests[2].proposal_mean, verifier.requests[2].target_mean
+    )
+
+
+def test_refinement_update_needs_exactly_one_of_increments_and_drifts():
+    zeros = np.zeros((2, 1))
+    with pytest.raises(TypeError):
+        RefinementUpdate()
+    with pytest.raises(TypeError):
+        RefinementUpdate(increments=zeros, drifts=zeros)
+    assert RefinementUpdate(drifts=zeros).increments is None
+
+
+@pytest.mark.parametrize("kind", ["shape", "nonfinite", "apply_drift"])
+def test_malformed_drift_refinement_is_rejected(kind):
+    class BadApply(VelocitySplitTarget):
+        def apply_drift(self, drift, states, steps):
+            return super().apply_drift(drift, states, steps)[..., :1]
+
+    def update(request):
+        values = np.zeros_like(request.parent_states)
+        if kind == "shape":
+            values = values[:1]
+        elif kind == "nonfinite":
+            values[0] = np.nan
+        return RefinementUpdate(drifts=values)
+
+    target = BadApply() if kind == "apply_drift" else VelocitySplitTarget()
+    _, sampler = scalar_sampler(target=target, iterations=1, callback=update)
+    with pytest.raises(ValueError):
+        sampler.sample(np.zeros(2), rng=np.random.default_rng(0))
+
+
+def test_refined_rmc_with_drift_update_preserves_target_law():
+    target = VelocitySplitTarget(a=0.8, b=-0.5, slope=0.5, bend=0.0)
+    sigma, num_steps = 0.3, 3
+    sampler = SpeculativeSampler(
+        target=target,
+        proposal=IdentityProposal(),
+        schedule=ConstantSchedule(sigma),
+        tree=DraftTree.chain(3),
+        verifier=ReflectionMaximalCoupling(),
+        num_steps=num_steps,
+        proposal_refinement_iters=1,
+        refinement_update_fn=picard_drift_update_fn,
+    )
+    rng = np.random.default_rng(21)
+    samples = np.asarray([
+        sampler.sample(np.zeros(1), rng=rng).sample[0] for _ in range(2500)
+    ])
+
+    # bend = 0 makes the target linear: x -> (a + b slope) x + 0.2 b (step + 1).
+    gain = target.a + target.b * target.slope
+    mean, variance = 0.0, 0.0
+    for step in range(num_steps):
+        mean = gain * mean + 0.2 * target.b * (step + 1)
+        variance = gain * gain * variance + sigma * sigma
     standard_error = np.sqrt(variance / len(samples))
     assert abs(samples.mean() - mean) < 5 * standard_error
     assert abs(samples.var() / variance - 1.0) < 0.1

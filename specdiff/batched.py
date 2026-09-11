@@ -35,7 +35,7 @@ from .refinement import (
     RefinementLevel,
     RefinementUpdateFn,
     normalize_refinement_iters,
-    picard_update_fn,
+    picard_drift_update_fn,
     refine_tree,
     reusable_exact_target_mean,
     reusable_target_rows,
@@ -137,7 +137,7 @@ class BatchedSpeculativeSampler:
         self._backend = backend
         self.proposal_refinement_iters = refinement_iters
         self.refinement_update_fn = (
-            picard_update_fn if refinement_update_fn is None else refinement_update_fn
+            picard_drift_update_fn if refinement_update_fn is None else refinement_update_fn
         )
 
     # ------------------------------------------------------------------ public

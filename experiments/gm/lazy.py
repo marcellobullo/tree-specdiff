@@ -47,6 +47,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from specdiff import VerifyRequest, create_verifier  # noqa: E402
+from experiments.verifier_config import configured_verifier
 from specdiff.ops import resolve_backend  # noqa: E402
 
 
@@ -72,7 +73,7 @@ class LazyResult:
 
 
 def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
-             evaluate_leaves=False) -> LazyResult:
+             evaluate_leaves=False, verifier_options=None) -> LazyResult:
     """One trajectory, materialising only the committed branch.
 
     Mirrors ``SpeculativeSampler._round`` phase for phase; the only differences
@@ -80,7 +81,7 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
     """
     ops = resolve_backend(init)
     target, schedule, N = setting.target, setting.schedule, setting.num_steps
-    verifier = create_verifier(rule)
+    verifier = configured_verifier(rule, verifier_options)
     if verifier.max_children is not None and K > verifier.max_children:
         raise ValueError(
             f"{rule} supports at most K={verifier.max_children} proposals per node, "

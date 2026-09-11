@@ -179,6 +179,7 @@ class TestSampling:
     @pytest.mark.parametrize("rule,tree", [
         ("rmc", DraftTree.chain(4)),
         ("d-grs", DraftTree.uniform(branching=2, lookahead=3)),
+        ("paws", DraftTree.uniform(branching=2, lookahead=3)),
     ])
     def test_single_trajectory_lands_on_its_prompt(self, rule, tree):
         den, s = make(["a cat"])

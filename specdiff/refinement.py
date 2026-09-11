@@ -40,7 +40,14 @@ class RefinementRequest:
 
 @dataclass(frozen=True)
 class RefinementUpdate:
-    """A row-local increment and optional correctness-bearing target cache.
+    """A row-local update and optional correctness-bearing target cache.
+
+    Set exactly one of ``increments`` and ``drifts``, each shaped like
+    ``request.parent_states``. With ``X_u`` the parent state rebuilt earlier in
+    the same sweep, the new proposal mean is ``X_u + increments[i]``, or
+    ``target.apply_drift(drifts[i], X_u, step)``. ``apply_drift`` must then be
+    row-local too; when ``exact_target_means`` is also supplied, the drift mean
+    is anchored on it so that unmoved parents keep the exact target mean.
 
     If supplied, ``exact_target_means[i]`` asserts that it is exactly the
     target mean at ``request.parent_states[i]`` for the associated image and
@@ -49,8 +56,13 @@ class RefinementUpdate:
     cache rows.
     """
 
-    increments: Array
+    increments: Optional[Array] = None
     exact_target_means: Optional[Array] = None
+    drifts: Optional[Array] = None
+
+    def __post_init__(self) -> None:
+        if (self.increments is None) == (self.drifts is None):
+            raise TypeError("RefinementUpdate needs exactly one of increments and drifts")
 
 
 RefinementUpdateFn = Callable[[RefinementRequest], RefinementUpdate]
@@ -124,7 +136,11 @@ def normalize_refinement_iters(value: Optional[int]) -> int:
 
 
 def picard_update_fn(request: RefinementRequest) -> RefinementUpdate:
-    """Canonical target-backed Picard increment ``m^q_s(x) - x``."""
+    """Target-backed Picard update that freezes the whole increment ``m^q_s(x) - x``.
+
+    This was the default before ``picard_drift_update_fn``. It is kept to
+    reproduce earlier runs bit for bit.
+    """
 
     means = request.target(
         request.indices_in_batch,
@@ -137,6 +153,31 @@ def picard_update_fn(request: RefinementRequest) -> RefinementUpdate:
     )
 
 
+def picard_drift_update_fn(request: RefinementRequest) -> RefinementUpdate:
+    """Default target-backed Picard update: freeze only the target's drift.
+
+    ``picard_update_fn`` freezes the whole increment ``m^q_s(x) - x`` at the
+    snapshot. This update freezes ``target.freeze_drift`` of the same mean, and
+    ``refine_tree`` re-applies it with ``target.apply_drift`` at the rebuilt
+    parent. For the churn kernels, ``m = a x + b v``, the affine part ``a x``
+    is then evaluated at the new state and only the network velocity is
+    frozen. That removes the stale ``(a - 1)(X^(j+1) - X^(j))`` term from the
+    proposal mean. Both updates have the same fixed point, and they agree up to
+    rounding for a target whose frozen drift is the increment itself. See
+    ``docs/refinement.md`` for the derivations.
+    """
+
+    means = request.target(
+        request.indices_in_batch,
+        request.parent_states,
+        request.steps,
+    )
+    return RefinementUpdate(
+        drifts=request.target.freeze_drift(request.parent_states, means, request.steps),
+        exact_target_means=means,
+    )
+
+
 def _check_stack(name: str, value: Array, reference: Array, rows: int, ops: Backend) -> None:
     expected = tuple(reference.shape)
     actual = tuple(getattr(value, "shape", ()))
@@ -145,6 +186,40 @@ def _check_stack(name: str, value: Array, reference: Array, rows: int, ops: Back
     ops.check_state_dtype(value, name)
     if not ops.is_finite(value):
         raise ValueError(f"{name} contains non-finite values")
+
+
+def _rebuild_from_drifts(
+    update: RefinementUpdate,
+    target: TargetTransition,
+    layout: RefinementLayout,
+    level: RefinementLevel,
+    anchors: Array,
+    parent_states: Array,
+    ops: Backend,
+) -> Array:
+    """Proposal means of one level's rebuilt parents from frozen drifts.
+
+    The mean is ``apply(D, X^(j+1))``. With exact target means it is computed
+    as ``m(X^(j)) + [apply(D, X^(j+1)) - apply(D, X^(j))]``: the same value in
+    exact arithmetic, but bitwise the cached target mean wherever the parent
+    has not moved, so converged parents verify with ``delta = 0`` exactly.
+    """
+
+    drifts = ops.take(update.drifts, level.parent_positions)
+    steps = tuple(layout.steps[p] for p in level.parent_positions)
+
+    def apply(states: Array) -> Array:
+        means = target.apply_drift(drifts, states, steps)
+        _check_stack("apply_drift means", means, anchors, len(level.parent_ids), ops)
+        return means
+
+    means = apply(anchors)
+    if update.exact_target_means is None:
+        return means
+    snapshot = ops.take(parent_states, level.parent_positions)
+    return ops.take(update.exact_target_means, level.parent_positions) + (
+        means - apply(snapshot)
+    )
 
 
 def refine_tree(
@@ -183,10 +258,12 @@ def refine_tree(
         update = update_fn(request)
         if not isinstance(update, RefinementUpdate):
             raise TypeError("refinement_update_fn must return RefinementUpdate")
-        _check_stack(
-            "refinement increments", update.increments, parent_states,
-            len(layout.internal_ids), ops,
+        name, values = (
+            ("refinement increments", update.increments)
+            if update.drifts is None
+            else ("refinement drifts", update.drifts)
         )
+        _check_stack(name, values, parent_states, len(layout.internal_ids), ops)
 
         if update.exact_target_means is None:
             last_cache = None
@@ -208,10 +285,13 @@ def refine_tree(
         # Roots stay fixed. Because levels are breadth-first, every new parent
         # has already been reconstructed when its children are visited.
         for level in layout.levels:
-            means = (
-                ops.take(states, level.parent_ids)
-                + ops.take(update.increments, level.parent_positions)
-            )
+            anchors = ops.take(states, level.parent_ids)
+            if update.drifts is None:
+                means = anchors + ops.take(update.increments, level.parent_positions)
+            else:
+                means = _rebuild_from_drifts(
+                    update, target, layout, level, anchors, parent_states, ops
+                )
             ops.put(proposal_means, level.parent_ids, means)
             children = (
                 ops.repeat_rows(means, level.child_counts)

@@ -253,6 +253,7 @@ def main() -> None:
         ("rmc", DraftTree.chain(lookahead)),
         ("d-grs", DraftTree.chain(lookahead)),
         ("d-grs", tree),
+        ("paws", tree),
     ):
         sampler = SpeculativeSampler(
             target=target,

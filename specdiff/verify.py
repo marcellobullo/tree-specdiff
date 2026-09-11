@@ -61,6 +61,26 @@ class Verifier(ABC):
     def supports(self, num_children: int) -> bool:
         return self.max_children is None or num_children <= self.max_children
 
+    @property
+    def requires_chain(self) -> bool:
+        """Whether experiments must match their allocated tree with a chain."""
+        return self.max_children == 1
+
+    def matched_tree(self, tree, *, num_steps: int, match: str = "verification",
+                     evaluate_leaves: bool = False):
+        """Apply the experiment's budget policy using verifier capabilities."""
+        if match not in ("verification", "budget"):
+            raise ValueError("match must be 'verification' or 'budget'")
+        if self.requires_chain:
+            from .trees import DraftTree
+
+            depth = (tree.budget if match == "budget" else
+                     tree.verification_budget(evaluate_leaves=evaluate_leaves)
+                     - int(evaluate_leaves))
+            tree = DraftTree.chain(max(1, min(depth, num_steps)))
+        self.check_topology(tree)
+        return tree
+
     def check_topology(self, tree) -> None:
         """Raise if this rule cannot handle the tree it is about to be given.
 

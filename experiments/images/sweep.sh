@@ -43,7 +43,7 @@ NUM_REAL="${NUM_REAL:-50000}"   # real images the FID is measured against
 # configs (INCLUDE_TARGET=1 CONFIGS="" generates the baseline alone); with `:-`
 # an empty value would silently restore the whole default sweep.
 CONFIGS="${CONFIGS-2,3 2,5 3,4 4,4}"
-RULES="${RULES-d-grs rmc}"
+RULES="${RULES-d-grs rmc paws}"
 # How the rmc chain is sized against each (K, L) tree. `verification` gives both
 # arms the same target batch |I| -- the hardware-matched comparison, and
 # gm_sweep.py's default. `budget` is the paper's protocol, chain(B), a factor of
@@ -61,6 +61,9 @@ NODE_BUDGET="${NODE_BUDGET:-500}"
 # every cell so one grid is one policy. Unset, the library defaults apply and
 # each cell records those. Either way the resolved values land in meta.json.
 SAMPLER_CONFIG="${SAMPLER_CONFIG:-}"
+# Per-rule JSON options, included in resume checks and passed to every cell.
+VERIFIER_OPTIONS="${VERIFIER_OPTIONS:-}"
+[[ -n "$VERIFIER_OPTIONS" ]] || VERIFIER_OPTIONS='{}'
 
 # EDM's S_noise: scales the transition std and not the churn mean, so it is not
 # a reparameterisation of EPS. A scalar like SEED, not a list like EPS -- one
@@ -141,21 +144,22 @@ log "configs  : $CONFIGS   rules: $RULES   match: $MATCH"
 # |I| per cell, from the library rather than a formula duplicated here -- the
 # two must not be able to disagree.
 verified_nodes() {   # $1=rule $2=K $3=L
-  python - "$1" "$2" "$3" "$SPEC_STEPS" "$MATCH" <<'PY'
+  python - "$1" "$2" "$3" "$SPEC_STEPS" "$MATCH" "$SAMPLER_CONFIG" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path.cwd() / "experiments"))
-from images.run_edm import matched_chain_depth          # noqa: E402
-from specdiff import DraftTree                          # noqa: E402
+from images.run_common import load_sampler_config      # noqa: E402
+from specdiff import DraftTree, create_verifier         # noqa: E402
 
 rule, K, L, steps, match = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+leaves = load_sampler_config(sys.argv[6] or None)["evaluate_leaves"]
 if rule == "target":
-    print(1)
+    tree = DraftTree.chain(1)
 else:
     tree = DraftTree.uniform(branching=K, lookahead=L)
-    if rule == "rmc":
-        tree = DraftTree.chain(matched_chain_depth(tree, steps, match))
-    print(tree.verification_budget())
+    tree = create_verifier(rule).matched_tree(
+        tree, num_steps=steps, match=match, evaluate_leaves=leaves)
+print(tree.verification_budget(evaluate_leaves=leaves))
 PY
 }
 
@@ -163,13 +167,15 @@ PY
 # appear in the output path, so nothing but this check stops two of them being
 # pooled into one grid. Resolved once, through the same loader the drivers use,
 # so the skip check in run_cell compares like with like.
-POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" <<'PY'
+POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" "$VERIFIER_OPTIONS" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path.cwd() / "experiments"))
 from images.run_common import load_sampler_config          # noqa: E402
+from experiments.verifier_config import parse_verifier_options
 
-print(json.dumps({"sampler": load_sampler_config(sys.argv[1] or None),
+print(json.dumps({"verifier_options": parse_verifier_options(sys.argv[3]),
+                  "sampler": load_sampler_config(sys.argv[1] or None),
                   "s_noise": float(sys.argv[2])}, sort_keys=True))
 PY
 )" || fail "could not resolve the sampler config"
@@ -206,6 +212,7 @@ print(json.dumps({
     "sampler": meta.get("sampler", {"evaluate_leaves": False,
                                     "prefetch": "parent"}),
     "s_noise": meta.get("s_noise", 1.0),
+    "verifier_options": meta.get("verifier_options", {}),
 }, sort_keys=True))
 PY
 )" || fail "cannot read $out/meta.json"
@@ -216,7 +223,7 @@ PY
        Two cells of one grid sampled under different settings are not
        comparable, and neither the FID nor the speedup table would show it.
        Either delete the cell to regenerate it under this run's settings, or
-       set SAMPLER_CONFIG / S_NOISE to the ones it already has."
+       set VERIFIER_OPTIONS / SAMPLER_CONFIG / S_NOISE to the ones it already has."
     fi
     log "skip $rn K=$K L=$L eps=$eps (already done)"; return 0
   fi
@@ -232,6 +239,7 @@ PY
     experiments/images/run_edm.py \
       --network "$NETWORK" --edm-repo "$EDM_REPO" \
       --rule "$rn" --branching "$K" --lookahead "$L" --match "$MATCH" \
+      --verifier-options "$VERIFIER_OPTIONS" \
       --num-samples "$NUM_SAMPLES" --num-steps "$NUM_STEPS" --eps "$eps" \
       --seed "$SEED" --labels "$LABELS" \
       --sample-batch "$sb" --forward-batch "$FORWARD_BATCH" \

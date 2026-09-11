@@ -294,3 +294,35 @@ def test_resume_subset_keeps_original_grid_and_selects_only_requested_cells(
     with pytest.raises(SystemExit, match="subset of the saved grid"):
         picard_sweep.main(base + ["--J-up-to-L", "--K-values", "8"])
     assert json.loads((tmp_path / "config.json").read_text())["seed"] == 20260714
+
+
+def test_runs_saved_before_picard_update_resume_only_as_increment(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        picard_sweep, "_run_epsilon",
+        lambda args, out, cfg, eps, progress: calls.append(dict(cfg)),
+    )
+    base = ["--out", str(tmp_path), "--eps", "0.1", "--progress", "none", "--J-up-to-L"]
+    picard_sweep.main(base)
+    assert calls[-1]["picard_update"] == "drift"
+
+    # Rewrite the saved config as a run from before the flag existed.
+    config_path = tmp_path / "config.json"
+    legacy = json.loads(config_path.read_text())
+    del legacy["picard_update"]
+    config_path.write_text(json.dumps(legacy))
+    with pytest.raises(SystemExit, match="different protocol"):
+        picard_sweep.main(base)
+    picard_sweep.main(base + ["--picard-update", "increment"])
+    assert calls[-1]["picard_update"] == "increment"
+    assert json.loads(config_path.read_text())["picard_update"] == "increment"
+
+
+@pytest.mark.parametrize("update", ["drift", "increment"])
+def test_picard_update_selects_the_refinement_callback(update):
+    setting = models.build(dimension=6, num_components=3, num_steps=8, eps=0.06)
+    sampler, _, refiner, _, _ = picard_sweep.build_sampler(
+        setting, "d-grs", 2, 2, 1, {**_config(), "picard_update": update}
+    )
+    assert sampler.refinement_update_fn is refiner
+    assert refiner.update_fn is picard_sweep.PICARD_UPDATES[update]

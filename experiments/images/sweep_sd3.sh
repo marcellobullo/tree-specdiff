@@ -45,12 +45,15 @@ CACHE_ENCODED_PROMPTS="${CACHE_ENCODED_PROMPTS-$REPO/results/sd3/_prompt_cache}"
 MIN_FREE_MIB="${MIN_FREE_MIB:-10000}"
 
 CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 6,2 7,2 8,2 9,2 10,2 2,3 3,3 4,3 5,3 6,3 7,3 8,3 9,3 10,3}"
-RULES="${RULES-d-grs rmc}"
+RULES="${RULES-d-grs rmc paws}"
 MATCH="${MATCH:-verification}"
 # Sampler options, S_noise and the timestep shift: protocol that does not appear
 # in a cell's output path, so the guard in run_cell is the only thing stopping
 # two settings being pooled into one grid. Same treatment as sweep.sh.
 SAMPLER_CONFIG="${SAMPLER_CONFIG:-}"
+# Per-rule JSON options, included in resume checks and passed to every cell.
+VERIFIER_OPTIONS="${VERIFIER_OPTIONS:-}"
+[[ -n "$VERIFIER_OPTIONS" ]] || VERIFIER_OPTIONS='{}'
 S_NOISE="${S_NOISE:-1.0}"
 # SD3.5 is trained at 1024px and its noise schedule is resolution dependent, so
 # 512px generation shifts the grid by t -> kt / (1 + (k-1)t). 3.0 is what the
@@ -96,13 +99,15 @@ log "sd3      : cfg=$GUIDANCE  ${RESOLUTION}px  $DTYPE  shift=$SHIFT"
 log "encode   : ${ENCODE_DEVICE:-with the transformer}  cache ${CACHE_ENCODED_PROMPTS:-off}"
 log "gpus     : $GPUS ($NUM_PROC processes)"
 log "configs  : $CONFIGS   rules: $RULES   match: $MATCH"
-POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" "$SHIFT" <<'PY'
+POLICY_RESOLVED="$(python - "$SAMPLER_CONFIG" "$S_NOISE" "$SHIFT" "$VERIFIER_OPTIONS" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path.cwd() / "experiments"))
 from images.run_common import load_sampler_config          # noqa: E402
+from experiments.verifier_config import parse_verifier_options
 
-print(json.dumps({"sampler": load_sampler_config(sys.argv[1] or None),
+print(json.dumps({"verifier_options": parse_verifier_options(sys.argv[4]),
+                  "sampler": load_sampler_config(sys.argv[1] or None),
                   "s_noise": float(sys.argv[2]),
                   "shift": float(sys.argv[3])}, sort_keys=True))
 PY
@@ -110,21 +115,22 @@ PY
 log "policy   : $POLICY_RESOLVED"
 
 verified_nodes() {   # $1=rule $2=K $3=L
-  python - "$1" "$2" "$3" "$SPEC_STEPS" "$MATCH" <<'PY'
+  python - "$1" "$2" "$3" "$SPEC_STEPS" "$MATCH" "$SAMPLER_CONFIG" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path.cwd() / "experiments"))
-from images.run_sd3 import matched_chain_depth          # noqa: E402
-from specdiff import DraftTree                          # noqa: E402
+from images.run_common import load_sampler_config      # noqa: E402
+from specdiff import DraftTree, create_verifier         # noqa: E402
 
 rule, K, L, steps, match = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+leaves = load_sampler_config(sys.argv[6] or None)["evaluate_leaves"]
 if rule == "target":
-    print(1)
+    tree = DraftTree.chain(1)
 else:
     tree = DraftTree.uniform(branching=K, lookahead=L)
-    if rule == "rmc":
-        tree = DraftTree.chain(matched_chain_depth(tree, steps, match))
-    print(tree.verification_budget())
+    tree = create_verifier(rule).matched_tree(
+        tree, num_steps=steps, match=match, evaluate_leaves=leaves)
+print(tree.verification_budget(evaluate_leaves=leaves))
 PY
 }
 
@@ -155,6 +161,7 @@ print(json.dumps({
     "sampler": meta.get("sampler", {"evaluate_leaves": False,
                                     "prefetch": "parent"}),
     "s_noise": meta.get("s_noise", 1.0),
+    "verifier_options": meta.get("verifier_options", {}),
     "shift": meta.get("shift", 3.0),
 }, sort_keys=True))
 PY
@@ -164,7 +171,7 @@ PY
          it has  : $was
          this run: $POLICY_RESOLVED
        Either delete the cell to regenerate it under this run's settings, or
-       set SAMPLER_CONFIG / S_NOISE / SHIFT to the ones it already has."
+       set VERIFIER_OPTIONS / SAMPLER_CONFIG / S_NOISE / SHIFT to the ones it already has."
     fi
     log "skip $rn K=$K L=$L (already done)"; return 0
   fi
@@ -183,6 +190,7 @@ PY
     experiments/images/run_sd3.py \
       --network "$NETWORK" --prompts "$PROMPTS" --negative-prompt "$NEGATIVE" \
       --rule "$rn" --branching "$K" --lookahead "$L" --match "$MATCH" \
+      --verifier-options "$VERIFIER_OPTIONS" \
       --num-samples "$NUM_SAMPLES" --num-steps "$NUM_STEPS" --eps "$EPS" \
       --seed "$SEED" --guidance-scale "$GUIDANCE" --resolution-px "$RESOLUTION" \
       --dtype "$DTYPE" --sample-batch "$sb" --forward-batch "$FORWARD_BATCH" \
