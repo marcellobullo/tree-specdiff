@@ -15,10 +15,11 @@ levels.csv
     One row per verification decision, including normalized mean mismatch.
 refinement_summary.csv
     Online node summaries by trajectory, round, Picard sweep, and tree depth.
-eps<eps>/K<K>_L<L>/J<J>/samples.npz
+eps<eps>/K<K>_L<L>/<rule>/J<J>/samples.npz
     Initial, terminal, and complete committed trajectories, keyed by replicate.
 
-Each ``(eps, K, L, J)`` directory contains both rules and is written atomically.
+Each ``(eps, K, L, rule, J)`` cell has its own directory and is written
+atomically, so a later run can add a rule to an existing output directory.
 Replicates are checkpointed individually while a cell is running, so interrupted
 runs resume without retaining every replicate in memory.
 """
@@ -56,7 +57,9 @@ from specdiff import (  # noqa: E402
     picard_update_fn,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+RULE_DIRECTORY_SCHEMA = 4
+"""First schema with one directory per rule; older runs cannot be resumed."""
 PICARD_UPDATES = {"drift": picard_drift_update_fn, "increment": picard_update_fn}
 """``--picard-update`` choices. Configs saved before the flag used ``increment``."""
 IDENTITY_FIELDS = (
@@ -174,15 +177,6 @@ REFINEMENT_STATISTICS = (
     "mean", "std", "rms", "min", "max", "p50", "p90", "p99",
     "zero_fraction",
 )
-LEGACY_REFINEMENT_FIELDS = IDENTITY_FIELDS + (
-    "round_index",
-    "sweep_index",
-    "refinement_iteration",
-    "node",
-    "node_depth",
-    "step",
-    "sigma",
-) + REFINEMENT_METRICS
 REFINEMENT_FIELDS = IDENTITY_FIELDS + (
     "round_index",
     "sweep_index",
@@ -686,24 +680,21 @@ def _init_worker(cfg):
     _WORKER["samplers"] = {}
 
 
-def _job_replicate(args):
-    K, L, J, replicate, rules = args
+def _job_trajectory(args):
+    rule, K, L, J, replicate = args
     cell = (K, L, J)
     if _WORKER.get("cell") != cell:
         _WORKER["samplers"].clear()
         _WORKER["cell"] = cell
-    bundles = []
-    for rule in rules:
-        key = (rule, K, L, J)
-        if key not in _WORKER["samplers"]:
-            _WORKER["samplers"][key] = build_sampler(
-                _WORKER["setting"], rule, K, L, J, _WORKER["cfg"]
-            )
-        bundles.append(one_trajectory(
-            _WORKER["setting"], rule, K, L, J, replicate,
-            _WORKER["cfg"], _WORKER["samplers"][key],
-        ))
-    return bundles
+    key = (rule, K, L, J)
+    if key not in _WORKER["samplers"]:
+        _WORKER["samplers"][key] = build_sampler(
+            _WORKER["setting"], rule, K, L, J, _WORKER["cfg"]
+        )
+    return one_trajectory(
+        _WORKER["setting"], rule, K, L, J, replicate,
+        _WORKER["cfg"], _WORKER["samplers"][key],
+    )
 
 
 def _write_csv(path: Path, fields, rows) -> None:
@@ -759,9 +750,9 @@ def _write_bundle_files(directory, bundles, save_samples) -> None:
         _write_samples(directory / "samples.npz", _sample_arrays(bundles))
 
 
-def write_cell(out: Path, K, L, J, bundles, save_samples=True) -> Path:
+def write_cell(out: Path, rule, K, L, J, bundles, save_samples=True) -> Path:
     """Write a complete cell atomically; retained for small callers/tests."""
-    parent = out / topology_slug(K, L)
+    parent = out / topology_slug(K, L) / rule
     parent.mkdir(parents=True, exist_ok=True)
     slug = iteration_slug(J)
     destination = parent / slug
@@ -778,8 +769,8 @@ def write_cell(out: Path, K, L, J, bundles, save_samples=True) -> Path:
     return destination
 
 
-def streamed_cell_paths(out: Path, K: int, L: int, J: int):
-    parent = out / topology_slug(K, L)
+def streamed_cell_paths(out: Path, rule: str, K: int, L: int, J: int):
+    parent = out / topology_slug(K, L) / rule
     parent.mkdir(parents=True, exist_ok=True)
     slug = iteration_slug(J)
     return parent / slug, parent / f".{slug}.work"
@@ -858,70 +849,12 @@ def finalize_streamed_cell(
     return destination
 
 
-def migrate_legacy_refinements(cell: Path) -> bool:
-    """Add an online-summary-format file to a schema-v2 completed cell."""
-    destination = cell / "refinement_summary.csv"
-    if destination.exists():
-        return False
-    source = cell / "refinements.csv"
-    temporary = cell / ".refinement_summary.csv.tmp"
-    with temporary.open("w", newline="") as dst:
-        writer = csv.DictWriter(dst, fieldnames=REFINEMENT_FIELDS)
-        writer.writeheader()
-        if source.exists():
-            with source.open(newline="") as src:
-                first = None
-                key = None
-                values = None
-                for row in csv.DictReader(src):
-                    row_key = tuple(
-                        row[field]
-                        for field in IDENTITY_FIELDS + (
-                            "round_index", "sweep_index",
-                            "refinement_iteration", "node_depth",
-                        )
-                    )
-                    if key is not None and row_key != key:
-                        writer.writerow(_legacy_summary(first, values))
-                        first = values = None
-                    if first is None:
-                        first = row
-                        key = row_key
-                        values = {metric: [] for metric in REFINEMENT_METRICS}
-                    for metric in REFINEMENT_METRICS:
-                        value = row.get(metric, "")
-                        if value not in ("", None):
-                            values[metric].append(float(value))
-                if first is not None:
-                    writer.writerow(_legacy_summary(first, values))
-        dst.flush()
-        os.fsync(dst.fileno())
-    os.replace(temporary, destination)
-    return True
-
-
-def _legacy_summary(first, values):
-    summary = {
-        field: first[field]
-        for field in IDENTITY_FIELDS + (
-            "round_index", "sweep_index", "refinement_iteration", "node_depth",
-        )
-    }
-    summary["node_count"] = max(
-        (len(metric_values) for metric_values in values.values()), default=0
-    )
-    for metric, metric_values in values.items():
-        summary.update(
-            _aggregate_values(metric, metric_values if metric_values else None)
-        )
-    return summary
-
-
 def consolidate(out: Path) -> None:
-    """Rebuild normalized epsilon-level tables from completed cells."""
-    complete = sorted(marker.parent for marker in out.glob("K*_L*/J*/COMPLETE"))
-    for cell in complete:
-        migrate_legacy_refinements(cell)
+    """Rebuild normalized epsilon-level tables from every completed cell.
+
+    The glob covers rules added by earlier invocations as well as this one.
+    """
+    complete = sorted(marker.parent for marker in out.glob("K*_L*/*/J*/COMPLETE"))
     for filename, fields in TABLES.items():
         temporary = out / f".{filename}.tmp"
         with temporary.open("w", newline="") as dst:
@@ -1056,70 +989,75 @@ def _run_epsilon(
                     progress.update(len(iterations) * len(args.rules), label=label)
                     continue
                 for J in iterations:
-                    destination, work = streamed_cell_paths(eps_out, K, L, J)
-                    label = str(destination.relative_to(out))
-                    if (destination / "COMPLETE").exists():
-                        if migrate_legacy_refinements(destination):
-                            progress.log(f"migrated legacy refinements: {label}")
-                        progress.log(f"resume: {label} already complete")
-                        progress.update(len(args.rules), label=f"{label} resumed")
+                    pending = {}
+                    for rule in args.rules:
+                        destination, work = streamed_cell_paths(
+                            eps_out, rule, K, L, J
+                        )
+                        if (destination / "COMPLETE").exists():
+                            label = str(destination.relative_to(out))
+                            progress.log(f"resume: {label} already complete")
+                            progress.update(1, label=f"{label} resumed")
+                            continue
+                        work.mkdir(exist_ok=True)
+                        completed = completed_replicates(work)
+                        pending[rule] = (destination, work, [
+                            replicate for replicate in range(args.replicates)
+                            if replicate not in completed
+                        ])
+                    if not pending:
                         continue
-                    work.mkdir(exist_ok=True)
-                    completed = completed_replicates(work)
-                    missing = [
-                        replicate for replicate in range(args.replicates)
-                        if replicate not in completed
+                    # One ordered stream for every pending rule keeps the pool
+                    # busy across rule boundaries; results arrive rule by rule.
+                    jobs = [
+                        (rule, replicate)
+                        for rule, (_, _, missing) in pending.items()
+                        for replicate in missing
                     ]
-                    progress.update(
-                        label=f"{label} replicate {len(completed)}/{args.replicates}"
-                    )
-                    started = time.time()
                     if pool is not None:
-                        jobs = [
-                            (K, L, J, replicate, tuple(args.rules))
-                            for replicate in missing
-                        ]
-                        results = pool.imap(_job_replicate, jobs, chunksize=1)
+                        results = pool.imap(
+                            _job_trajectory,
+                            [(rule, K, L, J, replicate) for rule, replicate in jobs],
+                            chunksize=1,
+                        )
                     else:
                         built = {
                             rule: build_sampler(setting, rule, K, L, J, eps_cfg)
-                            for rule in args.rules
+                            for rule in pending
                         }
                         results = (
-                            [
-                                one_trajectory(
-                                    setting, rule, K, L, J, replicate,
-                                    eps_cfg, built[rule],
-                                )
-                                for rule in args.rules
-                            ]
-                            for replicate in missing
+                            one_trajectory(
+                                setting, rule, K, L, J, replicate,
+                                eps_cfg, built[rule],
+                            )
+                            for rule, replicate in jobs
                         )
-                    for finished, (replicate, bundles) in enumerate(
-                        zip(missing, results), start=len(completed) + 1
-                    ):
-                        write_replicate(
-                            work, replicate, bundles,
+                    for rule, (destination, work, missing) in pending.items():
+                        label = str(destination.relative_to(out))
+                        done = args.replicates - len(missing)
+                        progress.update(
+                            label=f"{label} replicate {done}/{args.replicates}"
+                        )
+                        started = time.time()
+                        for finished, replicate in enumerate(missing, start=done + 1):
+                            write_replicate(
+                                work, replicate, [next(results)],
+                                save_samples=args.save_samples,
+                            )
+                            progress.update(
+                                label=f"{label} replicate {finished}/{args.replicates}"
+                            )
+                        finalize_streamed_cell(
+                            work, destination, args.replicates,
                             save_samples=args.save_samples,
                         )
-                        progress.update(
-                            label=f"{label} replicate {finished}/{args.replicates}"
-                        )
-                    finalize_streamed_cell(
-                        work, destination, args.replicates,
-                        save_samples=args.save_samples,
-                    )
-                    with (destination / "trajectories.csv").open(newline="") as src:
-                        trajectory_rows = list(csv.DictReader(src))
-                    for rule in args.rules:
-                        selected = [
-                            row for row in trajectory_rows if row["rule"] == rule
-                        ]
+                        with (destination / "trajectories.csv").open(newline="") as src:
+                            trajectory_rows = list(csv.DictReader(src))
                         mean_calls = float(np.mean([
-                            float(row["target_calls"]) for row in selected
+                            float(row["target_calls"]) for row in trajectory_rows
                         ]))
                         mean_accept = float(np.mean([
-                            float(row["acceptance_rate"]) for row in selected
+                            float(row["acceptance_rate"]) for row in trajectory_rows
                         ]))
                         progress.log(
                             f"  {rule:>5} {topology_slug(K, L)}/{iteration_slug(J)} "
@@ -1128,12 +1066,64 @@ def _run_epsilon(
                             f"accept={mean_accept:6.3f} "
                             f"[{time.time() - started:5.1f}s]"
                         )
-                    progress.update(len(args.rules), label=label)
+                        progress.update(1, label=label)
     finally:
         if pool is not None:
             pool.close()
             pool.join()
     consolidate(eps_out)
+
+
+def resumed_config(path: Path, cfg: dict) -> dict:
+    """Merge this invocation's ``cfg`` into the run saved at ``path``.
+
+    Each cell is its own ``(eps, K, L, rule, J)`` directory, so a new rule can
+    join an existing run: the saved rule list grows, and a rule's verifier
+    options are fixed by its first run. K and L may be subsets of the saved
+    grid; every other setting must match.
+    """
+    previous = json.loads(path.read_text())
+    if previous.get("schema_version", 0) < RULE_DIRECTORY_SCHEMA:
+        raise SystemExit(
+            f"{path} predates per-rule cell directories and cannot be resumed; "
+            "use a new --out directory"
+        )
+    # These keys are reconciled below; every other key is the protocol.
+    merged = {"schema_version", "K_values", "L_values", "rules", "verifier_options"}
+    previous_protocol = {
+        key: value for key, value in previous.items() if key not in merged
+    }
+    current_protocol = {
+        key: value for key, value in cfg.items() if key not in merged
+    }
+    if previous_protocol != current_protocol:
+        raise SystemExit(f"{path} has a different protocol; use a new --out directory")
+    for axis in ("K_values", "L_values"):
+        if not set(cfg[axis]).issubset(previous[axis]):
+            raise SystemExit(
+                f"{path}: {axis} must be a subset of the saved grid "
+                f"{previous[axis]}; use a new --out directory to expand it"
+            )
+        # Keep the original grid in metadata: older cells remain valid,
+        # and a later invocation may resume any part of that grid.
+        # The run loops and progress count use args, the selected subset.
+        cfg[axis] = previous[axis]
+    saved_options = previous["verifier_options"]
+    for rule in cfg["rules"]:
+        options = cfg["verifier_options"].get(rule, {})
+        if rule in previous["rules"] and options != saved_options.get(rule, {}):
+            raise SystemExit(
+                f"{path}: {rule} ran with verifier options "
+                f"{saved_options.get(rule, {})}, not {options}; "
+                "use a new --out directory for a variant"
+            )
+    cfg["verifier_options"] = {**saved_options, **cfg["verifier_options"]}
+    # Saved rules stay listed even when this invocation runs only new ones;
+    # their cells remain valid and the consolidated tables include them.
+    cfg["rules"] = previous["rules"] + [
+        rule for rule in cfg["rules"] if rule not in previous["rules"]
+    ]
+    return cfg
 
 
 def main(argv=None) -> None:
@@ -1147,6 +1137,8 @@ def main(argv=None) -> None:
     eps_slugs = [epsilon_slug(eps) for eps in args.eps_values]
     if len(set(eps_slugs)) != len(eps_slugs):
         raise SystemExit("eps values must map to distinct output-directory names")
+    if len(set(args.rules)) != len(args.rules):
+        raise SystemExit("rules must be distinct")
     unknown = set(args.rules) - set(available_verifiers())
     if unknown:
         raise SystemExit(f"unsupported rules: {sorted(unknown)}")
@@ -1159,45 +1151,21 @@ def main(argv=None) -> None:
         if key not in {"out", "n_workers", "progress"}
     }
     cfg["schema_version"] = SCHEMA_VERSION
+    # Options belong to the rule they configure: record only the rules that run.
+    cfg["verifier_options"] = {
+        rule: options for rule, options in args.verifier_options.items()
+        if rule in args.rules
+    }
     config_path = out / "config.json"
     if config_path.exists():
-        previous = json.loads(config_path.read_text())
-        # Runs saved before --picard-update existed used the increment update, so
-        # they resume only under --picard-update increment.
-        previous.setdefault("picard_update", "increment")
-        previous_protocol = {
-            key: value for key, value in previous.items()
-            if key not in {"schema_version", "K_values", "L_values"}
-        }
-        current_protocol = {
-            key: value for key, value in cfg.items()
-            if key not in {"schema_version", "K_values", "L_values"}
-        }
-        if previous_protocol != current_protocol:
-            raise SystemExit(
-                f"{config_path} has a different protocol; use a new --out directory"
-            )
-        for axis in ("K_values", "L_values"):
-            if not set(cfg[axis]).issubset(previous[axis]):
-                raise SystemExit(
-                    f"{config_path}: {axis} must be a subset of the saved grid "
-                    f"{previous[axis]}; use a new --out directory to expand it"
-                )
-            # Keep the original grid in metadata: older cells remain valid,
-            # and a later invocation may resume any part of that grid.
-            # The run loops and progress count use args, the selected subset.
-            cfg[axis] = previous[axis]
+        cfg = resumed_config(config_path, cfg)
     config_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
     (out / "schema.json").write_text(json.dumps({
         "version": SCHEMA_VERSION,
         "tables": {name: list(fields) for name, fields in TABLES.items()},
         "samples": (
-            "eps<eps>/K<K>_L<L>/J<J>/samples.npz: replicate, trajectory_id, "
+            "eps<eps>/K<K>_L<L>/<rule>/J<J>/samples.npz: replicate, trajectory_id, "
             "eps, rule, K, L, J, match, evaluate_leaves, initial, sample, trajectory"
-        ),
-        "legacy_refinements": (
-            "schema-v2 completed cells retain raw refinements.csv; "
-            "schema-v3 cells store refinement_summary.csv only"
         ),
     }, indent=2, sort_keys=True) + "\n")
 

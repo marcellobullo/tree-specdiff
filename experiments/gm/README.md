@@ -136,15 +136,14 @@ list are mutually exclusive.
 
 `--picard-update drift` (the default) freezes only the target's velocity during
 refinement; `--picard-update increment` freezes the whole increment `m - x`, as
-every run did before the flag existed. The choice is part of the saved protocol:
-a `config.json` without it counts as `increment`, so older output directories
-resume only with `--picard-update increment`, and mixing the two in one `--out`
-directory is refused. See [docs/refinement.md](../../docs/refinement.md) for the
-derivations and measured differences.
+every run did before the flag existed. The choice is part of the saved protocol,
+so mixing the two in one `--out` directory is refused. See
+[docs/refinement.md](../../docs/refinement.md) for the derivations and measured
+differences.
 
 `--progress auto` (the default) displays one overall configuration bar in an
 interactive terminal and periodic progress lines in redirected logs. The count
-includes both sampler rules and advances for completed, resumed, and
+covers every requested rule and advances for completed, resumed, and
 budget-skipped configurations. Use `--progress bar`, `--progress plain`, or
 `--progress none` to override the display mode.
 
@@ -172,25 +171,37 @@ RUN/
     levels.csv
     refinement_summary.csv
     K2_L2/
-      J0/
-        trajectories.csv
-        rounds.csv
-        levels.csv
-        refinement_summary.csv
-        samples.npz
-        COMPLETE
-      J1/
-      J2/
+      rmc/
+        J0/
+          trajectories.csv
+          rounds.csv
+          levels.csv
+          refinement_summary.csv
+          samples.npz
+          COMPLETE
+        J1/
+        J2/
+      d-grs/
+      paws/
   eps0.3/
   eps0.6/
 ```
 
-Each `J` directory contains both rules and is saved atomically. While it is
-running, each replicate is checkpointed separately; rerunning the same command
-resumes both completed directories and incomplete cells. Each epsilon directory
-also gets normalized aggregate tables. Schema-v2 cells retain their raw
-`refinements.csv` and receive a derived summary during resume; new schema-v3
-cells contain only the summary:
+Each `<rule>/J<J>` directory is one `(eps, K, L, rule, J)` cell and is saved
+atomically. While it is running, each replicate is checkpointed separately;
+rerunning the same command resumes both completed directories and incomplete
+cells. Each epsilon directory also gets normalized aggregate tables, rebuilt from
+every completed cell on disk.
+
+To add a rule to an existing run, rerun its command with only the new rule, for
+example `--rules resample`. The saved `config.json` then lists every rule in the
+directory, and the epsilon tables include all of them. Streams are keyed by
+`(seed, replicate)` alone, so the new rule is paired replicate by replicate with
+the existing ones, exactly as if they had run together. A rule's
+`--verifier-options` are fixed by its first run; changing them for a rule already
+in the directory is refused, so run a variant into a new `--out`. Directories
+written before this layout (schema 3 and earlier kept every rule in one `J`
+directory) cannot be resumed, but the plotting scripts still read them.
 
 To resume only part of an existing grid, pass subsets of its saved `--K-values`
 and `--L-values`. For example, `--K-values 1 2 3 4 5 6 --L-values 1 2 3 4 5 6`
@@ -205,7 +216,7 @@ epsilon tables still include all completed cells, including excluded ones.
 | `rounds.csv` | every sampler `RoundRecord`, including committed and accepted steps and the complete cost decomposition |
 | `levels.csv` | every verification event, including `delta`, drift geometry, candidates, and outcome |
 | `refinement_summary.csv` | online count, mean, standard deviation, RMS, extrema, percentiles, and zero fraction per trajectory/round/sweep/depth |
-| `K*/J*/samples.npz` | rule labels plus full initial, terminal, and committed trajectory arrays |
+| `K*_L*/<rule>/J*/samples.npz` | full initial, terminal, and committed trajectory arrays, with replicate and rule labels |
 | `schema.json` | machine-readable column inventory at the run root |
 
 `plot_picard.py` derives `summary.csv`, `round_summary.csv`,

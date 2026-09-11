@@ -640,7 +640,10 @@ def plot_sample_norms(out, trajectory_summary, figures):
         data, labels = [], []
         for row in sorted(rows, key=lambda item: int(item["J"])):
             J = int(row["J"])
-            path = out / f"K{K}_L{L}" / f"J{J}" / "samples.npz"
+            path = out / f"K{K}_L{L}" / rule / f"J{J}" / "samples.npz"
+            if not path.exists():
+                # Runs before schema 4 kept every rule in one J directory.
+                path = out / f"K{K}_L{L}" / f"J{J}" / "samples.npz"
             if not path.exists():
                 continue
             with np.load(path) as archive:

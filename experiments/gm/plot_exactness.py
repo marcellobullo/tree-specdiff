@@ -34,7 +34,10 @@ DIV = ["#184f95", "#3987e5", "#9ec5f4", "#f0efec", "#f0a58c", "#e34948", "#a5232
 def load_arms(run: Path, eps: float):
     """One entry per (rule, K, L, J) cell: replicates within a cell are i.i.d."""
     arms = {}
-    for path in sorted((run / f"eps{eps:g}").glob("K*_L*/J*/samples.npz")):
+    cells = run / f"eps{eps:g}"
+    # K*_L*/<rule>/J*, or K*_L*/J* holding every rule in runs before schema 4.
+    paths = [*cells.glob("K*_L*/*/J*/samples.npz"), *cells.glob("K*_L*/J*/samples.npz")]
+    for path in sorted(paths):
         K, L = map(int, re.search(r"/K(\d+)_L(\d+)/", str(path)).groups())
         J = int(re.search(r"/J(\d+)/", str(path)).group(1))
         z = np.load(path)

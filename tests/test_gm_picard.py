@@ -149,31 +149,28 @@ def test_atomic_cells_consolidate_and_summarize(tmp_path):
         mixture_seed=11,
     )
     cfg = _config()
-    bundles = []
+    eps_out = tmp_path / picard_sweep.epsilon_slug(cfg["eps"])
     for rule in ("rmc", "d-grs"):
         built = picard_sweep.build_sampler(setting, rule, 2, 2, 1, cfg)
-        bundles.extend(
+        bundles = [
             picard_sweep.one_trajectory(
                 setting, rule, 2, 2, 1, replicate, cfg, built
             )
             for replicate in range(2)
+        ]
+        cell = picard_sweep.write_cell(
+            eps_out, rule, 2, 2, 1, bundles, save_samples=True
         )
 
-    eps_out = tmp_path / picard_sweep.epsilon_slug(cfg["eps"])
-    cell = picard_sweep.write_cell(
-        eps_out, 2, 2, 1, bundles, save_samples=True
-    )
+        assert cell == eps_out / "K2_L2" / rule / "J1"
+        assert (cell / "COMPLETE").exists()
+        with np.load(cell / "samples.npz") as samples:
+            assert samples["initial"].shape == (2, 4)
+            assert samples["sample"].shape == (2, 4)
+            assert samples["trajectory"].shape == (2, setting.num_steps + 1, 4)
+            assert samples["rule"].tolist() == [rule, rule]
+            assert samples["eps"].tolist() == [cfg["eps"]] * 2
     picard_sweep.consolidate(eps_out)
-
-    assert cell == eps_out / "K2_L2" / "J1"
-
-    assert (cell / "COMPLETE").exists()
-    with np.load(cell / "samples.npz") as samples:
-        assert samples["initial"].shape == (4, 4)
-        assert samples["sample"].shape == (4, 4)
-        assert samples["trajectory"].shape == (4, setting.num_steps + 1, 4)
-        assert samples["rule"].tolist() == ["rmc", "rmc", "d-grs", "d-grs"]
-        assert samples["eps"].tolist() == [cfg["eps"]] * 4
 
     with (eps_out / "trajectories.csv").open(newline="") as handle:
         trajectories = list(csv.DictReader(handle))
@@ -215,16 +212,15 @@ def test_replicate_checkpoints_resume_and_finalize(tmp_path):
     )
     cfg = _config()
     destination, work = picard_sweep.streamed_cell_paths(
-        tmp_path / "eps0.06", 2, 2, 1
+        tmp_path / "eps0.06", "d-grs", 2, 2, 1
     )
+    assert destination == tmp_path / "eps0.06" / "K2_L2" / "d-grs" / "J1"
+    built = picard_sweep.build_sampler(setting, "d-grs", 2, 2, 1, cfg)
     for replicate in range(2):
-        bundles = []
-        for rule in ("rmc", "d-grs"):
-            built = picard_sweep.build_sampler(setting, rule, 2, 2, 1, cfg)
-            bundles.append(picard_sweep.one_trajectory(
-                setting, rule, 2, 2, 1, replicate, cfg, built
-            ))
-        picard_sweep.write_replicate(work, replicate, bundles)
+        bundle = picard_sweep.one_trajectory(
+            setting, "d-grs", 2, 2, 1, replicate, cfg, built
+        )
+        picard_sweep.write_replicate(work, replicate, [bundle])
 
     assert picard_sweep.completed_replicates(work) == {0, 1}
     picard_sweep.finalize_streamed_cell(work, destination, 2)
@@ -233,40 +229,8 @@ def test_replicate_checkpoints_resume_and_finalize(tmp_path):
     assert not (destination / "refinements.csv").exists()
     assert (destination / "refinement_summary.csv").exists()
     with np.load(destination / "samples.npz") as samples:
-        assert samples["replicate"].tolist() == [0, 0, 1, 1]
-        assert samples["rule"].tolist() == ["rmc", "d-grs", "rmc", "d-grs"]
-
-
-def test_legacy_refinement_rows_are_migrated(tmp_path):
-    cell = tmp_path / "K1_L1" / "J1"
-    cell.mkdir(parents=True)
-    identity = picard_sweep._identity("d-grs", 1, 1, 1, 0, _config())
-    rows = []
-    for node, delta in ((0, 1.0), (1, 3.0)):
-        rows.append({
-            **identity,
-            "round_index": 0,
-            "sweep_index": 0,
-            "refinement_iteration": 1,
-            "node": node,
-            "node_depth": 0,
-            "step": 0,
-            "sigma": 1.0,
-            **{metric: delta for metric in picard_sweep.REFINEMENT_METRICS},
-        })
-    picard_sweep._write_csv(
-        cell / "refinements.csv", picard_sweep.LEGACY_REFINEMENT_FIELDS, rows
-    )
-    (cell / "COMPLETE").write_text("ok\n")
-
-    assert picard_sweep.migrate_legacy_refinements(cell)
-    assert not picard_sweep.migrate_legacy_refinements(cell)
-    with (cell / "refinement_summary.csv").open(newline="") as handle:
-        summary = list(csv.DictReader(handle))
-    assert len(summary) == 1
-    assert summary[0]["node_count"] == "2"
-    assert float(summary[0]["current_delta_mean"]) == 2.0
-    assert float(summary[0]["current_delta_max"]) == 3.0
+        assert samples["replicate"].tolist() == [0, 1]
+        assert samples["rule"].tolist() == ["d-grs", "d-grs"]
 
 
 def test_resume_subset_keeps_original_grid_and_selects_only_requested_cells(
@@ -296,26 +260,83 @@ def test_resume_subset_keeps_original_grid_and_selects_only_requested_cells(
     assert json.loads((tmp_path / "config.json").read_text())["seed"] == 20260714
 
 
-def test_runs_saved_before_picard_update_resume_only_as_increment(tmp_path, monkeypatch):
+def test_rules_can_join_an_existing_run(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
         picard_sweep, "_run_epsilon",
-        lambda args, out, cfg, eps, progress: calls.append(dict(cfg)),
+        lambda args, out, cfg, eps, progress: calls.append(list(args.rules)),
     )
     base = ["--out", str(tmp_path), "--eps", "0.1", "--progress", "none", "--J-up-to-L"]
-    picard_sweep.main(base)
-    assert calls[-1]["picard_update"] == "drift"
+    config_path = tmp_path / "config.json"
+    picard_sweep.main(base + ["--rules", "rmc", "d-grs"])
+    paws = json.dumps({"paws": {"rank_policy": "max"}})
+    picard_sweep.main(base + ["--rules", "paws", "--verifier-options", paws])
+    assert calls[-1] == ["paws"]
+    saved = json.loads(config_path.read_text())
+    assert saved["rules"] == ["rmc", "d-grs", "paws"]
+    assert saved["verifier_options"] == json.loads(paws)
 
-    # Rewrite the saved config as a run from before the flag existed.
+    # Rerunning saved rules resumes them without changing the metadata.
+    picard_sweep.main(base + ["--rules", "d-grs", "paws", "--verifier-options", paws])
+    assert calls[-1] == ["d-grs", "paws"]
+    assert json.loads(config_path.read_text()) == saved
+    # A rule keeps the options of its first run, and the protocol still binds.
+    with pytest.raises(SystemExit, match="verifier options"):
+        picard_sweep.main(base + ["--rules", "paws"])
+    with pytest.raises(SystemExit, match="different protocol"):
+        picard_sweep.main(base + ["--rules", "resample", "--seed", "123"])
+    with pytest.raises(SystemExit, match="distinct"):
+        picard_sweep.main(base + ["--rules", "rmc", "rmc"])
+    assert json.loads(config_path.read_text()) == saved
+
+
+def test_runs_from_before_per_rule_directories_are_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(picard_sweep, "_run_epsilon", lambda *args: None)
+    base = ["--out", str(tmp_path), "--eps", "0.1", "--progress", "none", "--J-up-to-L"]
+    picard_sweep.main(base)
     config_path = tmp_path / "config.json"
     legacy = json.loads(config_path.read_text())
-    del legacy["picard_update"]
+    legacy["schema_version"] = 3
     config_path.write_text(json.dumps(legacy))
-    with pytest.raises(SystemExit, match="different protocol"):
+    with pytest.raises(SystemExit, match="predates per-rule"):
         picard_sweep.main(base)
-    picard_sweep.main(base + ["--picard-update", "increment"])
-    assert calls[-1]["picard_update"] == "increment"
-    assert json.loads(config_path.read_text())["picard_update"] == "increment"
+
+
+def test_a_rule_added_later_matches_one_run_with_every_rule(tmp_path):
+    base = [
+        "--eps", "0.1", "--dimension", "4", "--num-components", "2",
+        "--num-steps", "7", "--mixture-seed", "11", "--K-values", "2",
+        "--L-values", "2", "--J-values", "0", "2", "--replicates", "2",
+        "--progress", "none",
+    ]
+    together, split = tmp_path / "together", tmp_path / "split"
+    picard_sweep.main(
+        base + ["--out", str(together), "--rules", "rmc", "d-grs", "--n-workers", "2"]
+    )
+    picard_sweep.main(base + ["--out", str(split), "--rules", "rmc"])
+    rmc_cell = split / "eps0.1" / "K2_L2" / "rmc" / "J2"
+    finished = (rmc_cell / "COMPLETE").stat().st_mtime_ns
+    picard_sweep.main(base + ["--out", str(split), "--rules", "rmc", "d-grs"])
+    assert (rmc_cell / "COMPLETE").stat().st_mtime_ns == finished
+
+    for rule in ("rmc", "d-grs"):
+        for J in ("J0", "J2"):
+            cell = f"eps0.1/K2_L2/{rule}/{J}/samples.npz"
+            with np.load(together / cell) as a, np.load(split / cell) as b:
+                assert a.files == b.files
+                for field in a.files:
+                    np.testing.assert_array_equal(a[field], b[field])
+
+    def trajectories(run):
+        with (run / "eps0.1" / "trajectories.csv").open(newline="") as handle:
+            return [
+                {key: value for key, value in row.items() if key != "sampling_seconds"}
+                for row in csv.DictReader(handle)
+            ]
+
+    assert trajectories(split) == trajectories(together)
+    assert {row["rule"] for row in trajectories(split)} == {"rmc", "d-grs"}
+    assert json.loads((split / "config.json").read_text())["rules"] == ["rmc", "d-grs"]
 
 
 @pytest.mark.parametrize("update", ["drift", "increment"])
