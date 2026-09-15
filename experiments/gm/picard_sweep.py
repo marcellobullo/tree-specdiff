@@ -35,6 +35,7 @@ import os
 import shutil
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -53,14 +54,21 @@ from specdiff import (  # noqa: E402
     Verifier,
     create_verifier,
     available_verifiers,
+    picard_broyden_correction_update_fn,
     picard_drift_update_fn,
+    picard_jtx_update_fn,
     picard_update_fn,
 )
 
 SCHEMA_VERSION = 4
 RULE_DIRECTORY_SCHEMA = 4
 """First schema with one directory per rule; older runs cannot be resumed."""
-PICARD_UPDATES = {"drift": picard_drift_update_fn, "increment": picard_update_fn}
+PICARD_UPDATES = {
+    "broyden": picard_broyden_correction_update_fn,
+    "drift": picard_drift_update_fn,
+    "increment": picard_update_fn,
+    "jtx": picard_jtx_update_fn,
+}
 """``--picard-update`` choices. Configs saved before the flag used ``increment``."""
 IDENTITY_FIELDS = (
     "trajectory_id",
@@ -499,7 +507,11 @@ def build_sampler(setting, rule, K, L, J, cfg):
         rule, K, L, setting.num_steps, cfg["match"], cfg["evaluate_leaves"]
     )
     verifier = RecordingVerifier(configured_verifier(rule, cfg.get("verifier_options")))
-    refiner = RecordingPicardUpdate(tree, PICARD_UPDATES[cfg.get("picard_update", "drift")])
+    update_name = cfg.get("picard_update", "drift")
+    update_fn = PICARD_UPDATES[update_name]
+    if update_name == "broyden":
+        update_fn = partial(update_fn, memory=cfg.get("broyden_memory", 2))
+    refiner = RecordingPicardUpdate(tree, update_fn)
     sampler = SpeculativeSampler(
         target=setting.target,
         proposal=DelayedDriftProposal(setting.target),
@@ -893,8 +905,13 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--picard-update", default="drift", choices=sorted(PICARD_UPDATES),
-        help="freeze the target's drift (default) or the whole increment m - x; "
+        help="freeze the target's drift (default), the whole increment m - x, "
+        "or use mean-error transport (jtx) with optional secant corrections (broyden); "
         "runs saved before this flag used increment",
+    )
+    p.add_argument(
+        "--broyden-memory", "--secant-memory", type=int, default=2, metavar="M",
+        help="rank-one corrections retained per parent for broyden (default: 2; 0 is JTX)",
     )
     p.add_argument("--rules", nargs="+", default=["rmc", "d-grs", "paws"])
     p.add_argument("--verifier-options", type=parse_verifier_options, default={})
@@ -1143,6 +1160,8 @@ def main(argv=None) -> None:
     if unknown:
         raise SystemExit(f"unsupported rules: {sorted(unknown)}")
 
+    if args.broyden_memory < 0:
+        raise SystemExit("Broyden memory must be non-negative")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cfg = {
@@ -1150,6 +1169,8 @@ def main(argv=None) -> None:
         for key, value in sorted(vars(args).items())
         if key not in {"out", "n_workers", "progress"}
     }
+    if args.picard_update != "broyden":
+        cfg.pop("broyden_memory", None)
     cfg["schema_version"] = SCHEMA_VERSION
     # Options belong to the rule they configure: record only the rules that run.
     cfg["verifier_options"] = {

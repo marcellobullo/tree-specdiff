@@ -167,6 +167,12 @@ class ProposalTransition(ABC):
 
         ``indices_in_batch[i]``, ``states[i]`` and ``steps[i]`` all describe
         entry ``i``: which image it belongs to, its value, and its step.
+
+        With JTX refinement, this base map is also evaluated at snapshot and
+        rebuilt parents. It must be deterministic, row-local across batch
+        partitions, and fixed throughout drafting and refinement in a round.
+        ``means`` must not update proposal state; lifecycle hooks may do so
+        between rounds.
         """
 
     def on_round_start(

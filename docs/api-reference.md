@@ -3,8 +3,8 @@
 This reference covers the public symbols exported by `specdiff`. Symbols follow the paper's
 notation; see the [notation table](../README.md#notation).
 
-- [Samplers](#samplers) · [Results](#results) · [Draft trees](#draft-trees)
-- [Models](#models) · [Proposals](#proposals) · [Batched proposals](#batched-proposals)
+- [Samplers](#samplers) · [Refinement callbacks](#refinement-callbacks) · [Results](#results) · [Draft trees](#draft-trees)
+- [Models](#models) · [Proposals](#proposals) · [Proposals and batching](#proposals-and-batching)
 - [Verification](#verification) · [Contract types](#contract-types)
 - [Rank-1 coordinates](#rank-1-coordinates) · [Testing](#testing) · [Backends](#backends)
 
@@ -36,10 +36,12 @@ construction.
 - `num_steps` — the horizon `N`. Must be `>= 1`.
 - `check_contract` — wrap the rule in `CheckedVerifier`; recommended during development.
 - `backend` — only needed for a framework `resolve_backend` does not know.
-- `proposal_refinement_iters` — synchronous tree-refinement sweeps; `None` or `0` disables them.
+- `proposal_refinement_iters` — maximum synchronous tree-refinement sweeps; `None` or `0` disables them.
+  Each round executes at most `min(J, tree.depth, num_steps - start_step)` sweeps;
+  round records store the actual `refinement_iters`.
 - `refinement_update_fn` — row-local refinement callback. Positive iterations default to
-  `picard_drift_update_fn`; `picard_update_fn` freezes the whole increment and reproduces
-  earlier runs.
+  `picard_drift_update_fn`; `picard_update_fn` freezes the whole increment, retaining
+  the update used by earlier runs.
 
 ```python
 .sample(init, *, rng=None, on_round=None, record=True) -> SamplingResult
@@ -63,6 +65,8 @@ BatchedSpeculativeSampler(
 
 Runs the algorithm over `batch_size` independent trajectories. The tree must be
 **level-uniform**. Any `ProposalTransition` can be used without an adapter.
+The shared refinement sweep count is capped at the longest active lookahead;
+shorter active trees participate in those same sweeps.
 
 - `keep_trajectories` — retain the full `(batch, N+1, *shape)` history rather than terminal
   states only. Costs memory.
@@ -78,9 +82,11 @@ unaffected.
 ### Refinement callbacks
 
 `RefinementRequest` contains the iteration, image indices, logical nodes, steps, parent
-states, current proposal means, sigmas, target, and backend. A callback must be row-local
+states, current proposal means, sigmas, target, backend, the base `proposal`, and
+a mutable `history` dictionary shared only across sweeps within the current round. A callback must be row-local
 and returns exactly one `RefinementUpdate(increments=None, exact_target_means=None,
-drifts=None)` with exactly one of `increments` and `drifts` set. `increments` are added to
+drifts=None, base_proposal_means=None, broyden_factors=None)` with exactly one of `increments`, `drifts`,
+and `base_proposal_means` set. `increments` are added to
 the rebuilt parent; `drifts` are passed to `target.apply_drift` at the rebuilt parent.
 
 `picard_drift_update_fn` is the default for positive iteration counts. It returns
@@ -88,8 +94,37 @@ the rebuilt parent; `drifts` are passed to `target.apply_drift` at the rebuilt p
 exact target means, so the part of the mean the target does not freeze is evaluated at the
 rebuilt parent. `picard_update_fn`, the former default, returns the whole increment
 `m^q_s(x) - x` instead. Both have the same fixed point; the drift update removes the stale
-`(a - 1) x` term of the churn kernels. See [Proposal refinement](refinement.md) for the
-derivations and the caching contract.
+`(a - 1) x` term of the churn kernels. Neither is universally better: the whole
+increment can preserve cancellation with the network term. On a chain with matching
+inputs, `picard_update_fn` gives the reference ParaDiGMS refinement recurrence,
+while the full samplers differ. See [the reference comparison](refinement.md#relationship-to-paradigms-and-appendix-b)
+and [the cancellation example](refinement.md#cancellation-can-favor-the-whole-increment).
+
+`picard_jtx_update_fn` returns `base_proposal_means=p(old)` and
+`exact_target_means=q(old)`. Reconstruction evaluates the base proposal at each
+rebuilt parent and stores `q(old) + (p(new) - p(old))`, the JTX mean-error update.
+The proposal must be deterministic and row-local, with its map fixed for the
+whole round. The sampler passes it through `RefinementRequest.proposal`;
+manually constructed requests may omit it for the older callbacks. Supplying
+`base_proposal_means` requires `exact_target_means` and a base proposal.
+
+`picard_broyden_correction_update_fn(request, *, memory=2)` extends JTX with
+per-parent rank-one derivative corrections to `d=q-p`. Configure it using
+`functools.partial(picard_broyden_correction_update_fn, memory=1)`. The memory
+is the maximum number of rank-one factors retained per parent, not the sweep count.
+It must be a non-negative integer; zero gives exactly JTX. History belongs to the
+sampler's round, so the callback can be reused across samplers and repeated
+`sample()` calls. Each `(image, node, step)` has separate history; the first
+sweep records the initial state/error pair and gives JTX. The second sweep can
+fit a correction if that parent has moved enough. After verification, the next
+round starts with empty history again.
+
+The optional `broyden_factors` output requires `base_proposal_means`. It contains
+one tuple per request row, each with `(u, v)` factor pairs shaped like a single
+state. Reconstruction adds `sum(u * dot(v, new_parent - snapshot))` to the JTX
+mean. Factors must be finite and row-local. Non-finite corrected means fall back
+to the JTX mean for that row; finite corrections are not clipped. See
+[Proposal refinement](refinement.md) for the update and truncation rules.
 
 ### `standard_sampler`
 

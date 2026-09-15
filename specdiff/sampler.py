@@ -224,6 +224,7 @@ class SpeculativeSampler:
                 ops.put(scaled_innovations, child_ids, scaled)
             ops.put(states, child_ids, ops.repeat_rows(means, counts) + scaled)
 
+        refinement_iters = min(self.proposal_refinement_iters, lookahead)
         refinement_calls_before = self.target.num_calls
         refinement_states_before = self.target.num_states
         refinement_cache: Optional[ExactTargetCache] = None
@@ -233,8 +234,9 @@ class SpeculativeSampler:
                 proposal_means=proposal_means,
                 scaled_innovations=scaled_innovations,
                 layout=self._refinement_layout(tree, n),
-                iterations=self.proposal_refinement_iters,
+                iterations=refinement_iters,
                 update_fn=self.refinement_update_fn,
+                proposal=self.proposal,
                 target=self.target,
                 ops=ops,
             )
@@ -381,7 +383,7 @@ class SpeculativeSampler:
             proposals_examined=tuple(examined),
             proposal_target_calls=proposal_target_calls,
             proposal_target_states_evaluated=proposal_target_states,
-            refinement_iters=self.proposal_refinement_iters,
+            refinement_iters=refinement_iters,
             refinement_target_calls=refinement_target_calls,
             refinement_target_states_evaluated=refinement_target_states,
             verification_target_calls=verification_target_calls,

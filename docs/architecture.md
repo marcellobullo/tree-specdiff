@@ -100,8 +100,8 @@ Leaves are not parents unless `evaluate_leaves` requests them for prefetching.
 parent and its `K` drafted children, and returns a state that is an exact draw from
 `N(m^q, sigma^2 I)`. If it accepted, the returned state *is* one of the children and the
 walk descends into that child's subtree. If it rejected, the round ends there. Either way
-one state is committed per level examined, so a round that rejects at level 1 still makes
-one state is committed for every level examined, ensuring that the loop terminates.
+one state is committed per level examined, so a round that rejects at level 1 still
+makes progress, ensuring that the loop terminates.
 
 ### Step indexing
 

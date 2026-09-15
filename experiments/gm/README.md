@@ -135,11 +135,41 @@ per-depth refinement grid visible. `--J-up-to-L` and an explicit `--J-values`
 list are mutually exclusive.
 
 `--picard-update drift` (the default) freezes only the target's velocity during
-refinement; `--picard-update increment` freezes the whole increment `m - x`, as
-every run did before the flag existed. The choice is part of the saved protocol,
-so mixing the two in one `--out` directory is refused. See
+refinement; `--picard-update increment` freezes the whole increment `m - x`.
+The latter gives the reference ParaDiGMS recurrence on a chain with matching
+inputs and was used by runs saved before the flag existed. Neither update has
+a universal performance advantage; see the
+[reference comparison and formulas](../../docs/refinement.md#relationship-to-paradigms-and-appendix-b). `--picard-update jtx` transports the
+target-minus-base-proposal error using the round's fixed draft map. For the GM
+delayed affine drift proposal, JTX and `drift` agree up to rounding. The choice
+is part of the saved protocol, so mixing updates in one `--out` directory is refused. See
 [docs/refinement.md](../../docs/refinement.md) for the derivations and measured
-differences.
+differences. Add `--picard-update increment` explicitly for the ParaDiGMS
+refinement baseline, or `--picard-update jtx` for JTX; the output directory name
+does not select the update. With `J=0`, none of the callbacks is invoked.
+
+The requested `J` is capped at each round's actual lookahead. Under
+`--match verification`, RMC uses a matched chain whose depth can exceed the
+branching tree's `L`; `--J-up-to-L` controls the requested grid, not that chain's
+actual depth. Compare recorded `refinement_iters` and target calls as well as
+acceptance: more accepted draft states need not offset extra refinement calls.
+The printed `speed` is a target-call ratio, not wall-clock speedup.
+
+`--picard-update broyden --broyden-memory 2` adds a limited-memory, per-parent
+Broyden correction to JTX. The first sweep is JTX; subsequent sweeps use changes
+in the target-minus-draft error to fit directional derivatives. Memory zero is
+JTX, and `--secant-memory` is an alias for `--broyden-memory`. History resets each
+round and replicate. Here memory 2 means at most two retained rank-one factors
+per parent; it does not request two sweeps. A round with only one sweep gives
+JTX even with positive memory. The memory setting is saved in the Broyden run's protocol;
+changing it requires a separate output directory. For example:
+
+```bash
+python experiments/gm/picard_sweep.py \
+  --out results/gm-broyden-m2 --picard-update broyden --broyden-memory 2 \
+  --eps 0.1 --dimension 32 --num-steps 10 --K-values 1 2 --L-values 4 \
+  --J-values 0 1 2 3 --rules rmc d-grs paws --replicates 4
+```
 
 `--progress auto` (the default) displays one overall configuration bar in an
 interactive terminal and periodic progress lines in redirected logs. The count

@@ -339,7 +339,7 @@ def test_a_rule_added_later_matches_one_run_with_every_rule(tmp_path):
     assert json.loads((split / "config.json").read_text())["rules"] == ["rmc", "d-grs"]
 
 
-@pytest.mark.parametrize("update", ["drift", "increment"])
+@pytest.mark.parametrize("update", ["drift", "increment", "jtx"])
 def test_picard_update_selects_the_refinement_callback(update):
     setting = models.build(dimension=6, num_components=3, num_steps=8, eps=0.06)
     sampler, _, refiner, _, _ = picard_sweep.build_sampler(
@@ -347,3 +347,37 @@ def test_picard_update_selects_the_refinement_callback(update):
     )
     assert sampler.refinement_update_fn is refiner
     assert refiner.update_fn is picard_sweep.PICARD_UPDATES[update]
+
+
+@pytest.mark.parametrize('memory', [0, 1, 2, 4])
+def test_broyden_selection_passes_memory_to_callback(memory):
+    from functools import partial
+    from specdiff import picard_broyden_correction_update_fn
+
+    setting = models.build(dimension=6, num_components=3, num_steps=8, eps=0.06)
+    _, _, refiner, _, _ = picard_sweep.build_sampler(
+        setting, 'd-grs', 2, 3, 2,
+        {**_config(), 'picard_update': 'broyden', 'broyden_memory': memory},
+    )
+    assert isinstance(refiner.update_fn, partial)
+    assert refiner.update_fn.func is picard_broyden_correction_update_fn
+    assert refiner.update_fn.keywords == {'memory': memory}
+
+
+def test_broyden_memory_cli_defaults_validation_and_resume_protocol(tmp_path):
+    args = picard_sweep.parser().parse_args(['--picard-update', 'broyden'])
+    assert args.broyden_memory == 2
+    assert picard_sweep.parser().parse_args(['--secant-memory', '1']).broyden_memory == 1
+    with pytest.raises(SystemExit, match='memory'):
+        picard_sweep.main(['--broyden-memory', '-1', '--out', str(tmp_path / 'bad')])
+    assert not (tmp_path / 'bad').exists()
+    cfg = {
+        **_config(), 'schema_version': picard_sweep.SCHEMA_VERSION,
+        'K_values': [1], 'L_values': [3], 'rules': ['rmc'],
+        'verifier_options': {}, 'picard_update': 'broyden', 'broyden_memory': 2,
+    }
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(cfg))
+    assert picard_sweep.resumed_config(path, dict(cfg))['broyden_memory'] == 2
+    with pytest.raises(SystemExit, match='different protocol'):
+        picard_sweep.resumed_config(path, {**cfg, 'broyden_memory': 1})
