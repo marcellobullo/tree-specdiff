@@ -63,9 +63,9 @@ This shared covariance permits the rank-1 reduction from a `d`-dimensional coupl
 to a scalar problem. See
 [writing-a-verifier.md](writing-a-verifier.md#rank-1-coordinates).
 
-`NoiseSchedule.__call__` refuses a zero or negative scale: at zero churn both kernels are
-point masses, their total-variation distance is 1, and speculation provides no benefit
-(Remark 3).
+`NoiseSchedule.__call__` accepts finite non-negative scales. At zero variance, both
+kernels are point masses: the sampler commits the target mean and continues only when
+the proposal mean and drafted child match it exactly. Unequal point masses reject.
 
 ## One round, in three phases
 
@@ -91,10 +91,12 @@ sweeps. Each sweep evaluates one row-local update for every internal node, by de
 target's frozen drift, then rebuilds the tree breadth-first with the original fixed edge
 innovations. See [Proposal refinement](refinement.md).
 
-**With refinement disabled, Phase 2 makes one target call over internal nodes.** With
+**Phase 2 makes at most one target call over uncached internal nodes.** With
 refinement enabled, exact target means from the final sweep are reused wherever the final
 state is exactly unchanged; all remaining internal nodes share at most one final call.
-Leaves are not parents unless `evaluate_leaves` requests them for prefetching.
+Leaves are not parents, but `evaluate_leaves` requests their means for prefetching
+when their step is strictly below the horizon. Initialization means are also reused
+when target identity, image, step and state match exactly.
 
 **Phase 3 descends and stops at the first rejection.** At each level the rule sees one
 parent and its `K` drafted children, and returns a state that is an exact draw from
@@ -169,8 +171,11 @@ override `means` and callers invoke the instance:
 | `drafted_states` | states the proposal produced, `sum of B_n` |
 
 `speedup = num_steps / target_calls`. The denominator includes any warm-up call a proposal
-needed. `standard_sampler` therefore reports `1.00x`, while a verifier that rejects every
-draft reports slightly below `1.00x` when the proposal requires a warm-up.
+needed. `standard_sampler` reports `1.00x`. A round can make zero, one or several
+calls because initialization, refinement and exact reuse affect its cost. Batched results
+also record `target_calls_per_trajectory` and `target_states_per_trajectory`; each logical
+call counts once per participating image, irrespective of its number of tree nodes or
+physical model chunks.
 
 ## The batched sampler
 

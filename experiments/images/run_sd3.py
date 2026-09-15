@@ -338,6 +338,8 @@ def experiment_signature(args, setting, tree, denoiser):
             "network": file_identity(args.network),
             "prompts": file_identity(args.prompts),
             "per_sample_prompts": denoiser.per_sample_prompts,
+            "endpoint_policy": "in_sampler",
+            "nfe_accounting": "logical_calls_per_image_v2",
         },
     )
 
@@ -356,7 +358,8 @@ def generate_shard(args, setting, sampler, denoiser, start, count, out, rank):
 
     batch = args.sample_batch or count
     generator = torch.Generator(device=args.device).manual_seed(args.seed + rank)
-    n_endpoints = len(setting.deterministic_steps)
+    # All endpoints now run inside the sampler and its NFE counters.
+    n_endpoints = 0
     chunks, metrics = [], {}
     t0, done, last_report = time.time(), 0, 0.0
 
@@ -423,6 +426,9 @@ def merge_shards(args, setting, tree, denoiser, out, world=None):
         "latent_shape": list(setting.state_shape),
         "total_steps": setting.total_steps,
         "speculative_steps": setting.num_steps,
+        "stochastic_steps": setting.num_steps - len(setting.deterministic_steps),
+        "endpoint_policy": "in_sampler",
+        "nfe_accounting": "logical_calls_per_image_v2",
         "deterministic_steps": list(setting.deterministic_steps),
         "eps": args.eps,
         "s_noise": args.s_noise,
@@ -514,8 +520,8 @@ def main(argv=None) -> None:
         px = args.toy_resolution if args.toy else args.resolution_px
         print(f"{args.rule}: {args.num_samples} samples over {world} process(es), "
               f"{px}px from {setting.state_shape} latents, T={setting.total_steps} "
-              f"({setting.num_steps} speculative + "
-              f"{len(setting.deterministic_steps)} Euler), eps={args.eps}"
+              f"({setting.num_steps} sampler transitions, "
+              f"{len(setting.deterministic_steps)} deterministic), eps={args.eps}"
               + (f", s_noise={args.s_noise}" if args.s_noise != 1.0 else ""))
         print(f"tree {tree}: proposal budget B={tree.budget}, "
               f"verification budget |I|={tree.verification_budget()} rows per round")

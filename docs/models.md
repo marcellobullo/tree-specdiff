@@ -89,11 +89,11 @@ class MySchedule(NoiseSchedule):              # or compute it
 the largest index that ever reaches the schedule is `N - 1`. A `TabulatedSchedule` therefore
 needs exactly `N` entries, not `N + 1`.
 
-**Scales must be positive.** `NoiseSchedule.__call__` raises on a non-positive scale. At zero
-churn, both kernels are point masses, their total-variation distance is 1, and speculation
-provides no benefit (Remark 3).
-If your schedule ends at `sigma = 0`, stop the speculative sampler one step short and take the
-final step with your own deterministic update.
+**Scales must be finite and non-negative.** Zero-variance transitions are handled inside
+both samplers: commit the target mean, and continue along the first drafted child only if
+its state and proposal mean equal the target mean exactly. Distinct point masses have
+total-variation distance 1; identical point masses have distance 0. No tolerance is used.
+Schedules may include deterministic endpoints, interior steps, or consist entirely of zeros.
 
 ### Converting an existing sampler
 
@@ -131,7 +131,9 @@ gamma b^q(Y~) = m^q(Y~) - Y~
 The proposal freezes that increment and reuses it at every depth of the tree. Because it is
 read from a target mean already evaluated during verification, no additional target call is
 needed per round. This is Appendix C's root-drift prefetching. One warm-up call is required at
-`n = 0` and included in `target_calls`.
+`n = 0` and included in `target_calls`. Its exact mean is reused at the root
+during drafting and verification; initializing the drift does not require evaluating
+that same root twice.
 
 What is frozen is the **target's** decision, through two required hooks:
 

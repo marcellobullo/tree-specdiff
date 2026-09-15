@@ -148,7 +148,7 @@ speedup baseline and distributional reference in tests.
 | `sample` | property: the terminal state `Y_N` |
 | `rounds` | `tuple[RoundRecord, ...]` |
 | `num_steps` | `N` |
-| `target_calls` | **NFEs** — one batched call per round, plus any proposal warm-up |
+| `target_calls` | **NFEs** — measured logical batched target calls, including warm-up/refinement |
 | `target_states_evaluated` | total rows through the target — batch volume, not NFEs |
 | `drafted_states` | states the proposal produced |
 | `speedup` | property: `num_steps / target_calls` |
@@ -165,8 +165,10 @@ speedup baseline and distributional reference in tests.
 | `batch_size`, `num_steps` | |
 | `target_calls`, `target_states_evaluated`, `drafted_states` | as above |
 | `rounds_per_trajectory` | `tuple[int, ...]` |
-| `speedup` | property: `N / target_calls` — the **wall-clock** number |
-| `mean_isolated_speedup` | property: mean of `N / rounds_i`, what each trajectory would have achieved alone |
+| `target_calls_per_trajectory` | logical target calls involving each image, including warm-up/refinement |
+| `target_states_per_trajectory` | target rows evaluated for each image |
+| `speedup` | property: `N / target_calls` — logical NFE speedup |
+| `mean_isolated_speedup` | property: mean of `N / target_calls_per_trajectory[i]` |
 | `occupancy` | property: mean fraction of the batch still live per iteration |
 | `acceptance_rate` | property: pooled over every trajectory and round |
 | `summary()` | |
@@ -259,8 +261,8 @@ belong to different steps.
 
 ### `NoiseSchedule`
 
-Abstract. Override `sigma(step) -> float`. `__call__` validates and refuses a non-positive
-scale (Remark 3). Concrete: `ConstantSchedule(sigma)`, `TabulatedSchedule(sigmas)` — the latter
+Abstract. Override `sigma(step) -> float`. `__call__` requires a finite non-negative
+scale. Both samplers handle zero-variance transitions directly. Concrete: `ConstantSchedule(sigma)`, `TabulatedSchedule(sigmas)` — the latter
 needs exactly `N` entries.
 
 ---
@@ -276,6 +278,7 @@ means(indices_in_batch, states, steps) -> Array           # required
 on_round_start(indices_in_batch, steps, roots)            # optional hooks
 on_verified(indices_in_batch, steps, states, target_means)
 configure_prefetch(mode)
+exact_target_means()                                     # optional ExactTargetMean records
 reset(batch_size)
 ```
 
@@ -292,7 +295,9 @@ stateful proposals should use it as the cache key.
 
 `prefetch=True` reuses the freshest committed drift, so no extra target call per round;
 `prefetch=False` re-evaluates at each round's root, costing one NFE per round for a strictly
-better proposal.
+better proposal. Exact cached root means are reused in verification and at the
+unchanged proposal root, avoiding both a duplicate evaluation and drift round-trip
+rounding. Reuse requires matching target identity, image, step and represented state.
 
 ---
 
@@ -361,7 +366,8 @@ available_verifiers() -> tuple[str, ...]
 
 Registered by the library: `resample`, `rmc`, `d-grs`, `paws`, all registered on `import specdiff`.
 `rmc` is Algorithm 1 (`max_children = 1`, so pair it with `DraftTree.chain(L)`) and `d-grs` is
-Algorithm 2 (any `K`); see [the paper's two algorithms](writing-a-verifier.md#the-papers-two-algorithms).
+Algorithm 2 (any `K`), with `residual_complement="first"` by default. D-GRS also accepts
+`"fresh"` and `"nearest_projection"`, using the same perpendicular-noise policies as PAWS; see [the paper's two algorithms](writing-a-verifier.md#the-papers-two-algorithms).
 `paws` is `RankSelectionCoupling(rank_policy="optimized", residual_complement="first")`,
 with any `K`, shared positive Gaussian variance, and no temperature parameter. Rank policies
 are `optimized`, `uniform`, `max`, or a callable `(delta, K) -> weights`; complement policies

@@ -10,10 +10,10 @@ Three implementation constraints apply. The first two become relevant for
 *   The children arrive in ``request.children`` in sampling order and a
     sequence coupling must keep it. Sorting them, or examining them by
     likelihood ratio, breaks exactness.
-*   Which orthogonal residual is carried through matters. Algorithm 2 returns
-    ``Z_perp,k`` on acceptance of child ``k`` but ``Z_perp,1`` on the residual
-    branch (lines 9 and 18). Note the subscript indexes the *child*, not a
-    coordinate: ``Z_perp,1`` is the first drafted child's orthogonal residual.
+*   Acceptance keeps the accepted child's orthogonal residual. On rejection,
+    ``residual_complement`` selects ``first`` (Algorithm 2's default), ``fresh``,
+    or ``nearest_projection``. Selection may depend on scalar projections,
+    but not on the orthogonal values.
 *   Check ``frame.degenerate`` before dividing by ``delta`` to handle small,
     nonzero mean differences safely.
 
@@ -33,7 +33,7 @@ import math
 from ..ops import standard_normal_sf
 from ..types import VerifyRequest, VerifyResult
 from ..verify import Verifier, register_verifier
-from .rank1 import Rank1Frame
+from .rank1 import Rank1Frame, RESIDUAL_COMPLEMENTS, residual_complement
 
 
 def _sample_residual(frame: Rank1Frame, level: float, mass: float, u: float) -> float:
@@ -110,6 +110,11 @@ class GreedyRejectionSampling(Verifier):
 
     max_children = None
 
+    def __init__(self, *, residual_complement: str = "first"):
+        if residual_complement not in RESIDUAL_COMPLEMENTS:
+            raise ValueError(f"residual_complement must be one of {RESIDUAL_COMPLEMENTS}")
+        self.residual_complement = residual_complement
+
     def verify(self, request: VerifyRequest) -> VerifyResult:
         ops = self.backend_for(request)
         frame = Rank1Frame.from_request(request)
@@ -170,11 +175,7 @@ class GreedyRejectionSampling(Verifier):
                 ),
             )
 
-        # Lines 17-20. Z_perp of child 1, not of the last child examined: the
-        # sweep's decisions depend only on the S_k, so Z_perp,1 is independent
-        # of reaching this branch, and carrying the wrong one is a silent
-        # exactness bug.
-        z_perp_first = projected[0][1]
+        # The scalar residual law is independent of the perpendicular policy.
         if mass <= 0.0:
             # Unreachable except through rounding: the probability of arriving
             # here is G_{K+1} itself. Fall back to the threshold, the point the
@@ -183,8 +184,11 @@ class GreedyRejectionSampling(Verifier):
         else:
             s = _sample_residual(frame, level, mass, ops.uniform(request.rng))
 
+        perp = residual_complement(
+            frame, request, s, self.residual_complement, projections=projected
+        )
         return VerifyResult(
-            state=frame.reconstruct(s, z_perp_first),
+            state=frame.reconstruct(s, perp),
             accepted=False,
             proposals_examined=request.num_children + 1,
         )

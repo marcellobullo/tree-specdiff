@@ -151,3 +151,24 @@ class Rank1Frame:
     def reconstruct(self, s: float, z_perp: Array) -> Array:
         """``(S, Z_perp) -> Y`` of eq. (11)."""
         return self.mu_p + self.sigma * (s * self.direction + z_perp)
+
+
+RESIDUAL_COMPLEMENTS = ("first", "fresh", "nearest_projection")
+
+
+def residual_complement(frame, request, s, policy, *, projections=None):
+    """Choose the orthogonal noise independently of its values.
+
+    Selection by scalar projection preserves the Gaussian perpendicular law;
+    selecting by full-vector distance generally does not.
+    """
+    if policy not in RESIDUAL_COMPLEMENTS:
+        raise ValueError(f"residual_complement must be one of {RESIDUAL_COMPLEMENTS}")
+    if policy == "fresh":
+        noise = frame.ops.randn_stack(1, request.proposal_mean, request.rng)[0]
+        return noise - frame.ops.dot(frame.direction, noise) * frame.direction
+    if projections is None:
+        projections = [frame.project(request.child(j)) for j in range(request.num_children)]
+    j = (min(range(len(projections)), key=lambda j: abs(projections[j][0] - s))
+         if policy == "nearest_projection" else 0)
+    return projections[j][1]

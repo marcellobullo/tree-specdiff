@@ -11,6 +11,8 @@ distilled draft network, analytic score, or delayed reverse drift.
 
 from __future__ import annotations
 
+import math
+from collections import Counter
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Sequence
 
@@ -29,12 +31,8 @@ class NoiseSchedule(ABC):
 
     def __call__(self, step: int) -> float:
         s = float(self.sigma(step))
-        if s <= 0.0:
-            raise ValueError(
-                f"sigma({step}) = {s}: speculation is vacuous at zero churn "
-                "(the transitions become point masses, TV distance 1). "
-                "See Remark 3 in the paper."
-            )
+        if not math.isfinite(s) or s < 0.0:
+            raise ValueError(f"sigma({step}) = {s}: expected a finite non-negative scale")
         return s
 
 
@@ -72,6 +70,8 @@ class TargetTransition(ABC):
     def __init__(self) -> None:
         self.num_calls = 0
         self.num_states = 0
+        self.calls_per_image = Counter()
+        self.states_per_image = Counter()
 
     @abstractmethod
     def means(
@@ -132,6 +132,10 @@ class TargetTransition(ABC):
             )
         self.num_calls += 1
         self.num_states += len(steps)
+        # One logical batch is one NFE for each participating image, even
+        # when several tree nodes of that image share the call.
+        self.calls_per_image.update(set(indices_in_batch))
+        self.states_per_image.update(indices_in_batch)
         out = self.means(indices_in_batch, states, steps)
         if int(out.shape[0]) != len(steps):
             raise ValueError(
@@ -143,6 +147,8 @@ class TargetTransition(ABC):
     def reset_stats(self) -> None:
         self.num_calls = 0
         self.num_states = 0
+        self.calls_per_image = Counter()
+        self.states_per_image = Counter()
 
 
 class ProposalTransition(ABC):
@@ -179,6 +185,14 @@ class ProposalTransition(ABC):
         self, indices_in_batch: Sequence[int], steps: Sequence[int], roots: Array
     ) -> None:
         """Called once per round, before drafting, with each image's ``(n, Y_n)``."""
+
+    def exact_target_means(self):
+        """Optional exact evaluations available to the sampler for root reuse.
+
+        Return ExactTargetMean records. Reuse validates target identity, image,
+        step, and represented state; an approximate carried drift is not enough.
+        """
+        return ()
 
     def on_verified(
         self,
@@ -289,6 +303,19 @@ class DelayedDriftProposal(ProposalTransition):
         self._have: list[bool] = []
         self._batch_size = 0
         self._backend = None
+        self._exact_means = {}
+
+    def exact_target_means(self):
+        return tuple(self._exact_means.values())
+
+    def _remember_exact(self, indices, steps, states, means, ops):
+        from .refinement import ExactTargetMean
+
+        for row, image in enumerate(indices):
+            self._exact_means[image] = ExactTargetMean(
+                self._target, image, int(steps[row]),
+                ops.copy(states[row]), ops.copy(means[row]),
+            )
 
     def configure_backend(self, backend) -> None:
         self._backend = backend
@@ -297,6 +324,7 @@ class DelayedDriftProposal(ProposalTransition):
         self._delayed_drift = None
         self._have = [False] * batch_size
         self._batch_size = batch_size
+        self._exact_means = {}
 
     def configure_prefetch(self, mode: str) -> None:
         # "none" means no drift is handed over, so the root must be paid for.
@@ -322,6 +350,9 @@ class DelayedDriftProposal(ProposalTransition):
             [indices_in_batch[i] for i in missing],
             self._target.freeze_drift(rows, means, missing_steps),
         )
+        self._remember_exact(
+            [indices_in_batch[i] for i in missing], missing_steps, rows, means, ops
+        )
         for i in missing:
             self._have[indices_in_batch[i]] = True
 
@@ -336,6 +367,7 @@ class DelayedDriftProposal(ProposalTransition):
             list(indices_in_batch),
             self._target.freeze_drift(states, target_means, tuple(steps)),
         )
+        self._remember_exact(indices_in_batch, steps, states, target_means, ops)
         for b in indices_in_batch:
             self._have[b] = True
 
@@ -346,4 +378,17 @@ class DelayedDriftProposal(ProposalTransition):
             raise RuntimeError("on_round_start must run before drafting")
         ops = self._backend or resolve_backend(states)
         drift = ops.take(self._delayed_drift, list(indices_in_batch))
-        return self._target.apply_drift(drift, states, tuple(steps))
+        means = self._target.apply_drift(drift, states, tuple(steps))
+        # Recovering and reapplying a velocity can round differently. At an
+        # unchanged, verified state use the exact mean, especially for Dirac
+        # transitions where an approximate equality is not an acceptance rule.
+        from .refinement import reusable_exact_target_mean
+
+        for row, (image, step) in enumerate(zip(indices_in_batch, steps)):
+            mean = reusable_exact_target_mean(
+                self._exact_means.get(image), target=self._target,
+                index_in_batch=image, step=int(step), state=states[row], ops=ops,
+            )
+            if mean is not None:
+                ops.put(means, [row], ops.stack_rows([mean]))
+        return means

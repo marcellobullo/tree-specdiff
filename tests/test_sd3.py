@@ -80,8 +80,10 @@ class TestSchedule:
     def test_endpoints_are_still_the_two_deterministic_steps(self):
         _, s = make()
         assert s.deterministic_steps == (0, STEPS - 1)
-        assert s.num_steps == STEPS - 2
-        assert all(s.schedule(n) > 0.0 for n in range(s.num_steps))
+        assert s.num_steps == STEPS
+        assert s.target.step_offset == 0
+        assert s.schedule(0) == s.schedule(STEPS - 1) == 0.0
+        assert all(s.schedule(n) > 0.0 for n in range(1, STEPS - 1))
 
 
 class TestVelocity:
@@ -587,3 +589,25 @@ class TestFrozenDrift:
         v_true = den.velocity(x, t.sigmas[idx].to(torch.float32), rows)
         assert torch.allclose(v, v_true, atol=1e-4, rtol=1e-5)
         assert torch.allclose(t.apply_drift(v, x, steps), m, atol=1e-6)
+
+
+@pytest.mark.parametrize("rule", ["rmc", "d-grs", "paws"])
+def test_zero_churn_runs_full_sd3_trajectory(rule):
+    den, _ = make(["a cat"], px=16)
+    setting = sd3.build(den, num_steps=6, eps=0.)
+    assert setting.deterministic_steps == tuple(range(6))
+    sampler = BatchedSpeculativeSampler(
+        target=setting.target, proposal=DelayedDriftProposal(setting.target),
+        schedule=setting.schedule,
+        tree=DraftTree.uniform(1 if rule == "rmc" else 2, 2),
+        verifier=create_verifier(rule), num_steps=setting.num_steps,
+        evaluate_leaves=True, keep_trajectories=True,
+    )
+    gen = torch.Generator().manual_seed(17)
+    init = torch.randn((1, *setting.state_shape), generator=gen)
+    out, result = sd3.sample_trajectory(setting, sampler, init, rng=gen, generator=gen)
+    assert torch.equal(result.trajectories[:, 0], init)
+    assert torch.equal(out, result.trajectories[:, -1])
+    assert torch.allclose(out, torch.full_like(out, prompt_mu("a cat")), atol=1e-3)
+    assert sum(r.committed[0] for r in result.rounds) == 6
+    assert result.target_calls_per_trajectory == (result.target_calls,)

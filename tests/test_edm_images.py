@@ -600,7 +600,11 @@ class TestSharding:
         rounds = meta["metric_totals"]["rounds_per_trajectory"]
         assert len(rounds) == 9
         assert all(1 <= r <= setting.num_steps for r in rounds)
-        isolated = [setting.num_steps / r for r in rounds]
+        calls = meta["metric_totals"]["target_calls_per_trajectory"]
+        assert len(calls) == len(rounds)
+        assert sum(meta["metric_totals"]["target_states_per_trajectory"]) == meta["metric_totals"]["target_states_evaluated"]
+        assert sum(meta["metric_totals"]["batch_sizes"]) == 9
+        isolated = [setting.num_steps / c for c in calls]
         assert meta["mean_isolated_speedup"] == pytest.approx(st.mean(isolated))
         assert meta["std_isolated_speedup"] == pytest.approx(st.stdev(isolated))
         assert meta["sem_isolated_speedup"] == pytest.approx(

@@ -344,14 +344,17 @@ class BatchedSamplingResult:
     num_steps: int
     batch_size: int
     target_calls: int
-    """Batched target calls, i.e. NFEs of wall-clock depth."""
+    """Logical batched target calls; physical model chunks do not add NFEs."""
     target_states_evaluated: int
     drafted_states: int
     rounds_per_trajectory: Tuple[int, ...]
+    target_calls_per_trajectory: Tuple[int, ...] = ()
+    """Logical target calls involving each image, including initialization/refinement."""
+    target_states_per_trajectory: Tuple[int, ...] = ()
 
     @property
     def speedup(self) -> float:
-        """Wall-clock speedup of the batch: ``N / target_calls``.
+        """Logical NFE speedup of the batch: ``N / target_calls``.
 
         This is the number that matters when you generate a batch, and it is
         *not* the mean of the per-trajectory speedups. One batched call serves
@@ -362,10 +365,12 @@ class BatchedSamplingResult:
 
     @property
     def mean_isolated_speedup(self) -> float:
-        """Mean over trajectories of ``N / rounds_i``: what each would have
-        achieved run on its own. The gap to :attr:`speedup` is the straggler
-        cost of sharing a batch."""
-        return sum(self.num_steps / max(r, 1) for r in self.rounds_per_trajectory) / max(
+        """Mean ``N / calls_i``, using direct per-image logical NFE counts.
+
+        The rounds fallback is only for legacy manually constructed results.
+        """
+        calls = self.target_calls_per_trajectory or self.rounds_per_trajectory
+        return sum(self.num_steps / max(r, 1) for r in calls) / max(
             self.batch_size, 1
         )
 

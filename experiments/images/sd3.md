@@ -82,7 +82,7 @@ python experiments/images/run_sd3.py --network stabilityai/stable-diffusion-3.5-
 
 Expect, in order:
 
-- `512px from (16, 64, 64) latents, T=28 (26 speculative + 2 Euler)`;
+- `512px from (16, 64, 64) latents, T=28 (28 sampler transitions, 2 deterministic)`;
 - a `memory:` line showing the CFG doubling, e.g.
   `2 trajectories x |I|=7 = 14 latents per target call, x2 for CFG = 28 rows`;
 - `prompts : ~/coco30k.txt (first 8, noise seed i = 0 + i)`;
@@ -170,3 +170,42 @@ CONFIGS="2,2"` to confirm the launch works before committing.
 Checkpoint interfaces can vary across Diffusers versions. Run the smoke test in step 1 to
 verify the installed pipeline, prompt encoding, transformer interface, and VAE scaling before
 starting a full experiment.
+
+
+## Endpoint handling and logical NFE accounting
+
+The SD3 sampler starts at pure noise `x_0` and handles all `T` transitions,
+including the zero-variance first and final transitions. At a deterministic
+step it commits the target mean; continuation requires exact equality with the
+drafted state and mean. Initializing the delayed drift still costs one target
+call, whose exact root mean is reused during verification. Terminal leaves
+`x_T` are not sent to the target, since there is no transition at step `T`.
+
+One logical batched target evaluation counts as one NFE, regardless of
+`--forward-batch`, classifier-free guidance, or the number of tree nodes.
+`metric_totals` retains rounds and saves `target_calls_per_trajectory`,
+`target_states_per_trajectory`, per-image acceptance/committed counts, and
+`batch_sizes` / `target_calls_per_batch`. Thus per-image speedups `T / C_i`
+and pooled batch speedup `batches * T / sum(C_batch)` can be recomputed later.
+Initialization and refinement are included in these direct call counts.
+Aggregate proposal, refinement and verification call/row counters and exact
+mean reuse counts are also saved.
+For SD3, `speedup` and `end_to_end_speedup` now cover the same full trajectory.
+The legacy field `speculative_steps` equals `T`; `stochastic_steps` records
+only positive-variance transitions.
+
+New SD3 runs carry `endpoint_policy="in_sampler"` and
+`nfe_accounting="logical_calls_per_image_v2"`. The sweep rejects completed
+cells with the older policy: use a new output root when rerunning comparisons.
+Legacy plotting falls back to rounds when direct call counts are absent;
+those historical values do not retroactively include initialization.
+
+D-GRS accepts the same residual-complement options as PAWS:
+
+```bash
+--verifier-options '{"d-grs":{"residual_complement":"nearest_projection"}}'
+```
+
+For `sweep_sd3.sh`, set the same JSON through `VERIFIER_OPTIONS`. Choices are `first` (default),
+`fresh`, and `nearest_projection`. Only the perpendicular Gaussian component
+on rejection changes; acceptance and the scalar residual law are unchanged.

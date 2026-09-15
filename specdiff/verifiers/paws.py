@@ -24,7 +24,7 @@ from scipy.sparse import csr_matrix, eye, hstack, vstack
 
 from ..types import VerifyRequest, VerifyResult
 from ..verify import Verifier, register_verifier
-from .rank1 import Rank1Frame
+from .rank1 import Rank1Frame, RESIDUAL_COMPLEMENTS, residual_complement
 
 RankPolicy = Union[str, Callable[[float, int], Sequence[float]]]
 _LOG_SQRT_2PI = 0.5 * math.log(2.0 * math.pi)
@@ -379,7 +379,7 @@ class RankSelectionCoupling(Verifier):
                  residual_complement: str = "first"):
         if not callable(rank_policy) and rank_policy not in ("optimized", "uniform", "max"):
             raise ValueError("invalid rank_policy")
-        if residual_complement not in ("first", "fresh", "nearest_projection"):
+        if residual_complement not in RESIDUAL_COMPLEMENTS:
             raise ValueError("invalid residual_complement")
         self.rank_policy = rank_policy
         self.residual_complement = residual_complement
@@ -412,11 +412,5 @@ class RankSelectionCoupling(Verifier):
         if (math.log(u) if u > 0 else -math.inf) < log_accept:
             return VerifyResult(request.child(child), True, child, proposals_examined=k)
         s = _residual_cdf(frame.delta, weights).sample(ops.uniform(request.rng))
-        if self.residual_complement == "fresh":
-            noise = ops.randn_stack(1, request.proposal_mean, request.rng)[0]
-            perp = noise - ops.dot(frame.direction, noise) * frame.direction
-        else:
-            j = (min(range(k), key=lambda j: abs(scores[j] - s))
-                 if self.residual_complement == "nearest_projection" else 0)
-            _, perp = frame.project(request.child(j))
+        perp = residual_complement(frame, request, s, self.residual_complement)
         return VerifyResult(frame.reconstruct(s, perp), False, proposals_examined=k)

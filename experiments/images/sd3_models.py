@@ -567,7 +567,7 @@ class Setting:
     schedule: NoiseSchedule
     state_shape: Tuple[int, int, int]
     num_steps: int
-    """Speculative steps -- ``total_steps`` minus the deterministic endpoints."""
+    """All transitions handled by the sampler, including deterministic steps."""
     total_steps: int
     deterministic_steps: Tuple[int, ...]
     sigmas: torch.Tensor
@@ -590,12 +590,7 @@ def build(
 ) -> Setting:
     """Assemble the target, the schedule, and the deterministic-endpoint bookkeeping."""
     if s_noise <= 0.0:
-        # Caught here rather than left to the bookkeeping below, which would
-        # mislead. At s_noise=0 every std is zero, `leading` walks the whole
-        # grid, and the run dies naming *eps* -- which was fine. Negative values
-        # are worse: nothing is exactly zero, so the endpoints look normal and a
-        # negative std reaches TabulatedSchedule, to be refused rounds later,
-        # after the checkpoint has loaded and generation has started.
+        # Reject invalid noise multipliers before building the schedule.
         raise ValueError(
             f"s_noise must be > 0; got {s_noise}. It scales the transition std, "
             "so s_noise=0 makes every step deterministic and a negative value "
@@ -605,34 +600,15 @@ def build(
     std = churn_std_grid(sigmas, eps, s_noise=s_noise)
     zero = tuple(int(n) for n in torch.nonzero(std == 0.0).flatten())
 
-    leading = 0
-    while leading in zero:
-        leading += 1
-    trailing = 0
-    while (num_steps - 1 - trailing) in zero:
-        trailing += 1
-    interior = [n for n in zero if leading <= n < num_steps - trailing]
-    if interior:
-        raise ValueError(
-            f"transition std is zero at interior steps {interior}; speculation "
-            "cannot span a deterministic step (Remark 3)"
-        )
-
-    speculative = num_steps - leading - trailing
-    if speculative < 1:
-        raise ValueError(
-            f"no stochastic steps at eps={eps}, num_steps={num_steps}: every step "
-            "is a deterministic Euler step, so there is nothing to speculate"
-        )
     target = SD3ChurnTarget(
-        denoiser, sigmas, eps, s_noise=s_noise, step_offset=leading,
+        denoiser, sigmas, eps, s_noise=s_noise, step_offset=0,
         forward_batch=forward_batch,
     )
     return Setting(
         target=target,
-        schedule=TabulatedSchedule(std[leading : leading + speculative].tolist()),
+        schedule=TabulatedSchedule(std.tolist()),
         state_shape=denoiser.state_shape,
-        num_steps=speculative,
+        num_steps=num_steps,
         total_steps=num_steps,
         deterministic_steps=zero,
         sigmas=sigmas,
@@ -655,21 +631,15 @@ def euler_steps(target, y, steps, generator) -> torch.Tensor:
 
 
 def sample_trajectory(setting: Setting, sampler, y0, *, rng, generator):
-    """Full ``T``-step trajectory: Euler prologue, speculative middle, Euler epilogue.
+    """Run the complete trajectory from pure noise, including zero-variance steps.
 
-    Returns **latents**, not pixels -- decoding is the caller's, because the VAE
-    peaks higher than the transformer and wants its own chunking.
+    ``generator`` is retained for API compatibility; all sampling randomness
+    is owned by the sampler through ``rng``. Decoding remains the caller's.
     """
-    target, T = setting.target, setting.total_steps
-    lo = target.step_offset
-    hi = lo + setting.num_steps
+    result = sampler.sample(y0, rng=rng)
     single = y0.dim() == len(setting.state_shape)
+    return (result.sample if single else result.samples), result
 
-    y = euler_steps(target, y0[None] if single else y0, range(0, lo), generator)
-    result = sampler.sample(y[0] if single else y, rng=rng)
-    out = result.sample[None] if single else result.samples
-    out = euler_steps(target, out, range(hi, T), generator)
-    return (out[0] if single else out), result
 
 
 def to_uint8(x: torch.Tensor) -> torch.Tensor:

@@ -189,14 +189,16 @@ def test_full_depth_refinement_avoids_final_target_call():
     assert result.target_calls == 2
 
 
-def test_evaluate_leaves_still_needs_the_leaf_target_mean():
+@pytest.mark.parametrize("horizon", [2, 3])
+def test_evaluate_leaves_only_needs_nonterminal_leaf_means(horizon):
     _, sampler = scalar_sampler(
         tree=DraftTree.chain(2), iterations=2, evaluate_leaves=True
     )
+    sampler.num_steps = horizon
     result = sampler.sample(np.zeros(2), rng=np.random.default_rng(1))
     record = result.rounds[0]
-    assert record.verification_target_calls == 1
-    assert record.verification_target_states_evaluated == 1
+    assert record.verification_target_calls == (horizon > 2)
+    assert record.verification_target_states_evaluated == (horizon > 2)
     assert record.verification_target_means_reused == 2
 
 

@@ -254,3 +254,33 @@ def available_verifiers() -> tuple[str, ...]:
 
 
 register_verifier("resample")(ResampleVerifier)
+
+
+def verify_transition(verifier: Verifier, request: VerifyRequest) -> VerifyResult:
+    """Dispatch a stochastic coupling or commit a deterministic target step."""
+    if request.sigma != 0.0:
+        return verifier(request)
+    ops = verifier.backend_for(request)
+    if not ops.is_finite(request.target_mean):
+        raise FloatingPointError("non-finite deterministic target mean")
+    equal = ops.equal_rows(
+        ops.stack_rows([request.proposal_mean, request.child(0)]),
+        ops.stack_rows([request.target_mean, request.target_mean]),
+    )
+    accepted = all(equal)
+    return VerifyResult(
+        state=ops.copy(request.target_mean), accepted=accepted,
+        child_index=0 if accepted else None, proposals_examined=1,
+    )
+
+
+def verify_transitions(verifier: Verifier, request: BatchedVerifyRequest) -> BatchedVerifyResult:
+    """Keep batched verification for positive-variance rows; bypass it at zero."""
+    if all(s > 0.0 for s in request.sigmas):
+        return verifier.verify_batch(request)
+    # Mixed deterministic/stochastic levels arise when trajectories desynchronise.
+    # The scalar verifier contract is mandatory even for batched overrides.
+    ops = request.backend or resolve_backend(request.children)
+    return BatchedVerifyResult.from_rows(
+        [verify_transition(verifier, request.row(i)) for i in range(request.batch_size)], ops
+    )

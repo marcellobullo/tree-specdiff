@@ -20,7 +20,8 @@ the target mean of each level's parent is needed *sequentially* -- you cannot
 know which parent to evaluate until the level above has been verified -- so a
 faithful lazy sampler would spend ``L`` calls per round instead of one, which is
 the behavior Algorithm 3 avoids. This module evaluates on demand and counts one
-call per round, which is valid for NFE accounting but not wall-clock estimates.
+verification call per round when uncached rows remain, which is valid for logical
+NFE accounting but not wall-clock estimates.
 
 Two consequences follow:
 
@@ -49,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from specdiff import VerifyRequest, create_verifier  # noqa: E402
 from experiments.verifier_config import configured_verifier
 from specdiff.ops import resolve_backend  # noqa: E402
+from specdiff.verify import verify_transition
 
 
 def verification_budget(K: int, depth: int, evaluate_leaves: bool = False) -> int:
@@ -103,14 +105,15 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
             drift = target.freeze_drift(state[None], root_mean, (n,))[0]
             calls += 1
             rows += 1
-            known_root_mean = None
+            known_root_mean = root_mean[0]
 
         # --- Phase 2, as one call. The rows are what the eager sampler would
         # --- have evaluated; here they are computed on demand below.
-        calls += 1
-        rows += verification_budget(K, lookahead, evaluate_leaves)
-        if known_root_mean is not None:
-            rows -= 1  # the exact-root optimisation
+        verification_rows = verification_budget(
+            K, lookahead, evaluate_leaves and n + lookahead < N,
+        ) - int(known_root_mean is not None)
+        calls += int(verification_rows > 0)
+        rows += verification_rows
 
         # --- Phase 3: descend, drafting one level at a time
         parent, parent_mean = state, known_root_mean
@@ -125,12 +128,13 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
         for level in range(1, lookahead + 1):
             step = n + level - 1
             sigma = schedule(step)
-            proposal_mean = target.apply_drift(drift[None], parent[None], (step,))[0]
+            proposal_mean = (parent_mean if level == 1 and parent_mean is not None else
+                             target.apply_drift(drift[None], parent[None], (step,))[0])
             if parent_mean is None:
                 parent_mean = target.means((0,), parent[None], (step,))[0]
 
             children = proposal_mean + sigma * ops.randn_stack(K, init, rng)
-            result = verifier(VerifyRequest(
+            result = verify_transition(verifier, VerifyRequest(
                 step=step, proposal_mean=proposal_mean, target_mean=parent_mean,
                 sigma=sigma, children=children, parent_state=parent, rng=rng,
                 info={"level": level},
@@ -149,7 +153,7 @@ def simulate(setting, rule, K, L, init, rng, *, prefetch="nearest",
             drift = target.freeze_drift(
                 verified_parent[None], verified_mean[None], (n + committed - 1,)
             )[0]
-        elif prefetch == "nearest":
+        elif prefetch == "nearest" and n + committed < N:
             drift, known_root_mean = _prefetch_nearest(
                 ops, target, state, verified_parent, verified_mean, verified_children,
                 n, committed, lookahead, rejected, evaluate_leaves,

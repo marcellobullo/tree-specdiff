@@ -1,9 +1,9 @@
 """Tests for Algorithm 2, diffusion greedy rejection sampling. `python tests/test_dgrs.py`.
 
 Same four obligations as `test_rmc.py`, plus the two that only exist once `K > 1`:
-the sweep must respect drafting order, and the residual branch must carry
-`Z_perp,1` rather than the last child's. Both produce samples that look Gaussian
-and are drawn from the wrong distribution.
+the sweep must respect drafting order, and the default residual branch must
+carry `Z_perp,1`. Configurable residual complements must preserve the joint
+Gaussian target law.
 
 The acceptance probability is checked against Theorem 2 rather than a constant,
 and the residual sampler is tested on its own, since inverting eq. (13) by
@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -308,3 +309,37 @@ if __name__ == "__main__":
         fn()
         print(f"ok  {fn.__name__}")
     print(f"\n{len(fns)} passed")
+
+
+@pytest.mark.parametrize("mode", ["first", "fresh", "nearest_projection"])
+def test_configurable_residual_joint_law(mode):
+    from scipy.stats import kstest
+    from experiments.verifier_config import configured_verifier
+
+    rule = configured_verifier("d-grs", {"d-grs": {"residual_complement": mode}})
+    rng = np.random.default_rng(91)
+    outputs, residuals = [], 0
+    for _ in range(1800):
+        request = _request(2., rng, dim=3, sigma=1.)
+        frame = Rank1Frame.from_request(request)
+        result = rule(request)
+        if not result.accepted:
+            residuals += 1
+            s, perp = frame.project(result.state)
+            projections = [frame.project(request.child(j)) for j in range(request.num_children)]
+            if mode == "nearest_projection":
+                j = min(range(request.num_children), key=lambda j: abs(projections[j][0] - s))
+                assert np.allclose(perp, projections[j][1], atol=1e-12, rtol=0)
+            elif mode == "fresh":
+                assert all(not np.array_equal(perp, p) for _, p in projections)
+        outputs.append(result.state - request.target_mean)
+    x = np.array(outputs)
+    assert residuals > 100
+    assert all(kstest(x[:, j], "norm").statistic < .055 for j in range(3))
+    assert np.max(np.abs(np.cov(x.T) - np.eye(3))) < .13
+    assert kstest(x.sum(axis=1) / np.sqrt(3), "norm").statistic < .055
+
+
+def test_invalid_residual_complement():
+    with pytest.raises(ValueError, match="residual_complement"):
+        GreedyRejectionSampling(residual_complement="nearest_vector")

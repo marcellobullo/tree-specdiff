@@ -25,7 +25,7 @@ from .refinement import (
 )
 from .trees import ROOT, DraftTree
 from .types import RoundRecord, SamplingResult, VerifyRequest, VerifyResult
-from .verify import CheckedVerifier, Verifier
+from .verify import CheckedVerifier, Verifier, verify_transition
 
 Array = Any
 RoundCallback = Callable[[RoundRecord], None]
@@ -200,6 +200,12 @@ class SpeculativeSampler:
 
         # One image is batch_size = 1: every entry belongs to image 0.
         self.proposal.on_round_start((0,), (n,), ops.stack_rows([root_state]))
+        for cached_root in self.proposal.exact_target_means():
+            if reusable_exact_target_mean(
+                cached_root, target=self.target, index_in_batch=0,
+                step=n, state=root_state, ops=ops,
+            ) is not None:
+                self._exact_root_mean = cached_root
 
         # ---------------------------------------------------- Phase 1: drafting
         # lines 5-9. Sequential in depth (a child cannot precede its parent),
@@ -263,6 +269,8 @@ class SpeculativeSampler:
             )
         else:
             requested = internal
+        # A terminal leaf is x_N: there is no target transition at step N.
+        requested = tuple(u for u in requested if n + tree.depth_of(u) < self.num_steps)
         has_mean = set(requested)
 
         cached = reusable_target_rows(
@@ -331,7 +339,7 @@ class SpeculativeSampler:
                 backend=ops,
                 info={"level": level, "node": u},
             )
-            result: VerifyResult = self.verifier(request)
+            result: VerifyResult = verify_transition(self.verifier, request)
             ops.put(trajectory, [n + level], result.state[None])
             committed += 1
             examined.append(result.proposals_examined)
@@ -358,7 +366,7 @@ class SpeculativeSampler:
                 break
             u = children[result.child_index]  # line 22
 
-        if self.prefetch == "nearest" and committed:
+        if self.prefetch == "nearest" and committed and n + committed < self.num_steps:
             self._prefetch_nearest(
                 ops, tree, n, states, target_means, has_mean,
                 last_parent, last_children, last_committed, u, rejected,

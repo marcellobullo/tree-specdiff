@@ -44,7 +44,7 @@ CACHE_ENCODED_PROMPTS="${CACHE_ENCODED_PROMPTS-$REPO/results/sd3/_prompt_cache}"
 #MIN_FREE_MIB="${MIN_FREE_MIB:-24000}"
 MIN_FREE_MIB="${MIN_FREE_MIB:-10000}"
 
-CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 6,2 7,2 8,2 9,2 10,2 2,3 3,3 4,3 5,3 6,3 7,3 8,3 9,3 10,3}"
+CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 6,2 7,2 2,3 3,3 4,3 5,3 6,3}"
 RULES="${RULES-d-grs rmc paws}"
 MATCH="${MATCH:-verification}"
 # Sampler options, S_noise and the timestep shift: protocol that does not appear
@@ -77,7 +77,7 @@ avail="$(grep -c . "$PROMPTS")"
 mkdir -p "$OUT_ROOT" || fail "cannot write $OUT_ROOT"
 
 NUM_PROC="$(awk -F, '{print NF}' <<< "$GPUS")"
-SPEC_STEPS=$(( NUM_STEPS - 2 ))
+SPEC_STEPS=$NUM_STEPS
 
 busy=""
 for g in ${GPUS//,/ }; do
@@ -94,7 +94,7 @@ cd "$REPO"
 log "output   : $OUT_ROOT"
 log "network  : $NETWORK"
 log "prompts  : $PROMPTS (first $NUM_SAMPLES of $avail, noise seed i = $SEED + i)"
-log "sampling : $NUM_SAMPLES samples, T=$NUM_STEPS ($SPEC_STEPS speculative), eps=$EPS"
+log "sampling : $NUM_SAMPLES samples, T=$NUM_STEPS ($SPEC_STEPS sampler transitions), eps=$EPS"
 log "sd3      : cfg=$GUIDANCE  ${RESOLUTION}px  $DTYPE  shift=$SHIFT"
 log "encode   : ${ENCODE_DEVICE:-with the transformer}  cache ${CACHE_ENCODED_PROMPTS:-off}"
 log "gpus     : $GPUS ($NUM_PROC processes)"
@@ -106,7 +106,9 @@ sys.path.insert(0, str(Path.cwd() / "experiments"))
 from images.run_common import load_sampler_config          # noqa: E402
 from experiments.verifier_config import parse_verifier_options
 
-print(json.dumps({"verifier_options": parse_verifier_options(sys.argv[4]),
+print(json.dumps({"endpoint_policy": "in_sampler",
+                  "nfe_accounting": "logical_calls_per_image_v2",
+                  "verifier_options": parse_verifier_options(sys.argv[4]),
                   "sampler": load_sampler_config(sys.argv[1] or None),
                   "s_noise": float(sys.argv[2]),
                   "shift": float(sys.argv[3])}, sort_keys=True))
@@ -158,6 +160,8 @@ meta = json.load(open(sys.argv[1]))
 # shift at the pipeline's 3.0. Naming all three lets an older grid be continued
 # deliberately rather than by accident.
 print(json.dumps({
+    "endpoint_policy": meta.get("endpoint_policy", "split"),
+    "nfe_accounting": meta.get("nfe_accounting", "rounds_v1"),
     "sampler": meta.get("sampler", {"evaluate_leaves": False,
                                     "prefetch": "parent"}),
     "s_noise": meta.get("s_noise", 1.0),
@@ -171,7 +175,7 @@ PY
          it has  : $was
          this run: $POLICY_RESOLVED
        Either delete the cell to regenerate it under this run's settings, or
-       set VERIFIER_OPTIONS / SAMPLER_CONFIG / S_NOISE / SHIFT to the ones it already has."
+       use a new OUT_ROOT for a different endpoint/accounting policy, or match the saved settings."
     fi
     log "skip $rn K=$K L=$L (already done)"; return 0
   fi

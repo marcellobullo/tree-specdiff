@@ -41,7 +41,8 @@ band
     a `max` over its trajectories and are one number per run.
 
     `--over images` uses the per-image NFE counts `r_i` that `run_edm.py`
-    records in `metric_totals.rounds_per_trajectory`, so one run carries its
+    records in `metric_totals.target_calls_per_trajectory` (legacy files fall
+    back to `rounds_per_trajectory`), so one run carries its
     own band. Defined for `mean_isolated_speedup` alone, the one reported
     metric that is a mean over images: the plotted mean is unchanged and only
     the band appears. Runs generated before that field existed have to be
@@ -161,6 +162,8 @@ def load(root: Path, pattern: str = "*") -> list[dict]:
             "acceptance_rate": meta.get("acceptance_rate"),
             "occupancy": meta.get("occupancy"),
             "speculative_steps": meta.get("speculative_steps"),
+            "calls": list(meta.get("metric_totals", {}).get(
+                "target_calls_per_trajectory", ()) or ()),
             "rounds": list(meta.get("metric_totals", {}).get(
                 "rounds_per_trajectory", ()) or ()),
         }
@@ -201,7 +204,7 @@ def summarise(rows: list[dict], metric: str, x: str, over: str = "runs",
     out = []
     for (dataset, eps, method, budget, lookahead), members in sorted(groups.items()):
         if over == "images":
-            blank = [m for m in members if not m["rounds"]]
+            blank = [m for m in members if not (m.get("calls") or m["rounds"])]
             if blank:
                 raise SystemExit(
                     f"{blank[0]['run']}/{blank[0]['cell']}/{blank[0]['rule']}: meta.json "
@@ -209,7 +212,7 @@ def summarise(rows: list[dict], metric: str, x: str, over: str = "runs",
                     f"per-image spread. Regenerate the run, or use --over runs."
                 )
             term = PER_IMAGE[metric]
-            values = [term(m["speculative_steps"], r) for m in members for r in m["rounds"]]
+            values = [term(m["speculative_steps"], r) for m in members for r in (m.get("calls") or m["rounds"])]
         else:
             values = [m[metric] for m in members]
         std = st.stdev(values) if len(values) > 1 else 0.0

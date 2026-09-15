@@ -48,7 +48,7 @@ from .types import (
     BatchedVerifyRequest,
     BatchedVerifyResult,
 )
-from .verify import CheckedVerifier, Verifier
+from .verify import CheckedVerifier, Verifier, verify_transitions
 
 Array = Any
 
@@ -131,7 +131,7 @@ class BatchedSpeculativeSampler:
         self.evaluate_leaves = bool(evaluate_leaves)
         self._check_root_mean = bool(check_contract)
         # batch index -> that row's root target mean, carried from the previous
-        # round's committed leaf. Only ever populated under nearest + leaves.
+        # round's committed leaf, or supplied by proposal initialization.
         self._exact_root_means: dict = {}
         self._evaluated_cache: dict = {}
         self._backend = backend
@@ -197,6 +197,13 @@ class BatchedSpeculativeSampler:
             ops.put(states, [r * size + ROOT for r in range(len(active))], roots)
 
             self.proposal.on_round_start(active, [steps_done[i] for i in active], roots)
+            for cached_root in self.proposal.exact_target_means():
+                i = cached_root.index_in_batch
+                if i in active and reusable_exact_target_mean(
+                    cached_root, target=self.target, index_in_batch=i,
+                    step=steps_done[i], state=current[i], ops=ops,
+                ) is not None:
+                    self._exact_root_means[i] = cached_root
 
             drafted = self._draft(
                 active, lookaheads, states, proposal_means, scaled_innovations,
@@ -296,6 +303,8 @@ class BatchedSpeculativeSampler:
             target_states_evaluated=self.target.num_states,
             drafted_states=drafted_total,
             rounds_per_trajectory=tuple(rounds_per_traj),
+            target_calls_per_trajectory=tuple(self.target.calls_per_image[i] for i in range(batch)),
+            target_states_per_trajectory=tuple(self.target.states_per_image[i] for i in range(batch)),
         )
 
     # ------------------------------------------------------------ phase 1
@@ -423,8 +432,10 @@ class BatchedSpeculativeSampler:
         has_mean = []
         for r, lookahead in enumerate(lookaheads):
             known_root = self._exact_root_means.pop(active[r], None)
-            nodes, node_set = self._evaluated_nodes(lookahead)
-            has_mean.append(node_set)
+            nodes, _ = self._evaluated_nodes(lookahead)
+            nodes = tuple(u for u in nodes
+                          if steps_done[active[r]] + self.tree.depth_of(u) < self.num_steps)
+            has_mean.append(frozenset(nodes))
             for u in nodes:
                 flat_id = r * size + u
                 step = steps_done[active[r]] + self.tree.depth_of(u)
@@ -523,7 +534,7 @@ class BatchedSpeculativeSampler:
                 # BatchedVerifyRequest.row() turns it back into info["node"].
                 info={"level": level, "nodes": tuple(cursor[r] for r in rows)},
             )
-            result: BatchedVerifyResult = self.verifier.verify_batch(request)
+            result: BatchedVerifyResult = verify_transitions(self.verifier, request)
 
             # commit one state per live row
             ops.put(current, [active[r] for r in rows], result.states)
@@ -586,7 +597,7 @@ class BatchedSpeculativeSampler:
         size = self.tree.size
         indices, steps, chosen = [], [], []
         for r in range(len(active)):
-            if not committed[r]:
+            if not committed[r] or steps_done[active[r]] + committed[r] >= self.num_steps:
                 continue
             n = steps_done[active[r]]
             parent = last_parent[r]
