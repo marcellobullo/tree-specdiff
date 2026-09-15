@@ -1,6 +1,6 @@
-# specdiff
+# tree-specdiff
 
-Algorithm 3 of *Accelerating Diffusion Sampling via Speculative Draft Trees*: speculative
+Algorithm 1 of *Accelerating Diffusion Sampling via Speculative Draft Trees*: speculative
 diffusion sampling over an arbitrary draft tree, with a pluggable verification rule.
 
 The implementation follows the paper's central abstraction: RMC and D-GRS differ in the
