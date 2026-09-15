@@ -35,7 +35,9 @@ from .refinement import (
     RefinementRequest,
     RefinementUpdate,
     RefinementUpdateFn,
+    picard_broyden_correction_update_fn,
     picard_drift_update_fn,
+    picard_jtx_update_fn,
     picard_update_fn,
 )
 from .sampler import SpeculativeSampler, standard_sampler
@@ -109,7 +111,9 @@ __all__ = [
     "RefinementUpdate",
     "RefinementUpdateFn",
     "picard_update_fn",
+    "picard_broyden_correction_update_fn",
     "picard_drift_update_fn",
+    "picard_jtx_update_fn",
     # contract types
     "VerifyRequest",
     "VerifyResult",

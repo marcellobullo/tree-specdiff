@@ -23,9 +23,16 @@ result = sampler.sample(y0, rng=rng)
 print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ```
 
-Set `proposal_refinement_iters=J` to run `J` target-backed Picard sweeps after
+Set `proposal_refinement_iters=J` to run up to `J` target-backed Picard sweeps after
 the initial draft and before verification. Sweeps freeze only the target's drift by
-default (`picard_drift_update_fn`); `picard_update_fn` freezes the whole increment. See
+default (`picard_drift_update_fn`); `picard_update_fn` freezes the whole increment
+and matches the reference ParaDiGMS recurrence on a chain with matching inputs.
+Neither update universally dominates the other. The sweep count is capped at the
+actual lookahead each round (the longest active lookahead for batched sampling).
+Use `refinement_update_fn=picard_jtx_update_fn` for JTX, which transports the
+target-minus-base-proposal error to the rebuilt parent. For a limited-memory
+secant correction, use `picard_broyden_correction_update_fn` (default: at most two
+rank-one factors per parent; history resets each round). See
 [Proposal refinement](docs/refinement.md) for the derivations: recurrence, conditional
 Gaussian law, finite-depth convergence, mismatch and error propagation, and target-mean reuse.
 
@@ -118,7 +125,7 @@ examples/    gaussian_mixture.py
 | `specdiff/batched.py` | the same, over many trajectories per target call |
 | `specdiff/trees.py` | draft topologies, layers, internal nodes, truncation `T|_m` |
 | `specdiff/kernels.py` | `TargetTransition`, `ProposalTransition`, noise schedules, delayed drift |
-| `specdiff/refinement.py` | row-local refinement contract, tree scan, fixed-noise Picard updates (frozen drift, whole increment), exact target cache |
+| `specdiff/refinement.py` | row-local refinement contract, tree scan, fixed-noise updates (drift, increment, JTX, Broyden), exact target cache |
 | `specdiff/verify.py` | the `Verifier` contract, contract checker, name registry |
 | `specdiff/types.py` | `VerifyRequest`/`VerifyResult` and the run records |
 | `specdiff/verifiers/rank1.py` | the rank-1 reduction (eqs. 8–11), shared by any isotropic rule |

@@ -11,6 +11,7 @@ from specdiff import (
     DraftTree,
     DelayedDriftProposal,
     IdentityProposal,
+    ProposalTransition,
     RefinementUpdate,
     ReflectionMaximalCoupling,
     SpeculativeSampler,
@@ -18,6 +19,7 @@ from specdiff import (
     Verifier,
     VerifyResult,
     picard_drift_update_fn,
+    picard_jtx_update_fn,
     picard_update_fn,
 )
 
@@ -89,12 +91,12 @@ class AcceptFirst(Verifier):
         )
 
 
-def scalar_sampler(*, target=None, tree=None, iterations=None, callback=None, **kwargs):
+def scalar_sampler(*, target=None, proposal=None, tree=None, iterations=None, callback=None, **kwargs):
     target = target or AffineTarget()
     tree = tree or DraftTree.chain(3)
     return target, SpeculativeSampler(
         target=target,
-        proposal=IdentityProposal(),
+        proposal=proposal or IdentityProposal(),
         schedule=ConstantSchedule(0.2),
         tree=tree,
         verifier=AcceptFirst(),
@@ -250,7 +252,8 @@ def test_false_exact_target_cache_is_detected_in_contract_mode():
 
 @pytest.mark.parametrize(
     "target_type, callback",
-    [(AffineTarget, None), (VelocitySplitTarget, picard_drift_update_fn)],
+    [(AffineTarget, None), (VelocitySplitTarget, picard_drift_update_fn),
+     (VelocitySplitTarget, picard_jtx_update_fn)],
 )
 def test_batch_of_one_matches_scalar_with_refinement(target_type, callback):
     common = dict(
@@ -330,7 +333,7 @@ def test_proposal_owned_target_accounting_is_complete(prefetch):
         assert [record.proposal_target_calls for record in result.rounds] == [1, 0]
 
 
-@pytest.mark.parametrize("callback", [None, picard_drift_update_fn])
+@pytest.mark.parametrize("callback", [None, picard_drift_update_fn, picard_jtx_update_fn])
 def test_torch_refinement_and_exact_cache_reuse(callback):
     torch = pytest.importorskip("torch")
 
@@ -416,7 +419,8 @@ def test_mixed_batched_lookaheads_use_one_final_call_if_any_row_needs_it():
         assert record.verification_target_calls == int(needs_final)
 
 
-def test_refined_rmc_preserves_affine_target_law():
+@pytest.mark.parametrize("callback", [None, picard_jtx_update_fn])
+def test_refined_rmc_preserves_affine_target_law(callback):
     a, shift, sigma, num_steps = 0.7, 0.15, 0.3, 3
     target = AffineTarget(a=a, shift=shift)
     sampler = SpeculativeSampler(
@@ -427,6 +431,7 @@ def test_refined_rmc_preserves_affine_target_law():
         verifier=ReflectionMaximalCoupling(),
         num_steps=num_steps,
         proposal_refinement_iters=1,
+        refinement_update_fn=callback,
     )
     rng = np.random.default_rng(21)
     samples = np.asarray([
@@ -591,3 +596,215 @@ def test_refined_rmc_with_drift_update_preserves_target_law():
     standard_error = np.sqrt(variance / len(samples))
     assert abs(samples.mean() - mean) < 5 * standard_error
     assert abs(samples.var() / variance - 1.0) < 0.1
+
+
+class NonlinearBaseProposal(ProposalTransition):
+    """A row-local draft whose nonlinear part must see the rebuilt parent."""
+
+    def means(self, indices_in_batch, states, steps):
+        offsets = np.asarray([
+            0.07 * (step + 1) + 0.03 * index
+            for index, step in zip(indices_in_batch, steps)
+        ], dtype=states.dtype)
+        shape = (len(steps),) + (1,) * (states.ndim - 1)
+        return 0.4 * states + 0.2 * np.sin(states) + offsets.reshape(shape)
+
+
+@pytest.mark.parametrize("iterations", [0, 1, 2, 4, 6])
+def test_jtx_matches_pdf_recurrence_on_every_edge(iterations):
+    from dataclasses import replace
+    from specdiff.ops import resolve_backend
+    from specdiff.refinement import refine_tree, reusable_target_rows
+
+    # Uneven sibling counts and depth four, with image-shaped states.
+    tree = DraftTree((-1, 0, 0, 1, 2, 2, 3, 6))
+    target = VelocitySplitTarget()
+    proposal = NonlinearBaseProposal()
+    _, sampler = scalar_sampler(target=target, tree=tree)
+    layout = sampler._refinement_layout(tree, 3)
+    layout = replace(layout, indices_in_batch=(4,) * len(layout.internal_ids))
+    root = np.asarray([[0.3, -0.4], [0.6, 0.2]])
+    ops = resolve_backend(root)
+    noise = 0.2 * np.random.default_rng(17).standard_normal((tree.size, *root.shape))
+    noise[0] = 0
+    states = np.zeros_like(noise)
+    states[0] = root
+    means = np.zeros_like(noise)
+
+    def base(x, step):
+        return proposal.means((4,), x[None], (step,))[0]
+
+    def exact(x, step):
+        return target.means((4,), x[None], (step,))[0]
+
+    # Initial proposal, eq. (2).
+    for level in layout.levels:
+        for u, pos in zip(level.parent_ids, level.parent_positions):
+            means[u] = base(states[u], layout.steps[pos])
+            for v in tree.children(u):
+                states[v] = means[u] + noise[v]
+    expected = states.copy()
+    expected_means = means.copy()
+    for _ in range(iterations):
+        old = expected.copy()
+        # Direct p(new) + [q(old) - p(old)], eqs. (3)-(4).
+        # In particular, do not subtract the previous corrected mean.
+        for level in layout.levels:
+            for u, pos in zip(level.parent_ids, level.parent_positions):
+                step = layout.steps[pos]
+                error = exact(old[u], step) - base(old[u], step)
+                expected_means[u] = base(expected[u], step) + error
+                for v in tree.children(u):
+                    expected[v] = expected_means[u] + noise[v]
+
+    original_noise = noise.copy()
+    cache = refine_tree(
+        states=states, proposal_means=means, scaled_innovations=noise,
+        layout=layout, iterations=iterations, update_fn=picard_jtx_update_fn,
+        target=target, proposal=proposal, ops=ops,
+    )
+    np.testing.assert_allclose(states, expected, rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(means, expected_means, rtol=1e-13, atol=1e-13)
+    np.testing.assert_array_equal(noise, original_noise)
+    np.testing.assert_array_equal(states[0], root)
+    assert target.num_calls == iterations
+    assert target.num_states == iterations * len(layout.internal_ids)
+    reused = reusable_target_rows(cache, target=target, final_states=states, ops=ops)
+    if iterations == 0:
+        assert cache is None
+    elif iterations >= tree.depth:
+        assert len(reused) == len(layout.internal_ids)
+        for u, step in zip(layout.internal_ids, layout.steps):
+            np.testing.assert_array_equal(means[u], exact(states[u], step))
+    else:
+        assert 0 < len(reused) < len(layout.internal_ids)
+
+
+@pytest.mark.parametrize("iterations", [1, 2, 3])
+def test_jtx_verifier_receives_corrected_means_and_final_target(iterations):
+    target = VelocitySplitTarget()
+    verifier = AcceptFirst()
+    _, sampler = scalar_sampler(
+        target=target, proposal=NonlinearBaseProposal(), iterations=iterations,
+        callback=picard_jtx_update_fn, check_contract=True,
+    )
+    sampler.verifier = verifier
+    root = np.asarray([0.3, -0.4])
+    result = sampler.sample(root, rng=np.random.default_rng(7))
+    noise = 0.2 * np.random.default_rng(7).standard_normal((3, 2))
+    for depth, request in enumerate(verifier.requests):
+        np.testing.assert_allclose(request.child(0), request.proposal_mean + noise[depth])
+        expected_target = target.means((0,), result.trajectory[depth][None], (depth,))[0]
+        np.testing.assert_array_equal(request.target_mean, expected_target)
+        if depth < iterations:
+            np.testing.assert_array_equal(request.proposal_mean, request.target_mean)
+    record = result.rounds[0]
+    assert record.refinement_target_calls == iterations
+    assert record.verification_target_means_reused == iterations
+    assert record.verification_target_states_evaluated == 3 - iterations
+
+
+@pytest.mark.parametrize("prefetch", ["none", "nearest"])
+def test_jtx_delayed_drift_matches_frozen_drift_across_rounds(prefetch):
+    results = []
+    for callback in (picard_drift_update_fn, picard_jtx_update_fn):
+        target = VelocitySplitTarget()
+        sampler = BatchedSpeculativeSampler(
+            target=target, proposal=DelayedDriftProposal(target),
+            schedule=ConstantSchedule(0.2), tree=DraftTree.chain(3),
+            verifier=ReflectionMaximalCoupling(), num_steps=7,
+            proposal_refinement_iters=2, refinement_update_fn=callback,
+            prefetch=prefetch, keep_trajectories=True, check_contract=True,
+        )
+        results.append(sampler.sample(np.zeros((3, 2)), rng=np.random.default_rng(19)))
+    for a, b in zip(results[0].trajectories, results[1].trajectories):
+        np.testing.assert_allclose(a, b, rtol=1e-13, atol=1e-13)
+    assert results[0].target_calls == results[1].target_calls
+    assert results[0].target_states_evaluated == results[1].target_states_evaluated
+
+
+def test_jtx_update_requires_proposal_and_exclusive_snapshot_means():
+    from specdiff import RefinementRequest
+    from specdiff.ops import resolve_backend
+
+    zeros = np.zeros((2, 1))
+    with pytest.raises(TypeError, match="exact_target_means"):
+        RefinementUpdate(base_proposal_means=zeros)
+    for field in ("increments", "drifts"):
+        with pytest.raises(TypeError, match="exactly one"):
+            RefinementUpdate(
+                base_proposal_means=zeros, exact_target_means=zeros, **{field: zeros}
+            )
+    request = RefinementRequest(
+        iteration=0, indices_in_batch=(0, 0), nodes=(0, 1), steps=(0, 1),
+        parent_states=zeros, current_proposal_means=zeros, sigmas=(0.2, 0.2),
+        target=AffineTarget(), backend=resolve_backend(zeros),
+    )
+    with pytest.raises(ValueError, match="base proposal"):
+        picard_jtx_update_fn(request)
+
+
+@pytest.mark.parametrize("kind", ["snapshot_shape", "snapshot_nonfinite", "rebuilt_shape", "rebuilt_nonfinite"])
+def test_jtx_rejects_malformed_base_proposal_means(kind):
+    class BadProposal(NonlinearBaseProposal):
+        corrupt = False
+
+        def means(self, indices_in_batch, states, steps):
+            out = super().means(indices_in_batch, states, steps)
+            if self.corrupt:
+                if kind.endswith("shape"):
+                    return out[..., :1]
+                out[..., 0] = np.nan
+            return out
+
+    proposal = BadProposal()
+
+    def update(request):
+        proposal.corrupt = kind.startswith("snapshot")
+        result = picard_jtx_update_fn(request)
+        proposal.corrupt = kind.startswith("rebuilt")
+        return result
+
+    _, sampler = scalar_sampler(proposal=proposal, iterations=1, callback=update)
+    with pytest.raises(ValueError, match="base proposal means"):
+        sampler.sample(np.zeros(2), rng=np.random.default_rng(1))
+
+
+@pytest.mark.parametrize("callback", [picard_update_fn, picard_drift_update_fn, picard_jtx_update_fn])
+@pytest.mark.parametrize("batched", [False, True])
+def test_refinement_sweeps_are_capped_by_actual_lookahead(callback, batched):
+    target = VelocitySplitTarget()
+    sampler_type = BatchedSpeculativeSampler if batched else SpeculativeSampler
+    sampler = sampler_type(
+        target=target, proposal=IdentityProposal(), schedule=ConstantSchedule(0.2),
+        tree=DraftTree.chain(3), verifier=AcceptFirst(), num_steps=4,
+        proposal_refinement_iters=5, refinement_update_fn=callback,
+    )
+    root = np.zeros((1, 2)) if batched else np.zeros(2)
+    result = sampler.sample(root, rng=np.random.default_rng(42))
+    assert sampler.proposal_refinement_iters == 5
+    assert [r.refinement_iters for r in result.rounds] == [3, 1]
+    assert [r.refinement_target_calls for r in result.rounds] == [3, 1]
+    assert [r.refinement_target_states_evaluated for r in result.rounds] == [9, 1]
+    assert result.target_calls == 4
+
+
+def test_batched_sweep_cap_keeps_enough_iterations_for_longer_live_trees():
+    class StaggeredVerifier(Verifier):
+        max_children = 1
+
+        def verify(self, request):
+            if request.index_in_batch == 0:
+                return VerifyResult(request.child(0), accepted=True, child_index=0)
+            return VerifyResult(request.target_mean, accepted=False)
+
+    sampler = BatchedSpeculativeSampler(
+        target=VelocitySplitTarget(), proposal=IdentityProposal(),
+        schedule=ConstantSchedule(0.2), tree=DraftTree.chain(3),
+        verifier=StaggeredVerifier(), num_steps=5,
+        proposal_refinement_iters=3, refinement_update_fn=picard_jtx_update_fn,
+    )
+    result = sampler.sample(np.zeros((2, 2)), rng=np.random.default_rng(42))
+    assert result.rounds[1].start_steps == (3, 1)
+    assert [r.refinement_iters for r in result.rounds] == [3, 3, 3, 2, 1]
+    assert [r.refinement_target_calls for r in result.rounds] == [3, 3, 3, 2, 1]

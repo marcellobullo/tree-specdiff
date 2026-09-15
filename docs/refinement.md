@@ -14,22 +14,43 @@ sampler = SpeculativeSampler(
     tree=tree,
     verifier=verifier,
     num_steps=N,
-    proposal_refinement_iters=2,  # J sweeps per round
+    proposal_refinement_iters=2,  # at most J sweeps per round
 )
 ```
 
+The requested sweep count is capped at the actual lookahead each round:
+`min(J, tree.depth, num_steps - start_step)`. Batched sampling caps the shared
+sweep count at the longest active lookahead, so longer live trees still receive
+all needed sweeps. Round records report the actual `refinement_iters` executed.
+This cap applies to all refinement callbacks.
+
 `BatchedSpeculativeSampler` accepts the same arguments. Positive iteration counts use
-`picard_drift_update_fn`, which freezes only the target's drift ([§3](#3-the-two-built-in-updates)).
+`picard_drift_update_fn`, which freezes only the target's drift ([§3](#3-the-built-in-updates)).
 Pass `refinement_update_fn=picard_update_fn` to freeze the whole increment $m-x$ instead. That was
-the default before, and it reproduces earlier runs. The GM Picard sweep exposes the same choice as
-`--picard-update {drift,increment}`.
+the default before, and it retains the update used in earlier runs. The GM Picard sweep exposes the same choice as
+`--picard-update {drift,increment,jtx,broyden}`. Use `refinement_update_fn=picard_jtx_update_fn`
+for the JTX mean-error update from *JTX: iterative mean-error refinement*
+(12 September 2026), equations (3)–(4):
+
+```python
+from specdiff import SpeculativeSampler, picard_jtx_update_fn
+
+sampler = SpeculativeSampler(
+    target=target, proposal=proposal, schedule=schedule, tree=tree,
+    verifier=verifier, num_steps=N,
+    proposal_refinement_iters=2,
+    refinement_update_fn=picard_jtx_update_fn,
+)
+```
+
+The callback also works with `BatchedSpeculativeSampler`.
 
 This page derives everything the implementation relies on:
 
 1. [Setting and notation](#1-setting-and-notation)
 2. [Picard sweeps as a split of the target mean](#2-picard-sweeps-as-a-split-of-the-target-mean)
-3. [The two built-in updates](#3-the-two-built-in-updates)
-4. [Path-sum form](#4-path-sum-form)
+3. [The built-in updates](#3-the-built-in-updates)
+4. [Path-sum form](#4-path-sum-form), including [ParaDiGMS and Appendix B](#relationship-to-paradigms-and-appendix-b)
 5. [Conditional proposal law and exactness](#5-conditional-proposal-law-and-exactness)
 6. [Finite-depth propagation](#6-finite-depth-propagation)
 7. [Mismatch at verification](#7-mismatch-at-verification)
@@ -93,15 +114,16 @@ X_r^{(j+1)}=Y_n,
 X_v^{(j+1)}=\widetilde\mu_u^{(j+1)}+\eta_v .
 $$
 
-The update map $\mathcal M_s(\text{snapshot};\,\text{anchor})$ is where updates differ. The only
-requirement is consistency on the diagonal:
+The update map $\mathcal M_s(\text{snapshot};\,\text{anchor})$ is where updates differ.
+For finite-depth propagation, the update must be consistent on the diagonal
+(row locality is additionally required for the proposal law in §5):
 
 $$
 \mathcal M_s(x;\,x)=m^q_s(x)\quad\text{for every }x.
 \qquad\text{(C)}
 $$
 
-Both built-in updates have the form
+The increment and frozen-drift updates have the form
 
 $$
 \mathcal M_s(y;\,x)=\operatorname{apply}_s\big(D_s(y),\,x\big),
@@ -127,11 +149,13 @@ $$
 $A_s$ is evaluated at the new anchor and $N_s$ is frozen at the snapshot. The mixed iteration
 indices are essential: the new parent anchors the step, while the frozen part comes from the old
 parent. [§7](#7-mismatch-at-verification) and [§9](#9-error-propagation-across-sweeps) show that
-only the frozen part produces mismatch and propagates error. The best split therefore puts
-everything cheap and known in closed form into $A_s$, and freezes only the expensive network
-output.
+only the frozen part directly produces verification mismatch; both parts enter error
+propagation. Evaluating cheap, known terms in $A_s$ can help, but it is not universally
+optimal: those terms can cancel variation in the network output when kept together in
+$N_s$. See [§7](#7-mismatch-at-verification) for a counterexample. Neither update
+guarantees higher acceptance or lower total cost.
 
-## 3. The two built-in updates
+## 3. The built-in updates
 
 **Whole increment (`picard_update_fn`).** This uses the translation pair
 $\operatorname{freeze}(y,m)=m-y$ and $\operatorname{apply}(D,x)=x+D$:
@@ -145,7 +169,10 @@ N_s(y)=G_s(y)=m^q_s(y)-y,
 $$
 
 The callback returns $G_s(X_u^{(j)})$ as `increments`, and `refine_tree` adds them to the rebuilt
-parents.
+parents. On a chain this is the reference ParaDiGMS prefix-sum recurrence
+([§4](#relationship-to-paradigms-and-appendix-b)), given the same transition mean,
+initial guesses, and fixed noises. Keeping this callback supports that baseline as
+well as earlier experiments; it is not a universally inferior version of `drift`.
 
 **Frozen drift (`picard_drift_update_fn`, the default).** This uses the target's own
 `freeze_drift` and `apply_drift`, the hooks that `DelayedDriftProposal` already relies on (see
@@ -203,8 +230,102 @@ G_s(y)=(a_s-1)\,y+b_s\,v_s(y),
 $$
 
 which contains the linear piece $(a_s-1)y$. That piece costs nothing to evaluate at the new
-anchor. For the churn kernels, $a_s\neq1$ exactly when $\varepsilon > 0$. For a target whose mean
-is a translation of its input ($a_s=1$), the two updates coincide.
+anchor. At stochastic churn steps with $h>0$ and $0<t<1$, $a_s\neq1$ when
+$\varepsilon>0$; deterministic fallback steps still use $a_s=1$. When $a_s=1$,
+the two updates coincide in exact arithmetic, even if $v_s(x)$ is nonlinear.
+
+**Mean-error transport (`picard_jtx_update_fn`).** JTX uses the round's fixed base
+proposal as the part evaluated at the new anchor:
+
+$$
+A_s(x)=m^p_s(x),
+\qquad
+N_s(y)=m^q_s(y)-m^p_s(y),
+\qquad
+\widetilde\mu_u^{(j+1)}
+=m^p_s(X_u^{(j+1)})+m^q_s(X_u^{(j)})-m^p_s(X_u^{(j)}).
+$$
+
+Each sweep recomputes the error against the **base** proposal. Subtracting the
+previous corrected mean would implement a different recurrence. The callback
+therefore evaluates `request.proposal.means` at the snapshot, returning it as
+`base_proposal_means` alongside `exact_target_means`. Reconstruction evaluates
+that same proposal at rebuilt parents, one batch per depth, and computes
+`q(old) + (p(new) - p(old))`. This is the same recurrence with floating-point
+anchoring: unchanged parents retain the exact target mean bit for bit.
+
+The base map must be deterministic and row-local, including across batch
+partitions and image conditioning, and remain fixed throughout drafting and
+refinement in the round. Proposal lifecycle hooks are not called during a
+sweep. `DelayedDriftProposal` keeps its cached drift fixed for this interval.
+The initial edge innovations and shared noise scales remain unchanged; the
+verifier receives the actual stored corrected means. The causal Gaussian law
+in §5 and finite-depth propagation in §6 still apply. Conditioning only on the
+final parent generally gives a Gaussian location mixture, as explained in the
+JTX note; it is the causal history that supplies the verifier's Gaussian law.
+
+For an additive frozen draft `p(x) = x + c`, JTX agrees with the whole-increment
+update up to rounding. For `p(x) = a x + b v_cached`, it agrees with the
+frozen-drift update up to rounding. A general nonlinear draft gives a distinct
+update. Each sweep adds one base-proposal batch at the snapshot and one per
+depth at rebuilt parents, in addition to the target batch. A proposal that
+itself invokes the target adds target work, which is included in the existing
+refinement counters. No monotone acceptance or speedup improvement is assumed.
+
+**Limited-memory Broyden (`picard_broyden_correction_update_fn`).** This extends
+JTX by estimating how the mean error $d_s=m_s^q-m_s^p$ changes with its input:
+
+$$
+\widetilde\mu_u^{(j+1)}=m_s^q(X_u^{(j)})+
+[m_s^p(X_u^{(j+1)})-m_s^p(X_u^{(j)})]
++B_u^{(j)}(X_u^{(j+1)}-X_u^{(j)}).
+$$
+
+For each parent independently, consecutive snapshots at the same transition
+step supply $s_j=X_u^{(j)}-X_u^{(j-1)}$ and
+$z_j=d_s(X_u^{(j)})-d_s(X_u^{(j-1)})$. Starting from $B=0$, the update is
+
+$$
+B\leftarrow B+\frac{(z_j-Bs_j)s_j^\top}{s_j^\top s_j}.
+$$
+
+The implementation stores at most `memory` rank-one factors per parent, with
+default 2. When full, it drops the oldest factor **before** computing the new
+rank-one residual. This enforces the newest secant condition in exact arithmetic;
+it does not enforce all older secant conditions. Storage and application cost
+are $O(mD)$ per parent, where $m$ is the maximum number of retained factors
+(`memory`) and $D$ is the number of scalar coordinates in one state, plus the
+preceding state/error vectors. The memory is a storage limit, not a sweep count
+or a number of extra target queries. Directions are
+normalized to avoid explicitly forming a squared small denominator.
+
+A secant is skipped if its displacement norm is at most
+`sqrt(dtype_epsilon) * max(1, norm(old), norm(new))` or its factors are
+non-finite. Existing factors are retained on a skipped update. A transported
+mean that becomes non-finite falls back to JTX for that row. Finite corrections
+are not clipped, and improvement in acceptance or runtime is not guaranteed.
+
+```python
+from functools import partial
+from specdiff import picard_broyden_correction_update_fn
+
+# Pass as refinement_update_fn to either sampler:
+update = partial(picard_broyden_correction_update_fn, memory=2)
+```
+
+Memory zero reproduces JTX bit for bit. The first sweep is JTX, and at most
+`min(memory, max(0, actual_sweeps - 1))` factors can be acquired in a round. No extra
+target evaluations are needed. `refine_tree` creates a fresh `request.history`
+dictionary for every round: after verification commits states, the next draft tree
+starts with empty history. The first sweep records one snapshot/error pair; the
+second can fit the first secant if that parent moved enough. With only one actual
+sweep, Broyden gives JTX regardless of memory. Histories are keyed by target/proposal identity,
+image, logical parent, and step. This avoids global mutable callback state and
+isolates repeated samples and batched trajectories. Each history uses only that
+parent's preceding refinement states, so it does not inspect outgoing noise or
+descendant rows. The same correction is shared by all children of a parent.
+Exact target-cache reuse still requires identical states and metadata; the
+Broyden approximation is never substituted for an exact target mean.
 
 ## 4. Path-sum form
 
@@ -238,6 +359,55 @@ exponential integrator. Only the velocity is taken from the previous sweep.
 
 In both forms, shared path prefixes are computed once, and all expensive target rows of a sweep
 are evaluated in one batch.
+
+### Relationship to ParaDiGMS and Appendix B
+
+The [ParaDiGMS paper, equation (5) and Algorithm 1](https://arxiv.org/abs/2305.16317v3)
+and the Hugging Face reference use the **whole transition increment**. In the
+[reference pipeline](https://github.com/huggingface/diffusers/blob/2843b3d37ad7c83b44cdcd098b9c064e1569457d/src/diffusers/pipelines/deprecated/stable_diffusion_variants/pipeline_stable_diffusion_paradigms.py#L717-L738),
+`batch_step_no_noise` returns the transition mean $m_i^q(x_i^{(j)})$;
+`delta` subtracts $x_i^{(j)}$. Prefix sums of these deltas and the fixed noises
+are added to the window's committed starting state. For a window beginning at $n$:
+
+$$
+x_{n+\ell}^{(j+1)}=x_n+
+\sum_{i=n}^{n+\ell-1}\left[m_i^q(x_i^{(j)})-x_i^{(j)}+\eta_i\right].
+$$
+
+Subtracting adjacent prefix sums yields exactly the `increment` recurrence in
+this section. Here $i$ counts transitions in sampling order, independently of
+the scheduler's descending diffusion timestep labels. The scheduler output is a
+complete mean, not just the neural network prediction: see the
+[DDPM mean calculation](https://github.com/huggingface/diffusers/blob/2843b3d37ad7c83b44cdcd098b9c064e1569457d/src/diffusers/schedulers/scheduling_ddpm_parallel.py#L657-L665).
+The name `batch_step_no_noise` means that additive noise is handled separately;
+it does not mean that only the final refinement sweep uses the stochastic kernel.
+
+The complete algorithms have different controls:
+
+| Aspect | Hugging Face ParaDiGMS | This repository's refinement |
+|---|---|---|
+| Initial guesses | Copies of the initial latent; newly entering guesses copy the window endpoint | States from the base draft tree |
+| Stochastic noise | Sampled once per transition and reused; omitted on the ODE scheduler path | Original draft edge innovations reused in every sweep |
+| Refinement | Prefix sums on a chain, with tolerance-based window advancement | Tree reconstruction with a configured, lookahead-capped sweep budget |
+| Final decision | Tolerance-based advancement; no speculative accept/reject correction | RMC, D-GRS, or PAWS verification with the stored proposal means |
+
+See the reference's
+[initialization and noise](https://github.com/huggingface/diffusers/blob/2843b3d37ad7c83b44cdcd098b9c064e1569457d/src/diffusers/pipelines/deprecated/stable_diffusion_variants/pipeline_stable_diffusion_paradigms.py#L651-L672)
+and [window advancement](https://github.com/huggingface/diffusers/blob/2843b3d37ad7c83b44cdcd098b9c064e1569457d/src/diffusers/pipelines/deprecated/stable_diffusion_variants/pipeline_stable_diffusion_paradigms.py#L739-L764).
+A finite tolerance does not guarantee the exact sequential target law. Our
+`increment` matches the reference's refinement formula on a chain in exact
+arithmetic with matching inputs; this does not make the full samplers or their
+floating-point results identical. Our default `drift` generally differs when
+$a_i\ne1$, as the two path-sum formulas above show.
+
+Appendix B, “Parallel sampling and speculative correction,” of
+[Accelerated Diffusion Models via Speculative Sampling, v2, pp. 17–18](https://arxiv.org/abs/2501.05370v2)
+prints a different construction: deterministic initial guesses, deterministic
+intermediate sweeps anchored at the **old** parent, and a final sweep adding
+independent Gaussian noises before speculative verification. Its intermediate
+recurrence is $x_{i+1}^{(j+1)}=x_i^{(j)}+\gamma\bar b_i^q(x_i^{(j)})$.
+As printed, it does not use the rebuilt parent or the prefix sum above. We do not
+implement that specific construction, despite its citation to ParaDiGMS.
 
 ## 5. Conditional proposal law and exactness
 
@@ -358,6 +528,29 @@ evaluating it at the final anchor. This changes neither the law ([§5](#5-condit
 nor the fixed point ([§6](#6-finite-depth-propagation)). It only changes acceptance at parents
 with $|u|\ge J$, where $e_u\neq0$.
 
+### Cancellation can favor the whole increment
+
+The formulas above compare two means at the **same** old and rebuilt parent;
+separate runs generally produce different parent states. Removing $(a_s-1)e_u$
+does not necessarily reduce the norm of the mismatch: it can remove a cancellation.
+
+For a scalar example, take $a=0.8$, $b=-0.1$, and $v(x)=-2x+c$, so
+$m^q(x)=0.8x-0.1(-2x+c)=x-0.1c$. At any old parent $y$ and rebuilt parent $x$:
+
+$$
+\widetilde\mu^{\mathrm{inc}}=x+[m^q(y)-y]=x-0.1c=m^q(x),
+\qquad
+\widetilde\mu^{\mathrm{drift}}=0.8x+0.2y-0.1c.
+$$
+
+Thus the whole increment gives the exact target mean, while the drift mismatch
+is $m^q(x)-\widetilde\mu^{\mathrm{drift}}=0.2(x-y)$. The stale affine and velocity
+terms cancel exactly in `increment`. More generally, local cancellation occurs
+when $[(a-1)I+bJ_v]e$ is small even though $bJ_v e$ is not. Section 8 connects this
+to posterior covariance directions in the interpolant model. This example shows
+why there is no universal dominance; it does not predict which update wins on a
+particular dataset or in total target-call cost.
+
 ## 8. Size of the stale affine term
 
 Write $\hat x_0(x)=\mathbb E[x_0\mid x]$ for the interpolant $x=(1-t)x_0+t\xi$. The velocity is
@@ -403,8 +596,9 @@ There are three regimes:
 - When $\lambda > 1$, the velocity coefficient changes sign, and the two terms partly cancel.
   This happens in directions where the posterior over $x_0$ is still split, for example between
   mixture components at high noise. There the stale term can reduce the mismatch, so the
-  frozen-drift update is not better in every direction. It is better on average in every
-  measured configuration ([§13](#13-measured-effect-on-the-gaussian-mixture)).
+  frozen-drift update is not better in every direction. The small GM comparison
+  in [§13](#13-measured-effect-on-the-gaussian-mixture) reports higher mean acceptance
+  for `drift`; this is empirical evidence for those settings, not a general guarantee.
 - When $\varepsilon=0$, $a_s=1$ and the updates coincide.
 
 The size of the stale term alone, normalized by the transition std
@@ -504,16 +698,19 @@ No tolerance is used. A custom backend that does not implement exact row compari
 conservatively re-evaluates every row. GPU nondeterminism can only reduce reuse; it cannot cause
 approximate states to be treated as identical.
 
-**Target calls per round.** Internal nodes have $|u|\le L_n-1$. Bitwise stability makes every
-internal node with $|u|\le J-1$ reusable. A final verification call is needed exactly when some
-internal node has $|u|\ge J$, that is, when $J < L_n$. Without leaf evaluation, a scalar round
-therefore costs
+**Target calls per round.** For the built-in callbacks with exact target-mean
+reuse and deterministic, row-independent target evaluations, internal nodes have $|u|\le L_n-1$. Bitwise stability makes every
+internal node with $|u|\le J-1$ reusable. If $J<L_n$, deeper parents may still move,
+requiring a final verification call.
+They can also stabilize early, so depth alone does not imply a call is necessary.
+Without leaf evaluation, a scalar round therefore costs at most
 
 $$
 J+\mathbf 1\lbrace J < L_n\rbrace
 $$
 
-target calls, excluding proposal-owned calls. A batched iteration costs
+target calls, excluding proposal-owned calls. Here $J$ is the actual capped
+sweep count and $L_n$ the actual lookahead. A batched iteration costs at most
 
 $$
 J+\mathbf 1\lbrace \exists i : J < L_{n_i}\rbrace .
@@ -533,21 +730,25 @@ $$
 \mathrm{row}_i^{(j)}=f_j\big(b_i,\,u_i,\,s_i,\,X_i^{(j)},\,\widetilde\mu_i^{(j)},\,\sigma_i\big).
 $$
 
-It may use fixed parameters and the conditioning for image $b_i$. It must not inspect, reduce
+It may use fixed parameters, the conditioning for image $b_i$, and its own
+preceding sweep history for the same image, node, and step. It must not inspect, reduce
 over, or mix other rows: cross-row dependence can make an ancestor's mean depend on its outgoing
 noise and invalidate the conditional proposal law ([§5](#5-conditional-proposal-law-and-exactness)).
 
-Callbacks always return a `RefinementUpdate` with exactly one of `increments` and `drifts`:
+Callbacks return a `RefinementUpdate` with exactly one of `increments`, `drifts`,
+and `base_proposal_means`; JTX may additionally supply `broyden_factors`:
 
 ```python
 RefinementUpdate(increments=increments, exact_target_means=target_means_or_none)
 RefinementUpdate(drifts=drifts, exact_target_means=target_means_or_none)
+RefinementUpdate(base_proposal_means=base_means, exact_target_means=target_means)
 ```
 
 `increments[i]` is added to the rebuilt parent. `drifts[i]` is passed to `target.apply_drift` at
 the rebuilt parent and its step, so row locality then extends to `apply_drift`. With
 `exact_target_means`, the drift mean is anchored as in [§10](#10-floating-point-target-mean-reuse-and-cost).
-Both have the shape of `parent_states`.
+`base_proposal_means` selects the JTX reconstruction in §3 and requires
+`exact_target_means`. All three have the shape of `parent_states`.
 
 `exact_target_means[i]`, when present, is a correctness-bearing assertion that it equals the
 target mean at the request's exact image, step, and state. An incorrect assertion can invalidate
@@ -591,7 +792,10 @@ $e_u\neq0$:
 
 At $\varepsilon=0.1$ the ratio stays at or below 1.06.
 
-**End to end.** Each configuration uses 40 paired trajectories, with shared initial states and
+**End to end.** These measurements describe a limited GM comparison, not a
+guarantee for other models or schedules. Speedup here is the sequential target-call
+baseline divided by mean target calls, not measured wall-clock acceleration.
+Each configuration uses 40 paired trajectories, with shared initial states and
 sampler random streams. RMC runs on the chain matched to the $K=2$, $L=4$ verification budget,
 which has depth 15. Values are means over trajectories:
 
