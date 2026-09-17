@@ -7,6 +7,10 @@
 [![Google Scholar](https://img.shields.io/badge/Arpan_Mukherjee-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=jAS9pzQAAAAJ&hl=it&oi=sra)
 [![Google Scholar](https://img.shields.io/badge/Deniz_Gündüz-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=MbmKROkAAAAJ&hl=it&oi=ao)
 
+<p align="center">
+  <img src="tree-specdiff-banner.png" alt="Project banner" width="100%">
+</p>
+
 Algorithm 1 of *Accelerating Diffusion Sampling via Speculative Draft Trees*: speculative
 diffusion sampling over an arbitrary draft tree, with a pluggable verification rule.
 
