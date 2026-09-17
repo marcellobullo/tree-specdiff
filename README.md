@@ -1,4 +1,11 @@
-# tree-specdiff
+# Accelerating Diffusion Sampling via Speculative Draft Trees 
+[![arXiv](https://img.shields.io/badge/arXiv-2609.17691-B31B1B?style=flat&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.17691)
+
+[![Google Scholar](https://img.shields.io/badge/Marcello_Bullo-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=k0a9iN8AAAAJ&hl=it&oi=sra)
+[![Google Scholar](https://img.shields.io/badge/Yanxiao_Liu-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=M6u1tgUAAAAJ&hl=it&oi=sra)
+[![Author](https://img.shields.io/badge/Öykü_Sıla_Güner-181717?logo=github&logoColor=white)](https://github.com/oykusilaguner)
+[![Google Scholar](https://img.shields.io/badge/Arpan_Mukherjee-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=jAS9pzQAAAAJ&hl=it&oi=sra)
+[![Google Scholar](https://img.shields.io/badge/Deniz_Gündüz-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=MbmKROkAAAAJ&hl=it&oi=ao)
 
 Algorithm 1 of *Accelerating Diffusion Sampling via Speculative Draft Trees*: speculative
 diffusion sampling over an arbitrary draft tree, with a pluggable verification rule.
@@ -23,7 +30,7 @@ result = sampler.sample(y0, rng=rng)
 print(result.summary())   # speedup, NFEs, acceptance rate, batch volume
 ```
 
-Set `proposal_refinement_iters=J` to run up to `J` target-backed Picard sweeps after
+Set `proposal_refinement_iters=J` to run up to `J` target-backed Picard iterations after
 the initial draft and before verification. Sweeps freeze only the target's drift by
 default (`picard_drift_update_fn`); `picard_update_fn` freezes the whole increment
 and matches the reference ParaDiGMS recurrence on a chain with matching inputs.
@@ -315,3 +322,5 @@ instance rather than `.means()`. Cost is reported as `target_calls` (the paper's
 batched call per round) and separately as `target_states_evaluated` (batch volume). The target
 is evaluated only at *internal* nodes — leaves are never parents, so `|I| = B / K` for a
 uniform tree, which is where a tree buys back some of its verification cost.
+
+[![Author](https://img.shields.io/badge/Marcello_Bullo-181717?logo=github&logoColor=white)](https://github.com/marcellobullo)
