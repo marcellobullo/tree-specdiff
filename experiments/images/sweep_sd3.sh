@@ -64,6 +64,15 @@ INCLUDE_TARGET="${INCLUDE_TARGET:-1}"
 # Latents per batched target call, BEFORE the CFG doubling. Divided by each
 # cell's |I| to give that cell's --sample-batch, so memory stays flat as K grows.
 NODE_BUDGET="${NODE_BUDGET:-64}"
+# Fixes --sample-batch instead of deriving it from |I|. Leave empty for the
+# NODE_BUDGET behaviour above. Set it when comparing two sweeps that differ in
+# |I| -- evaluate_leaves is the case that matters: a derived batch makes the
+# batch size a function of the treatment, and trajectories sharing an RNG
+# stream are not reproducible across batch sizes (specdiff/batched.py), so the
+# two grids would differ in their randomness as well as in the thing under
+# test. Memory is then yours to check: the peak scales with SAMPLE_BATCH x |I|,
+# so size it from the largest |I| in CONFIGS.
+SAMPLE_BATCH="${SAMPLE_BATCH:-}"
 
 OUT_ROOT="${OUT_ROOT:-$REPO/results/sd3/n${NUM_SAMPLES}_eps${EPS}_cfg${GUIDANCE}_${MATCH}}"
 
@@ -181,10 +190,16 @@ PY
   fi
   local iv sb
   iv="$(verified_nodes "$rn" "$K" "$L")"
-  sb=$(( NODE_BUDGET / iv )); (( sb < 1 )) && sb=1
+  if [[ -n "$SAMPLE_BATCH" ]]; then
+    sb=$SAMPLE_BATCH
+  else
+    sb=$(( NODE_BUDGET / iv ))
+  fi
+  (( sb < 1 )) && sb=1
   (( sb > NUM_SAMPLES )) && sb=$NUM_SAMPLES
   mkdir -p "$out"
-  log "generating $rn K=$K L=$L  (|I|=$iv, sample-batch $sb) -> $out"
+  log "generating $rn K=$K L=$L  (|I|=$iv, sample-batch $sb\
+${SAMPLE_BATCH:+ fixed}) -> $out"
   local mp=(); (( NUM_PROC > 1 )) && mp=(--multi_gpu)
   local sc=(); [[ -n "$SAMPLER_CONFIG" ]] && sc=(--sampler-config "$SAMPLER_CONFIG")
   local ed=(); [[ -n "$ENCODE_DEVICE" ]] && ed=(--encode-device "$ENCODE_DEVICE")
