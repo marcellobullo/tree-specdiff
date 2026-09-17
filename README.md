@@ -8,7 +8,7 @@
 [![Google Scholar](https://img.shields.io/badge/Deniz_Gündüz-4285F4?style=flat&logo=googlescholar&logoColor=white)](https://scholar.google.com/citations?user=MbmKROkAAAAJ&hl=it&oi=ao)
 
 <p align="center">
-  <img src="tree-specdiff-banner.png" alt="Project banner" width="100%">
+  <img src="assets/tree-specdiff-banner.png" alt="Project banner" width="100%">
 </p>
 
 Algorithm 1 of *Accelerating Diffusion Sampling via Speculative Draft Trees*: speculative
