@@ -250,81 +250,9 @@ sampler = BatchedSpeculativeSampler(
 result = sampler.sample(y0_batch)      # (batch, *state_shape)
 print(result.summary())
 ```
-
-Three things the batch dimension actually changes:
-
-**`sigma` is per row.** `BatchedVerifyRequest` carries `sigmas`, a tuple, because rows of one
-verification batch belong to different steps. Use `ops.scale_rows` to broadcast it portably.
-
-**Live rows shrink as the round descends.** A trajectory that rejects at level 1 takes no
-part in level 2. The sampler compacts rather than masks, so a rule never sees a dead row and
-never needs a validity flag. `request.indices_in_batch[j]` says which image row `j` is, for
-rules holding per-image state; `request.row(j)` carries it through as `index_in_batch`.
-
 **Cost is a max, not a mean.** One call serves every live trajectory, so the batch advances
 at the pace of its slowest member. `result.speedup` (`N / iterations`) is the wall-clock
 number; `result.mean_isolated_speedup` is what those trajectories would each have achieved
-alone, and `result.occupancy` is how full the batch stayed. The gap is real and is what you
-tune batch size against — the worked example prints ~12% for a batch of 16 at `L=3, alpha=0.84`.
-`result.acceptance_rate` is pooled over every trajectory and round, so it is directly
-comparable with the single-trajectory result for the same configuration.
-
-Two requirements the batched path adds. The tree must be **level-uniform** (every node at a
-given depth has the same width) so that a level's candidates form a rectangular
-`(batch, K, *shape)` array — `uniform` and `from_widths` qualify, arbitrary pruned trees do not.
-The proposal needs no change at all: `ProposalTransition` takes `indices_in_batch` at every
-batch size, so the object you hand the single-trajectory sampler is the object you hand this
-one. `DelayedDriftProposal` keeps a `(batch, *shape)` buffer of increments indexed by
-`indices_in_batch`, so no trajectory can pick up another's drift, and its warm-ups go in a
-single batched call.
-
-Rules get `verify_batch`, whose default implementation loops over rows calling `verify`, so
-nothing needs rewriting. Override it when the per-node work is worth vectorising — for the
-paper's rules, the sweep over levels `lambda_k` becomes an `(batch,)` vector operation and the
-`d`-dimensional projections become single batched ops. An override must stay row-independent:
-row `j` may depend only on `request.row(j)`.
-
-`info` carries the same keys either way, with one translation: rows sit at different tree
-nodes, so the batched request holds `info["nodes"]` (a tuple) while `request.row(j)` turns it
-back into the scalar contract's `info["node"]`. A rule keyed on `info["node"]` therefore runs
-unchanged under both samplers.
-
-`check_contract=True` applies identical per-row checks on both paths — shape, finiteness,
-index bounds, and accepted-state identity — so a rule the scalar sampler rejects is rejected
-under batching too, with the same message plus a row number.
-
-Trajectories share an RNG stream, so a given trajectory is not bit-reproducible across
-different batch sizes. Its law is unaffected.
-
-## Design notes
-
-**Why the tree is a first-class object.** Because "the chain is just `K = 1`" is only true if
-chain and tree share a representation. They do: a `DraftTree` is a general rooted tree in BFS
-order, `DraftTree.chain(L)` is a valid one, and depth-dependent widths (`from_widths`) or
-pruned trees need no new code path. Node ids in BFS order also make `T|_m` (eq. 27, needed
-when `L_n = min(L, N - n) < L` near the horizon) a slice.
-
-**Why `Verify` takes means and a scale, not distributions.** Eq. (24) is an assumption of the
-template, not an implementation detail: proposal and target must be isotropic Gaussians
-sharing the variance schedule. Encoding it in the request type means a rule may *rely* on it,
-which is what makes the rank-1 reduction legal. `NoiseSchedule.__call__` refuses a zero
-scale, since at zero churn both kernels are point masses and speculation is vacuous
-(Remark 3).
-
-**Why the proposal has lifecycle hooks.** The interesting proposals keep per-image memory. The
-delayed reverse drift needs to know when a round starts and which target drifts have become
-available; root-drift prefetching then reuses a drift the previous round already paid for
-during verification, instead of spending an extra NFE per round. The hooks let that live in
-the proposal rather than as a special case in the sampler. What gets frozen is the target's
-decision (`freeze_drift` / `apply_drift`, both required): the churn kernels freeze the network
-velocity and re-run the step at the drafted node, so the `eps`-dependent score correction
-stays exact; sliding the paper's increment `m^q(y) - y` along instead is only right for a
-translation-like mean.
-
-**Where the NFEs are counted.** `TargetTransition.__call__` counts; that is why you call the
-instance rather than `.means()`. Cost is reported as `target_calls` (the paper's metric: one
-batched call per round) and separately as `target_states_evaluated` (batch volume). The target
-is evaluated only at *internal* nodes — leaves are never parents, so `|I| = B / K` for a
-uniform tree, which is where a tree buys back some of its verification cost.
+alone, and `result.occupancy` is how full the batch stayed.
 
 [![Author](https://img.shields.io/badge/Marcello_Bullo-181717?logo=github&logoColor=white)](https://github.com/marcellobullo)
