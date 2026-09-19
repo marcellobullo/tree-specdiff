@@ -368,10 +368,16 @@ Registered by the library: `resample`, `rmc`, `d-grs`, `paws`, all registered on
 `rmc` is Algorithm 1 (`max_children = 1`, so pair it with `DraftTree.chain(L)`) and `d-grs` is
 Algorithm 2 (any `K`), with `residual_complement="first"` by default. D-GRS also accepts
 `"fresh"` and `"nearest_projection"`, using the same perpendicular-noise policies as PAWS; see [the paper's two algorithms](writing-a-verifier.md#the-papers-two-algorithms).
-`paws` is `RankSelectionCoupling(rank_policy="optimized", residual_complement="first")`,
+`paws` is `RankSelectionCoupling(rank_policy="optimized", residual_complement="first",
+residual_method="inverse_cdf", residual_max_trials=10000)`,
 with any `K`, shared positive Gaussian variance, and no temperature parameter. Rank policies
 are `optimized`, `uniform`, `max`, or a callable `(delta, K) -> weights`; complement policies
-are `first`, `fresh`, and `nearest_projection`. See [PAWS](paws.md).
+are `first`, `fresh`, and `nearest_projection`. `residual_method` selects how the correction
+is drawn -- `inverse_cdf` inverts the closed-form residual CDF, `rejection` proposes from the
+target scalar and accepts with probability `(1 - p_omega/q_delta)_+` -- and the two sample the
+same law, differing only in cost. After a run, `verifier.residual_trials / verifier.residual_draws`
+is the realized trials per correction (`residual_trials` stays 0 under `inverse_cdf`); both
+counters reset at the start of each `sample`. See [PAWS](paws.md).
 
 Experiments use `verifier.requires_chain` and `verifier.matched_tree(...)` instead of
 special-casing names. The latter returns the supplied tree for unrestricted rules; for

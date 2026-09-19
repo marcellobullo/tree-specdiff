@@ -29,6 +29,7 @@ def test_defaults_registration_and_topology_capabilities():
     assert isinstance(verifier, RankSelectionCoupling)
     assert verifier.residual_complement == "first"
     assert verifier.rank_policy == "optimized"
+    assert verifier.residual_method == "inverse_cdf"
     tree = DraftTree.uniform(2, 3)
     assert verifier.matched_tree(tree, num_steps=20) is tree
     assert not verifier.requires_chain
@@ -48,6 +49,49 @@ def test_scalar_target_law(policy, delta):
         num_children=4, num_samples=1200, alpha=0.0001, seed=731,
     )
     assert result.passed, result
+
+
+@pytest.mark.parametrize("policy", ["optimized", "uniform", "max"])
+@pytest.mark.parametrize("delta", [0., 0.1, 1., 3., 20.])
+def test_scalar_target_law_with_the_rejection_residual(policy, delta):
+    """The rejection residual of eq. (14) is the same coupling, sampled anew.
+
+    Exactness is the point: the two residual implementations differ in cost, so
+    a rule configured either way has to pass the same distributional test.
+    """
+    result = check_exactness(
+        RankSelectionCoupling(rank_policy=policy, residual_method="rejection"),
+        delta=delta, num_children=4, num_samples=1200, alpha=0.0001, seed=731,
+    )
+    assert result.passed, result
+
+
+def test_rejection_trial_counters_report_the_cost_and_reset():
+    rng = np.random.default_rng(5)
+    verifier = RankSelectionCoupling(rank_policy="max", residual_method="rejection")
+    base = request(delta=.7, k=4)
+    for _ in range(400):
+        verifier(replace(base, children=rng.standard_normal((4, 3)), rng=rng))
+    assert verifier.residual_draws > 0
+    # `1 / total` for this cell; the counter is the realized average.
+    expected = 1 / _ResidualCDF(.7, (0., 0., 0., 1.)).total
+    assert verifier.residual_trials / verifier.residual_draws == pytest.approx(expected, rel=.25)
+    verifier.reset()
+    assert (verifier.residual_draws, verifier.residual_trials) == (0, 0)
+    # The closed form spends no trials, so the second counter stays at zero.
+    closed = RankSelectionCoupling(rank_policy="max")
+    for _ in range(50):
+        closed(replace(base, children=rng.standard_normal((4, 3)), rng=rng))
+    assert closed.residual_draws > 0 and closed.residual_trials == 0
+
+
+def test_capped_rejection_keeps_the_target_law():
+    """A cap of one trial routes almost every correction to the closed form."""
+    report = check_exactness(
+        RankSelectionCoupling(residual_method="rejection", residual_max_trials=1),
+        delta=.3, num_children=4, num_samples=1500, alpha=.0001, seed=204,
+    )
+    assert report.passed, report
 
 
 @pytest.mark.parametrize("mode", ["first", "fresh", "nearest_projection"])
@@ -194,6 +238,10 @@ def test_bad_configuration_and_zero_noise_rejected():
         RankSelectionCoupling(temperature=2.)
     with pytest.raises(ValueError):
         RankSelectionCoupling(residual_complement="nearest_vector")
+    with pytest.raises(ValueError):
+        RankSelectionCoupling(residual_method="quadrature")
+    with pytest.raises(ValueError):
+        RankSelectionCoupling(residual_method="rejection", residual_max_trials=0)
     with pytest.raises(ValueError):
         RankSelectionCoupling()(replace(request(), sigma=0.))
 

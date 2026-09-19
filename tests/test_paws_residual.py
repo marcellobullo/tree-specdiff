@@ -17,8 +17,10 @@ import pytest
 from scipy.integrate import quad
 from scipy.optimize import brentq
 from scipy.special import ndtr
+from scipy.stats import kstest
 
 import specdiff.verifiers.paws as paws
+from specdiff.ops import NumpyBackend
 from specdiff.verifiers.paws import _ResidualCDF, _SelectedDensity, _shift_deficit
 
 # Exact gaps/weights from rejected transitions in the six reported eps=0.1 cells.
@@ -269,3 +271,66 @@ def test_masses_are_additive_over_a_split_span():
 def test_degenerate_residual_is_reported_not_silently_normalized():
     with pytest.raises(FloatingPointError, match="below numerical resolution"):
         _ResidualCDF(0.0, (.5, .5))
+
+
+# --- the rejection implementation of the same residual --------------------
+
+def closed_form_cdf(residual, s):
+    """``P(S <= s)`` under the residual, from the closed form, as an oracle."""
+    return math.fsum(
+        residual.mass(a, min(max(s, a), b)) for a, b in residual.spans if a < s
+    ) / residual.total
+
+
+@pytest.mark.parametrize("delta,weights", [
+    (.7, (0., 0., 0., 1.)),     # disconnected support, one span in each tail
+    (1., (0., 1.)),             # the paper's worked K=2 example
+    (2.5, (.3, .1, .2, .4)),
+    (.05, (.25,) * 4),          # residual mass ~ delta / sqrt(2 pi); many trials
+])
+def test_rejection_loop_samples_the_closed_form_residual(delta, weights):
+    """The two implementations are the same distribution, not merely both exact.
+
+    Rejection never forms the support, so this is the check that a proposal
+    landing in a gap between spans is discarded rather than corrected into one.
+    """
+    residual = _ResidualCDF(delta, weights)
+    ops, rng = NumpyBackend(), np.random.default_rng(101)
+    draws = np.array([paws._sample_residual_by_rejection(delta, weights, ops, rng, 10_000)[0]
+                      for _ in range(20_000)])
+    assert kstest(draws, np.vectorize(lambda s: closed_form_cdf(residual, s))).pvalue > 1e-3
+    for a, b in residual.spans:
+        assert np.any((draws > a) & (draws < b))
+    gaps = zip([b for _, b in residual.spans[:-1]], [a for a, _ in residual.spans[1:]])
+    assert not any(np.any((draws > b) & (draws < a)) for b, a in gaps)
+
+
+@pytest.mark.parametrize("delta,weights", [(.7, (0., 0., 0., 1.)), (2.5, (.3, .1, .2, .4))])
+def test_rejection_trial_count_is_the_reciprocal_residual_mass(delta, weights):
+    """The cost the paper quotes: ``1 / eta`` trials per correction."""
+    residual = _ResidualCDF(delta, weights)
+    ops, rng = NumpyBackend(), np.random.default_rng(3)
+    trials = [paws._sample_residual_by_rejection(delta, weights, ops, rng, 10_000)[1]
+              for _ in range(4000)]
+    assert np.mean(trials) == pytest.approx(1 / residual.total, rel=.08)
+    assert min(trials) == 1
+
+
+def test_trial_cap_defers_to_the_closed_form_instead_of_looping():
+    """A cap of one trial makes the fallback the usual path, not the rare one.
+
+    The fallback draw is an independent exact residual sample, so capping bounds
+    the work without touching the law -- which is what this asserts, by running
+    the same distributional check through a cap that fires almost every time.
+    """
+    delta, weights = .05, (.25,) * 4   # eta ~ 2%, so one trial almost never lands
+    residual = _ResidualCDF(delta, weights)
+    ops, rng = NumpyBackend(), np.random.default_rng(5)
+    draws, spent = [], []
+    for _ in range(6000):
+        s, trials = paws._sample_residual_by_rejection(delta, weights, ops, rng, 1)
+        draws.append(s)
+        spent.append(trials)
+    assert np.mean(spent) == 1.0
+    assert kstest(np.array(draws),
+                  np.vectorize(lambda s: closed_form_cdf(residual, s))).pvalue > 1e-3

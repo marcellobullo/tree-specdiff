@@ -44,8 +44,9 @@ CACHE_ENCODED_PROMPTS="${CACHE_ENCODED_PROMPTS-$REPO/results/sd3/_prompt_cache}"
 #MIN_FREE_MIB="${MIN_FREE_MIB:-24000}"
 MIN_FREE_MIB="${MIN_FREE_MIB:-10000}"
 
-CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 6,2 7,2 2,3 3,3 4,3 5,3 6,3}"
-RULES="${RULES-d-grs rmc paws}"
+CONFIGS="${CONFIGS-2,2 3,2 4,2 5,2 6,2 2,3 3,3 4,3 5,3 6,3}"
+#CONFIGS="${CONFIGS-2,3}"
+RULES="${RULES-d-grs paws rmc}"
 MATCH="${MATCH:-verification}"
 # Sampler options, S_noise and the timestep shift: protocol that does not appear
 # in a cell's output path, so the guard in run_cell is the only thing stopping

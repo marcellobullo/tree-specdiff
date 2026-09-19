@@ -7,7 +7,8 @@ from specdiff import DraftTree, RankSelectionCoupling, create_verifier
 
 tree = DraftTree.uniform(branching=2, lookahead=3)
 verifier = create_verifier("paws")
-# Equivalent: RankSelectionCoupling(rank_policy="optimized", residual_complement="first")
+# Equivalent: RankSelectionCoupling(rank_policy="optimized", residual_complement="first",
+#             residual_method="inverse_cdf")
 # Pass tree and verifier to SpeculativeSampler or BatchedSpeculativeSampler.
 ```
 
@@ -77,6 +78,9 @@ list-selection rule, and does not establish dominance over D-GRS.
 | `residual_complement` | `first` (default) | Reuse the first child's orthogonal component, as D-GRS does |
 | | `fresh` | Draw independent Gaussian noise and remove its projection |
 | | `nearest_projection` | Reuse the component of the child closest to the corrected scalar |
+| `residual_method` | `inverse_cdf` (default) | Closed-form residual CDF, inverted by bracketed root finding |
+| | `rejection` | Propose from the target scalar and accept with probability $(1-p_\omega/q_\delta)_+$ |
+| `residual_max_trials` | `10000` | Trials after which `rejection` defers to the closed form |
 
 A callable rank policy must not depend on the realized children, orthogonal
 components, or future subtree information. Nearest *full-vector* selection is
@@ -96,8 +100,10 @@ is approximate; uniform and maximum-rank policies are retained as candidates.
 Extremely large gaps use maximum rank directly. These choices affect efficiency,
 not the correction formula.
 
-The residual uses **inverse-CDF sampling with a closed-form CDF**. There is no
-numerical integration. Both laws have exact CDFs, so the residual mass on any
+### Residual by inverse CDF (default)
+
+The default residual uses **inverse-CDF sampling with a closed-form CDF**. There
+is no numerical integration. Both laws have exact CDFs, so the residual mass on any
 interval where $f>g$ is arithmetic:
 
 $$
@@ -140,13 +146,48 @@ of `ndtr`/`log_ndtr` in the far tails, crossing location, Brent inversion
 shortcut alone, the total-variation discrepancy is approximately
 $\delta/\sqrt{2\pi}$.
 
-The sibling PAWS code instead uses direct residual rejection from the target.
-That takes on average $1/(1-A)$ trials **conditional on needing a correction**,
-which can be large when acceptance is high. But correction itself occurs with
-probability $1-A$, so a large conditional retry count does not imply huge
-amortized cost in every regime. Inverse-CDF sampling removes this random retry
-loop and, with a closed-form CDF, adds only root-finding work: 0.34 ms per
-correction against 4.75 ms for the adaptive-quadrature version it replaced.
+### Residual by rejection (`residual_method="rejection"`)
+
+The same residual is also available without any support geometry. Propose
+$S\sim\mathcal N(\delta,1)$, the target scalar itself, and keep it with
+probability $(1-p_\omega(S)/q_\delta(S))_+$. The kept density is
+$q_\delta\cdot(1-p_\omega/q_\delta)_+=(q_\delta-p_\omega)_+$, the
+unnormalized residual, so the loop needs neither the crossings nor the span
+masses: a proposal landing where $p_\omega\ge q_\delta$ simply has acceptance
+probability zero, and disconnected support costs nothing. No target-model
+evaluation is involved, and proposals are drawn from the sampler's own uniform
+stream through `ndtri`, so runs stay reproducible.
+
+The price is the trial count. Acceptance per trial is the residual mass
+$\eta_\omega=1-A$, so the loop runs $1/\eta_\omega$ times on average
+**conditional on needing a correction**, which is large exactly when acceptance
+is high and corrections are rare. `residual_max_trials` (default 10000) bounds
+that: on exhaustion the draw falls back to the closed form. The fallback is an
+independent exact residual sample and the discarded trials carry no information
+about it, so the cap bounds work without perturbing the law; the tests in
+`tests/test_paws_residual.py` assert this by forcing the fallback with a cap of
+one.
+
+Which is faster is a measurement, not a ranking, and the answer moved once the
+closed form became cheap. Per correction, NumPy backend, $K=4$:
+
+| Regime | `rejection` | `inverse_cdf` |
+| --- | --- | --- |
+| $\delta=2.5$, mixed weights ($1/\eta\approx1.3$) | 0.008 ms | 0.42 ms |
+| $\delta=0.7$, maximum rank ($1/\eta\approx4.7$) | 0.022 ms | 0.36 ms |
+| $\delta=0.05$, uniform ($1/\eta\approx47$) | 0.086 ms | 0.096 ms |
+| $\delta=0.005$, uniform ($1/\eta\approx518$) | 0.95 ms | 0.095 ms |
+
+The inverse-CDF column is measured with a **distinct gap per correction**, which
+is what a real run produces: its `lru_cache` then misses every time and each
+correction pays the full crossing scan. Repeated gaps (a fixed-$\delta$ study,
+say) hit the cache and cost about 0.08 ms instead. Rejection has no setup to
+amortize and no cache to miss, so it wins wherever $1/\eta_\omega$ stays small
+-- which is most of the useful regime, since a small $\eta_\omega$ means
+corrections are rare in the first place. The crossover for uniform weights sits
+near $\delta\approx0.03$, where trials grow as $\sqrt{2\pi}/\delta$.
+Earlier numbers in this file compared the closed form against the
+adaptive-quadrature version it replaced: 0.34 ms against 4.75 ms.
 
 Scalar numerical work runs on CPU; states remain on their original backend.
 Batched verification currently uses the generic row-wise verifier interface.
@@ -172,6 +213,12 @@ python experiments/gm/gm_sweep.py --out results/paws-smoke \
   --replicates 4 --n-workers 1 \
   --verifier-options '{"paws":{"rank_policy":"max","residual_complement":"first"}}'
 
+# The residual implementation is selected the same way.
+python experiments/gm/gm_sweep.py --out results/paws-rejection \
+  --rules paws --dimension 8 --num-steps 8 --K-values 2 --L-values 2 \
+  --replicates 4 --n-workers 1 \
+  --verifier-options '{"paws":{"residual_method":"rejection"}}'
+
 python experiments/images/run_edm.py --toy --no-accelerate --device cpu \
   --rule paws --branching 2 --lookahead 2 --num-steps 8 --num-samples 4 \
   --out results/paws-edm-smoke
@@ -191,7 +238,10 @@ indexing, zero uniforms, tiny absolute gaps, CPU Torch dtypes, batching,
 truncated/nonuniform trees, Picard trajectories, and experiment wiring.
 `tests/test_paws_residual.py` covers the closed form specifically: the gaps from
 the reported eps=0.1 sweep cells, quantile monotonicity, crossing-scan
-completeness, and both deviation forms. It checks against two oracles, because
+completeness, and both deviation forms. It also covers the rejection loop
+against that closed form -- agreement in distribution, both spans reached and
+the gap between them empty, trials averaging $1/\eta_\omega$, and the capped
+fallback keeping the law. It checks against two oracles, because
 neither alone suffices -- quadrature split at the crossings validates the
 formula where the density is well scaled, and arbitrary precision (`mpmath`,
 skipped if absent) validates the arithmetic everywhere, including a span near

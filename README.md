@@ -158,7 +158,7 @@ the trajectory, so `sample()` rejects them. Both `float32` and `float64` are sup
 | | |
 | --- | --- |
 | [docs/writing-a-verifier.md](docs/writing-a-verifier.md) | verifier contract, rank-1 coordinates, exactness testing, and implementation guidance |
-| [docs/paws.md](docs/paws.md) | PAWS derivation, rank/complement variants, numerical correction, and experiments |
+| [docs/paws.md](docs/paws.md) | PAWS derivation, rank/complement variants, both residual implementations, and experiments |
 | [docs/refinement.md](docs/refinement.md) | tree Picard derivation, callback invariants, exact target-mean reuse, and accounting |
 | [docs/models.md](docs/models.md) | plugging in your own diffusion model, proposals, trees, backends |
 | [docs/architecture.md](docs/architecture.md) | how a round works, data flow, cost accounting, design decisions |

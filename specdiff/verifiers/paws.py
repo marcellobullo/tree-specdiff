@@ -5,10 +5,14 @@ Children are conditionally iid N(mu_p, sigma**2 I). Rank policies see only
 phi(s)*beta_lambda(Phi(s)). Only the optimizer may quantize delta; acceptance
 and the residual CDF always use its actual value.
 
-The residual correction uses no numerical integration. Both laws have exact
-CDFs -- Phi(s - delta) for the target, and a Bernstein polynomial in Phi(s) for
-the rank-selected law -- so the residual CDF is arithmetic, and the only
-numerical step is locating where the two densities cross.
+Two residual implementations are provided, and they sample the same law.
+``inverse_cdf`` (the default) uses no numerical integration: both laws have
+exact CDFs -- Phi(s - delta) for the target, and a Bernstein polynomial in
+Phi(s) for the rank-selected law -- so the residual CDF is arithmetic, and the
+only numerical step is locating where the two densities cross. ``rejection``
+instead proposes from the target scalar N(delta, 1) and accepts with
+probability (1 - p_omega/q_delta)_+, taking 1/(1 - A) trials on average but no
+setup.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from typing import Callable, Sequence, Union
 
 import numpy as np
 from scipy.optimize import brentq, linprog
-from scipy.special import gammaln, log_ndtr, ndtr
+from scipy.special import gammaln, log_ndtr, ndtr, ndtri
 from scipy.sparse import csr_matrix, eye, hstack, vstack
 
 from ..types import VerifyRequest, VerifyResult
@@ -128,6 +132,22 @@ def _optimized_weights(delta: float, k: int) -> tuple[float, ...]:
     return max(candidates, key=lambda w: float(
         integration_weights @ np.minimum(q, basis @ w)
     ))
+
+
+RESIDUAL_METHODS = ("inverse_cdf", "rejection")
+"""How the correction draws from ``(q_delta - p_omega)_+``; see
+:func:`_sample_residual_by_rejection` and :class:`_ResidualCDF`."""
+
+DEFAULT_REJECTION_TRIAL_CAP = 10_000
+"""Trials after which the rejection loop defers to the closed form.
+
+The loop is geometric with success probability ``1 - A``, so the cap is reached
+with probability ``A ** cap`` -- negligible except where acceptance is so close
+to one that the residual is almost never needed. The fallback draw is an
+independent exact residual sample, and the discarded trials carry no
+information about it, so the capped sampler still has exactly the residual law:
+the cap bounds work, it does not approximate.
+"""
 
 
 def rank_weights(delta: float, k: int, policy: RankPolicy = "optimized") -> tuple[float, ...]:
@@ -244,6 +264,16 @@ class _SelectedDensity:
         )
 
 
+@lru_cache(maxsize=512)
+def _selected_density(weights: tuple[float, ...]) -> _SelectedDensity:
+    """Shared, immutable ``_SelectedDensity`` for a weight vector.
+
+    Acceptance builds one per node and the rejection loop queries one per trial,
+    so the Bernstein bookkeeping is worth keeping rather than rebuilding.
+    """
+    return _SelectedDensity(weights)
+
+
 class _ResidualCDF:
     """Inverse CDF of the entire positive-part residual, in closed form.
 
@@ -267,7 +297,7 @@ class _ResidualCDF:
 
     def __init__(self, delta, weights):
         self.delta = delta
-        self.selected = _SelectedDensity(weights)
+        self.selected = _selected_density(weights)
         self.bounds = (min(0.0, delta) - _SUPPORT_HALF_WIDTH,
                        max(0.0, delta) + _SUPPORT_HALF_WIDTH)
         self.spans = self._spans()
@@ -364,25 +394,87 @@ def _residual_cdf(delta, weights):
     return _ResidualCDF(delta, weights)
 
 
+def _sample_residual_by_rejection(delta, weights, ops, rng, max_trials):
+    """Draw from ``(q_delta - p_omega)_+`` by rejection, as ``(s, trials)``.
+
+    Propose ``S ~ N(delta, 1)``, the target scalar, and keep it with probability
+    ``(1 - p_omega(S)/q_delta(S))_+``. The kept density is then
+    ``q_delta * (1 - p_omega/q_delta)_+ = (q_delta - p_omega)_+`` up to its
+    normalization, which is exactly the residual. No target-model evaluation is
+    involved, and unlike :class:`_ResidualCDF` there is no support geometry to
+    work out -- disconnected support costs nothing here, since a proposal
+    landing where ``p_omega >= q_delta`` simply has acceptance probability zero.
+
+    The price is the trial count: acceptance per trial is the residual mass
+    ``1 - A``, so the loop runs ``1/(1 - A)`` times on average *given* that a
+    correction is needed. Proposals come from the same uniform stream as every
+    other decision, through ``ndtri``, so the sampler stays reproducible.
+    """
+    selected = _selected_density(weights)
+    half_eps = 0.5 * np.finfo(float).eps
+    for trial in range(1, max_trials + 1):
+        # An attainable zero or one uniform must not produce an infinite state.
+        u = min(max(float(ops.uniform(rng)), half_eps), 1.0 - half_eps)
+        s = delta + float(ndtri(u))
+        # log p_omega(s) - log q_delta(s), the form `_ResidualCDF.log_ratio` uses.
+        log_ratio = selected.log_beta(s) - delta * (s - 0.5 * delta)
+        if ops.uniform(rng) < -math.expm1(min(0.0, log_ratio)):
+            return s, trial
+    return _residual_cdf(delta, weights).sample(ops.uniform(rng)), max_trials
+
+
 @register_verifier("paws")
 class RankSelectionCoupling(Verifier):
-    """PAWS with inverse-CDF correction and first-child complement reuse.
+    """PAWS with rank-selected acceptance and first-child complement reuse.
 
     rank_policy: 'optimized', 'uniform', 'max', or callable (delta, K) -> weights.
     residual_complement: 'first' (D-GRS default), 'fresh', 'nearest_projection'.
+    residual_method: 'inverse_cdf' (default) or 'rejection'. Both sample the
+    same residual law; they differ in cost, not in distribution.
     Policies preserve the target law up to floating-point tolerances; the
-    residual CDF is closed form, so no integration tolerance enters.
+    residual CDF is closed form, so no integration tolerance enters, and the
+    rejection loop introduces none of its own either.
     No temperature or biased acceptance mode is provided.
+
+    :attr:`residual_draws` and :attr:`residual_trials` count corrections and the
+    proposals the rejection loop spent on them since the last :meth:`reset`, so
+    a run can report the realized trials per correction. The inverse-CDF method
+    spends no trials and leaves the second counter at zero.
     """
 
     def __init__(self, *, rank_policy: RankPolicy = "optimized",
-                 residual_complement: str = "first"):
+                 residual_complement: str = "first",
+                 residual_method: str = "inverse_cdf",
+                 residual_max_trials: int = DEFAULT_REJECTION_TRIAL_CAP):
         if not callable(rank_policy) and rank_policy not in ("optimized", "uniform", "max"):
             raise ValueError("invalid rank_policy")
         if residual_complement not in RESIDUAL_COMPLEMENTS:
             raise ValueError("invalid residual_complement")
+        if residual_method not in RESIDUAL_METHODS:
+            raise ValueError(f"residual_method must be one of {RESIDUAL_METHODS}")
+        if int(residual_max_trials) != residual_max_trials or residual_max_trials < 1:
+            raise ValueError("residual_max_trials must be a positive integer")
         self.rank_policy = rank_policy
         self.residual_complement = residual_complement
+        self.residual_method = residual_method
+        self.residual_max_trials = int(residual_max_trials)
+        self.residual_draws = 0
+        self.residual_trials = 0
+
+    def reset(self) -> None:
+        self.residual_draws = 0
+        self.residual_trials = 0
+
+    def _sample_residual(self, delta, weights, ops, rng) -> float:
+        """The corrected scalar, by whichever residual implementation is set."""
+        if self.residual_method == "rejection":
+            s, trials = _sample_residual_by_rejection(
+                delta, weights, ops, rng, self.residual_max_trials)
+        else:
+            s, trials = _residual_cdf(delta, weights).sample(ops.uniform(rng)), 0
+        self.residual_draws += 1
+        self.residual_trials += trials
+        return s
 
     def verify(self, request: VerifyRequest) -> VerifyResult:
         if not math.isfinite(request.sigma) or request.sigma <= 0 or request.num_children < 1:
@@ -407,10 +499,10 @@ class RankSelectionCoupling(Verifier):
                 break
         child = order[rank]
         log_accept = min(0.0, frame.delta * (scores[child] - 0.5 * frame.delta)
-                         - _SelectedDensity(weights).log_beta(scores[child]))
+                         - _selected_density(weights).log_beta(scores[child]))
         u = ops.uniform(request.rng)
         if (math.log(u) if u > 0 else -math.inf) < log_accept:
             return VerifyResult(request.child(child), True, child, proposals_examined=k)
-        s = _residual_cdf(frame.delta, weights).sample(ops.uniform(request.rng))
+        s = self._sample_residual(frame.delta, weights, ops, request.rng)
         perp = residual_complement(frame, request, s, self.residual_complement)
         return VerifyResult(frame.reconstruct(s, perp), False, proposals_examined=k)
